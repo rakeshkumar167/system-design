@@ -1,6 +1,7 @@
 import type { MDXComponents } from "mdx/types";
 import { Callout } from "@/components/learning/callout";
 import { RequirementsTable } from "@/components/learning/requirements-table";
+import { CapacityModel } from "@/components/learning/capacity-model";
 import { ApiContract } from "@/components/learning/api-contract";
 import { EntityModel } from "@/components/learning/entity-model";
 import { TradeoffTable } from "@/components/learning/tradeoff-table";
@@ -19,6 +20,7 @@ import { KnowledgeCheck } from "@/components/learning/knowledge-check";
 const teachingComponents = {
   Callout,
   RequirementsTable,
+  CapacityModel,
   ApiContract,
   EntityModel,
   TradeoffTable,
