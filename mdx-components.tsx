@@ -10,6 +10,14 @@ import { FailureMatrix } from "@/components/learning/failure-matrix";
 import { DepthSection } from "@/components/learning/depth-section";
 import { Faq } from "@/components/learning/faq";
 import { KnowledgeCheck } from "@/components/learning/knowledge-check";
+import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
+import {
+  CreateUrlSequence,
+  RedirectCacheHitSequence,
+  RedirectCacheMissSequence,
+  AnalyticsSequence,
+} from "@/components/diagrams/request-flow-diagrams";
+import { ScaleEvolution } from "@/components/diagrams/scale-evolution";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -29,6 +37,12 @@ const teachingComponents = {
   DepthSection,
   Faq,
   KnowledgeCheck,
+  ArchitectureDiagram,
+  CreateUrlSequence,
+  RedirectCacheHitSequence,
+  RedirectCacheMissSequence,
+  AnalyticsSequence,
+  ScaleEvolution,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
