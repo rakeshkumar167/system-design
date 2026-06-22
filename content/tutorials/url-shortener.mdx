@@ -1,83 +1,487 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-Frame the problem, agree on scope, and budget your time before designing anything.
+A URL shortener turns a long URL into a short code — `https://example.com/very/long/path?utm=...` becomes `https://sho.rt/aB3xK9q` — and redirects anyone who visits the short link back to the original. It looks trivial, which is exactly why it is a classic interview opener: the interesting parts are scale, latency, and the distributed-systems decisions hiding underneath a two-endpoint API.
+
+Spend the first few minutes establishing scope rather than drawing boxes. Good questions to ask:
+
+- What is the expected traffic, and what is the read-to-write ratio? (It is almost always read-heavy.)
+- How long must links live — forever, or with expiry?
+- Do we need custom aliases (vanity links)?
+- Do we need analytics on clicks?
+- What are the latency and availability targets for redirects?
+- Who can create and delete links — anonymous users, or authenticated accounts?
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and scope · **5 min** requirements and capacity estimates · **5 min** API and data model · **10 min** high-level architecture and key generation · **15 min** deep dives (caching, partitioning, consistency, failure) · **5 min** trade-offs and wrap-up. Say your assumptions out loud and write them down — the interviewer is grading how you reason, not whether you memorized an answer.
+</Callout>
+
+This tutorial commits to a concrete set of assumptions so the numbers stay consistent end to end. **In scope:** create, redirect, custom alias, optional expiry, and aggregate click analytics. **Out of scope:** user-facing dashboards, billing, and link-preview generation — mention them, then set them aside.
 
 <h2 id="requirements">Requirements</h2>
 
-Capture the functional features and the non-functional targets that shape the architecture.
+Separate what the system must *do* from how *well* it must do it. The non-functional targets are what actually drive the architecture.
+
+<RequirementsTable
+  functional={[
+    "Create a short code for a given long URL",
+    "Redirect a short code to its long URL",
+    "Optionally accept a custom alias (vanity link)",
+    "Optionally set an expiry time on a link",
+    "Record and report aggregate click counts",
+    "Allow the owner to disable or delete a link",
+  ]}
+  nonFunctional={[
+    { goal: "Redirect availability", target: "99.99%" },
+    { goal: "Redirect latency (p99)", target: "< 50 ms" },
+    { goal: "Create latency (p99)", target: "< 200 ms" },
+    { goal: "Read : write ratio", target: "~100 : 1" },
+    { goal: "Mapping durability", target: "no lost links" },
+    { goal: "Code uniqueness", target: "globally unique" },
+  ]}
+/>
+
+Two requirements dominate every later decision. First, the system is **overwhelmingly read-heavy**: redirects outnumber creations roughly 100 to 1, so the redirect path is what we optimize and cache. Second, **redirects must be fast and always available** — a slow or failing redirect is a broken link on someone else's website, so we favor availability and low latency over strict global consistency on the read path.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-Turn a few transparent assumptions into traffic, storage, and cache numbers.
+Estimates are directional, not precise. Their job is to tell us *which* component is under pressure. Start from one assumption — new links per month — and derive the rest.
+
+<CapacityModel
+  assumptions={{
+    newLinksPerMonth: 100000000,
+    readWriteRatio: 100,
+    peakMultiplier: 3,
+    bytesPerMapping: 500,
+    retentionYears: 5,
+    cacheCoveragePercent: 20,
+  }}
+/>
+
+The takeaways: writes (~40/s) are trivial and never the bottleneck; reads peak around **11,600/s**, so the redirect path needs caching and horizontal read scaling; five years of links is **~6 billion rows / ~3 TB**, which is too much for a single node and forces partitioning; and the hot working set (~600 GB) fits comfortably in a distributed in-memory cache, so most redirects never touch the database.
 
 <h2 id="entity-model">Entity Model</h2>
 
-Define the URL mapping, alias reservation, and click-event entities.
+Three entities, with a clear split between the **source-of-truth mapping** and the **asynchronous analytics** data. They have very different consistency and durability needs and should not share a table.
+
+<EntityModel
+  name="UrlMapping"
+  description="The source of truth. One row per short code."
+  fields={[
+    { name: "short_code", type: "string (PK)", notes: "7-char Base62; partition key" },
+    { name: "long_url", type: "string", notes: "destination, validated on write" },
+    { name: "owner_id", type: "string", notes: "null for anonymous links" },
+    { name: "created_at", type: "timestamp", notes: "" },
+    { name: "expires_at", type: "timestamp?", notes: "null = never expires" },
+    { name: "status", type: "enum", notes: "active | disabled" },
+  ]}
+  keys="Primary key and partition key: short_code. Lookups are always by code, so no secondary index is needed on the hot path."
+/>
+
+<EntityModel
+  name="AliasReservation"
+  description="Guards custom-alias uniqueness via a conditional insert."
+  fields={[
+    { name: "alias", type: "string (PK)", notes: "the requested vanity code" },
+    { name: "short_code", type: "string", notes: "resolves to a UrlMapping" },
+    { name: "reserved_at", type: "timestamp", notes: "" },
+  ]}
+  keys="A conditional 'insert if not exists' on alias makes claiming a custom alias atomic and race-free."
+/>
+
+<EntityModel
+  name="ClickEvent"
+  description="Append-only analytics, written asynchronously off the redirect path."
+  fields={[
+    { name: "short_code", type: "string", notes: "which link was clicked" },
+    { name: "ts", type: "timestamp", notes: "event time" },
+    { name: "referrer", type: "string?", notes: "coarse, privacy-aware" },
+    { name: "geo", type: "string?", notes: "country-level only" },
+  ]}
+  keys="Never queried on the redirect path. Aggregated by a consumer into per-code counts; raw events have a short retention."
+/>
 
 <h2 id="api-design">API Design</h2>
 
-Specify the create, resolve, details, analytics, and disable endpoints.
+A small, REST-style surface. The redirect endpoint is intentionally separate and bare (`/{code}`) so it can be served at the edge with minimal overhead.
+
+<ApiContract
+  method="POST"
+  path="/v1/urls"
+  summary="Create a short link. Optionally supply a custom alias and expiry."
+  request={`{
+  "longUrl": "https://example.com/very/long/path",
+  "alias": "launch",        // optional
+  "expiresAt": "2026-12-31T00:00:00Z"  // optional
+}`}
+  response={`{
+  "shortUrl": "https://sho.rt/launch",
+  "code": "launch",
+  "expiresAt": "2026-12-31T00:00:00Z"
+}`}
+  statusCodes={[
+    { code: "201", meaning: "Created" },
+    { code: "400", meaning: "Invalid or unsafe URL" },
+    { code: "409", meaning: "Custom alias already taken" },
+    { code: "429", meaning: "Rate limit exceeded" },
+  ]}
+  notes="Idempotency: clients may send an Idempotency-Key header so retries don't create duplicate links. Auto-generated codes are unique by construction; custom aliases use a conditional insert (see Key Generation)."
+/>
+
+<ApiContract
+  method="GET"
+  path="/{code}"
+  summary="Resolve a short code and redirect the browser to the long URL."
+  response={`HTTP/1.1 302 Found
+Location: https://example.com/very/long/path
+Cache-Control: private, max-age=0`}
+  statusCodes={[
+    { code: "302", meaning: "Found — temporary redirect (default)" },
+    { code: "301", meaning: "Moved Permanently — only if links are immutable" },
+    { code: "404", meaning: "Unknown or deleted code" },
+    { code: "410", meaning: "Gone — expired link" },
+  ]}
+  notes="Use 302 by default: a 301 is cached aggressively by browsers and intermediaries, which breaks click analytics and makes disable/delete ineffective. Choose 301 only when links are guaranteed immutable and analytics don't matter."
+/>
+
+<ApiContract
+  method="GET"
+  path="/v1/urls/{code}"
+  summary="Fetch a link's metadata (owner, destination, status, expiry)."
+  response={`{
+  "code": "launch",
+  "longUrl": "https://example.com/very/long/path",
+  "status": "active",
+  "createdAt": "2026-06-01T10:00:00Z",
+  "expiresAt": "2026-12-31T00:00:00Z"
+}`}
+  statusCodes={[
+    { code: "200", meaning: "OK" },
+    { code: "403", meaning: "Not the owner" },
+    { code: "404", meaning: "Unknown code" },
+  ]}
+/>
+
+<ApiContract
+  method="GET"
+  path="/v1/urls/{code}/stats"
+  summary="Aggregate click analytics for a link. Eventually consistent."
+  response={`{
+  "code": "launch",
+  "totalClicks": 18243,
+  "last7Days": [120, 240, 310, 280, 450, 600, 510]
+}`}
+  statusCodes={[
+    { code: "200", meaning: "OK (counts may lag by seconds)" },
+    { code: "404", meaning: "Unknown code" },
+  ]}
+  notes="Served from the analytics store, never the mapping store. Counts are eventually consistent; that's an acceptable trade for keeping the redirect path fast."
+/>
+
+<ApiContract
+  method="DELETE"
+  path="/v1/urls/{code}"
+  summary="Disable or delete a link. Owner-only."
+  response={`HTTP/1.1 204 No Content`}
+  statusCodes={[
+    { code: "204", meaning: "Disabled/deleted" },
+    { code: "403", meaning: "Not the owner" },
+    { code: "404", meaning: "Unknown code" },
+  ]}
+  notes="Soft-disable by setting status=disabled, then proactively invalidate the cache entry so the dead link stops resolving quickly."
+/>
 
 <h2 id="key-generation">Key Generation</h2>
 
-Compare strategies for producing short, collision-free keys.
+This is the heart of the problem. We need short codes that are unique, hard to guess in bulk, cheap to generate, and that use the key space efficiently. A 7-character Base62 code (`0-9A-Za-z`) yields **62⁷ ≈ 3.5 trillion** combinations — far more than the ~6 billion we'll create in five years, so 7 characters give us comfortable headroom.
+
+<TradeoffTable
+  columns={["Strategy", "Collisions", "Predictable?", "Coordination", "Notes"]}
+  rows={[
+    ["Hash + truncate", "Possible — must check", "Somewhat", "None", "Hash the URL, take 7 chars; needs collision retry"],
+    ["DB auto-increment + Base62", "None", "Highly (sequential)", "Single sequence", "Simple but a write bottleneck and enumerable"],
+    ["Distributed ID + Base62", "None", "Low (with sharding)", "Coordinated, cheap", "Snowflake/range-allocated IDs encoded to Base62"],
+    ["Random token + check", "Rare — retry on hit", "No", "None", "Generate random 7 chars; check-and-set on write"],
+  ]}
+  recommendedRow={2}
+/>
+
+<DecisionRecord
+  title="Key generation"
+  choice="Allocate unique numeric IDs from a distributed generator (Snowflake-style or a range/ticket server), then Base62-encode them to 7-character codes."
+  rationale="IDs are unique by construction, so there is no collision check on the write path. A range/ticket server hands each write node a block of IDs (e.g. 1,000 at a time) so ID allocation is not a per-request bottleneck. Base62 keeps codes short and URL-safe."
+  alternatives="Random tokens with a conditional 'insert if not exists' are a fine, slightly simpler alternative when unguessability matters more than density — at the cost of occasional retries as the key space fills."
+  revisitWhen="You need unguessable links (e.g. private shares): switch to random tokens or add random padding so codes can't be enumerated by incrementing."
+/>
+
+A subtlety: purely sequential IDs make links **enumerable** — anyone can walk `aaaa0`, `aaaa1`, … and scrape every link. Interleaving shards or adding a few random bits before encoding breaks the obvious sequence while keeping uniqueness.
+
+<KnowledgeCheck
+  question="Why prefer a distributed ID generator over a single database auto-increment column?"
+  options={[
+    "Auto-increment produces codes that are too long",
+    "A single sequence becomes a write bottleneck and a single point of failure",
+    "Base62 only works with distributed IDs",
+    "Auto-increment IDs can collide",
+  ]}
+  answer={1}
+  explanation="Auto-increment is unique and simple, but every create must touch one sequence, which caps write throughput and adds a failure point. Distributed generators (or range allocation) let many nodes mint IDs independently while staying globally unique."
+/>
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-Separate the write path from the read-heavy redirect path.
+The defining move is to **split the write path from the read path**. They have wildly different traffic (1:100), different latency budgets, and different scaling needs, so they get separate services that scale independently and share only the mapping store.
 
 <ArchitectureDiagram />
 
+- **Edge / CDN + API Gateway** terminate TLS, route, and apply rate limits. Redirects can often be served right at the edge.
+- **Write Service** validates the URL, reserves a key from the **ID Generator**, persists the mapping, and kicks off asynchronous abuse scanning.
+- **Redirect Service** is the hot path: it reads the **Distributed Cache** first and only falls back to the **Mapping Store** on a miss. It emits a click event to the **Event Stream** and returns the redirect — it never waits on analytics.
+- **Analytics Worker** consumes the stream, aggregates counts, and writes the **Analytics Store**, fully decoupled from redirects.
+
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-Trace creation, cache-hit and cache-miss redirects, and async analytics.
+**Creating a link.** Validate, reserve an ID, encode, persist, return. Abuse scanning is fire-and-forget.
 
 <CreateUrlSequence />
 
+**Redirect — cache hit (the ~95% case).** One cache read, then respond. The click event is emitted asynchronously.
+
 <RedirectCacheHitSequence />
+
+**Redirect — cache miss.** Read the store, backfill the cache with a TTL, then respond. A negative cache entry for unknown codes prevents repeated misses from hammering the store.
 
 <RedirectCacheMissSequence />
 
+**Recording analytics.** Fully decoupled. If this pipeline lags or fails, redirects are unaffected and events are replayed on recovery.
+
 <AnalyticsSequence />
+
+For a **disabled or expired** link, the redirect service treats a `disabled` status or a past `expires_at` as a non-resolution and returns `410 Gone` (expired) or `404` (deleted), after the cache entry has been invalidated.
 
 <h2 id="storage-partitioning">Storage & Partitioning</h2>
 
-Choose a store and partition it for the access pattern.
+The access pattern is dead simple: **look up one row by primary key**. There are no joins, no range scans on the hot path, and the data is enormous. That points away from a single relational database and toward a horizontally partitioned key-value or wide-column store.
+
+<TradeoffTable
+  columns={["Option", "Fit", "Why / why not"]}
+  rows={[
+    ["Single relational DB", "Poor at scale", "Great consistency and queries we don't need; one node can't hold ~3 TB / 11k QPS"],
+    ["Sharded key-value (e.g. DynamoDB/Cassandra)", "Strong", "Point lookups by key, horizontal scale, tunable consistency — matches the pattern exactly"],
+    ["Wide-column", "Strong", "Same benefits; good if we later add per-owner listing or time-series columns"],
+  ]}
+  recommendedRow={1}
+/>
+
+<DecisionRecord
+  title="Mapping store"
+  choice="A sharded key-value store partitioned by short_code (hash partitioning)."
+  rationale="Every read and write is keyed by short_code, so hashing the code spreads load evenly across partitions and makes lookups a single-partition operation. Replication (typically 3×) gives durability and read availability."
+  alternatives="A relational primary with read replicas works at small scale and is simpler to operate, but it caps out and forces a painful migration later."
+  revisitWhen="You add access patterns the key alone can't serve (e.g. list all links for an owner) — then add a secondary index or a separate owner→codes table."
+/>
+
+Because the partition key is the code itself and codes are uniformly distributed, **hot partitions** are unlikely from key skew — but a single viral link is hot on *reads*, which the cache (not the store) absorbs. Rebalancing is handled by the store's consistent-hashing ring; backups are periodic snapshots plus a change log for point-in-time restore.
 
 <h2 id="caching">Caching</h2>
 
-Cache-aside reads, TTLs, negative caching, and stampede protection.
+Caching is what makes the 100:1 read ratio affordable. We use a **cache-aside** pattern: the redirect service checks the cache, and on a miss reads the store and populates the cache with a TTL.
+
+- **TTL** bounds staleness and lets cold entries age out; the ~600 GB hot set fits in memory.
+- **Negative caching** stores "this code does not exist" briefly so floods of bad codes don't stampede the store — with a short TTL so a newly created code becomes resolvable quickly.
+- **Invalidation** on disable/delete proactively evicts the entry so dead links stop resolving fast (this is also why we avoid 301s).
+- **Hot-key replication** spreads a single viral code across cache nodes so one key doesn't overload one node.
+
+<Callout variant="warning" title="Two failure modes to name explicitly">
+**Cache stampede:** when a hot key expires, thousands of concurrent misses hit the store at once. Mitigate with request coalescing (single-flight) so only one miss recomputes while others wait, plus jittered TTLs. **Cache unavailable:** the redirect service must fall back to the store and keep serving — degraded latency, not an outage. Size the store to survive cache loss, or accept temporary latency breaches.
+</Callout>
+
+<KnowledgeCheck
+  question="A viral link's cache entry expires and 5,000 redirects arrive in the same second. What prevents the database from being overwhelmed?"
+  options={[
+    "A longer TTL on every key",
+    "Request coalescing (single-flight) so only one miss reads the store while the rest wait",
+    "Switching to 301 redirects",
+    "Deleting the link",
+  ]}
+  answer={1}
+  explanation="Single-flight collapses concurrent misses for the same key into one store read; the result backfills the cache and the waiting requests are served from it. Jittered TTLs further spread expirations so many hot keys don't expire together."
+/>
 
 <h2 id="consistency-concurrency">Consistency & Concurrency</h2>
 
-Read-after-write, alias uniqueness, and disable/delete propagation.
+We deliberately choose **strong consistency where correctness demands it and eventual consistency everywhere else.**
+
+- **Read-after-write:** a creator should see their new link resolve immediately. Write to the store, then optionally warm the cache, before returning the short URL. Reads of a brand-new code on a different region may briefly miss until replication catches up.
+- **Alias uniqueness:** two users racing for the same custom alias is resolved by a **conditional insert** on `AliasReservation` — exactly one wins with a `409` for the other. No locks, no race.
+- **Stale cache:** bounded by TTL and eliminated on disable/delete by explicit invalidation.
+- **Disable/delete propagation:** update status in the store, invalidate the cache; replicas converge within replication lag. Using 302 (not 301) ensures browsers don't keep a private permanent cache.
+- **Analytics consistency:** intentionally eventual — counts may lag by seconds. That is the right trade for keeping redirects fast.
+
+<KnowledgeCheck
+  question="Two users submit a request for the custom alias 'sale' at the same instant. How do we guarantee only one succeeds?"
+  options={[
+    "First-come timestamps compared later by a cron job",
+    "A conditional 'insert if not exists' on the alias — the loser gets a 409",
+    "A global lock held for the whole request",
+    "Allow both; last write wins",
+  ]}
+  answer={1}
+  explanation="A conditional insert is atomic at the storage layer: exactly one insert of the alias key succeeds and the other fails cleanly with a conflict. It needs no external lock and scales with the store."
+/>
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Evolve the design through four recognizable stages.
+Don't design the final form on day one. Add complexity only when a specific trigger arrives — and name the operational cost you're taking on.
 
 <ScaleEvolution />
 
+Most real systems live happily at stage 2 for a long time. Stages 3 and 4 are justified only when global latency SLOs or edge-latency targets actually bite; each adds replication lag and operational burden that you pay for continuously.
+
+<KnowledgeCheck
+  question="Redirects are fast in your home region but slow for users on another continent. Which evolution step addresses this first?"
+  options={[
+    "Add more application servers in the home region",
+    "Replicate read-only mappings to other regions and serve redirects locally",
+    "Switch the database to a relational engine",
+    "Increase the cache TTL",
+  ]}
+  answer={1}
+  explanation="The bottleneck is cross-continent network latency, not compute. Replicating read-only mappings and serving redirects from a nearby region cuts the round trip. Writes can still home to one region since they're rare."
+/>
+
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-Reason about each failure's impact, detection, mitigation, and recovery.
+For each dependency, know the blast radius, how you detect it, how you blunt it, and how you recover. Reason in this matrix rather than hand-waving "it's highly available."
+
+<FailureMatrix
+  rows={[
+    { failure: "Cache cluster down", impact: "Higher redirect latency", detection: "Cache hit-rate / error-rate alerts", mitigation: "Fall back to store; single-flight to protect it", recovery: "Cache repopulates on demand via cache-aside" },
+    { failure: "Mapping store degraded", impact: "Some redirects fail / slow", detection: "Store latency & error SLOs", mitigation: "Serve from cache; shed load; read from replica", recovery: "Failover to healthy replica; backfill" },
+    { failure: "Whole region down", impact: "Regional outage", detection: "Health checks, synthetic probes", mitigation: "DNS/anycast failover to another region", recovery: "Region rejoins; replication catches up" },
+    { failure: "Event stream lag", impact: "Analytics counts stale", detection: "Consumer lag metric", mitigation: "None needed — redirects unaffected", recovery: "Worker drains backlog; counts converge" },
+    { failure: "Analytics pipeline down", impact: "No new click data", detection: "Worker liveness / write errors", mitigation: "Buffer events on the stream", recovery: "Replay buffered events on restart" },
+    { failure: "ID generator unavailable", impact: "Creates fail (reads fine)", detection: "Create error rate", mitigation: "Pre-allocated ID ranges per write node", recovery: "Resume central allocation when restored" },
+    { failure: "Replication lag spike", impact: "Stale reads in some regions", detection: "Replica lag metric", mitigation: "Route reads to primary for fresh data if needed", recovery: "Lag drains; replicas converge" },
+    { failure: "Abusive traffic surge", impact: "Resource pressure", detection: "Rate-limit & anomaly metrics", mitigation: "Edge rate limiting, quotas, WAF", recovery: "Block offenders; autoscale read tier" },
+  ]}
+/>
+
+<KnowledgeCheck
+  question="The analytics pipeline is down for an hour. What should happen to redirects?"
+  options={[
+    "Redirects should fail until analytics recovers",
+    "Redirects continue normally; click events buffer on the stream and are replayed later",
+    "Switch redirects to synchronous logging",
+    "Disable all links temporarily",
+  ]}
+  answer={1}
+  explanation="Analytics is deliberately decoupled and off the redirect path. Events accumulate durably on the event stream, redirects are unaffected, and the worker replays the backlog when it recovers — counts simply catch up."
+/>
 
 <h2 id="security-abuse">Security & Abuse</h2>
 
-Defend against malicious destinations, enumeration, and abuse.
+A URL shortener is an attractive tool for attackers: it hides malicious destinations behind a trusted-looking domain. Treat safety as a first-class requirement.
+
+- **Malicious destinations:** scan new URLs against a safe-browsing/threat feed asynchronously; quarantine or block links that resolve to malware or phishing.
+- **Open-redirect & unsafe schemes:** allow only `http`/`https`; reject `javascript:`, `data:`, and links back into your own auth flows.
+- **Enumeration:** sequential codes are scrapeable — add random bits or use random tokens for private links; rate-limit the redirect endpoint per IP.
+- **Abuse & quotas:** rate-limit creation per account/IP; cap links per free account; require auth for high-volume creation.
+- **Alias squatting:** reserve a deny-list of sensitive aliases (brand names, `admin`, `login`); consider verification for vanity namespaces.
+- **Authorization:** only the owner can disable/delete or view a private link's stats.
+- **Privacy & retention:** store click analytics coarsely (country, not precise location), and expire raw events on a short schedule.
+
+<Callout variant="warning" title="Why 302, restated as a security property">
+A `301 Moved Permanently` is cached by browsers and proxies, so a link flagged as malicious *after* creation may keep resolving from caches you don't control. A `302` keeps you in the loop on every click, which is exactly what you want for revocation and abuse response.
+</Callout>
 
 <h2 id="observability">Observability</h2>
 
-Define the signals that tell you the system is healthy.
+Define the signals that tell you the system is healthy before users do. Track them per region.
+
+- **Redirect latency (p50/p99)** — the headline SLI; alert on p99 > 50 ms.
+- **Redirect success rate** — fraction of 3xx vs 4xx/5xx.
+- **Cache hit rate** — a drop predicts store pressure and latency.
+- **Creation error rate** — surfaces ID-generator or validation problems.
+- **Store latency & error rate** — primary dependency health.
+- **Replication lag** — bounds read-after-write across regions.
+- **Event-stream consumer lag** — analytics freshness.
+- **Abuse blocks / rate-limit rejections** — security posture.
+- **Availability by region** — drives failover decisions.
+
+<DepthSection depth="advanced">
+Pair RED metrics (Rate, Errors, Duration) on every service with the four golden signals on dependencies. Emit a trace ID through the redirect path so a slow p99 can be attributed to cache, store, or network. Synthetic probes from multiple regions catch regional failures faster than waiting for real-user error spikes.
+</DepthSection>
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-Summarize the major decisions and when to revisit them.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<TradeoffTable
+  columns={["Decision", "Gained", "Sacrificed", "Revisit when"]}
+  rows={[
+    ["Distributed ID + Base62", "No collisions, short codes, scalable", "A coordination component to operate", "You need unguessable codes"],
+    ["Sharded KV store", "Horizontal scale, fast point reads", "Joins/ad-hoc queries", "New access patterns appear"],
+    ["Cache-aside + 302", "Fast reads, revocable links, real analytics", "Slightly higher per-redirect work than 301", "Links become truly immutable"],
+    ["Async analytics", "Redirects stay fast and resilient", "Counts are eventually consistent", "You need real-time exact counts"],
+    ["Multi-region reads (later)", "Low global latency", "Replication lag, complexity", "Global SLOs demand it"],
+  ]}
+/>
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Split read and write paths; mint Base62 codes from a distributed ID generator; store mappings in a sharded KV store fronted by a cache-aside distributed cache; redirect with 302; record clicks asynchronously."
+  rationale="It matches the dominant constraint — a read-heavy, latency-sensitive workload — while keeping writes simple and analytics decoupled and resilient."
+  revisitWhen="Traffic goes global (add regional read replicas) or links must be private (switch to unguessable random tokens)."
+/>
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-A concise end-to-end answer and likely follow-up questions.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"It's a read-heavy system, about 100:1, so I split the write and redirect paths. Creates validate the URL, get a unique ID from a distributed generator, Base62-encode it to a 7-character code, and store the mapping in a sharded key-value store keyed by the code. Redirects are the hot path: a cache-aside distributed cache serves ~95% of them in well under 50 ms, falling back to the store on a miss with single-flight to prevent stampedes. I use 302s so links stay revocable and analytics stays accurate. Click events go onto an event stream and are aggregated asynchronously, so logging never slows a redirect. For scale I start single-region and add partitioning, then regional read replicas only when global latency demands it. Main trade-off: I accept eventually-consistent analytics to keep redirects fast and available."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *How do you prevent two custom aliases from colliding? What happens when the cache is down? How do you stop sequential-code enumeration? Why 302 over 301? How do you keep redirects fast for users on another continent? How do click counts stay accurate if the analytics pipeline crashes?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Reinforce the key decisions and address common misconceptions.
+<KnowledgeCheck
+  question="Why is the redirect endpoint kept separate and minimal (just /{code}) instead of under /v1/...?"
+  options={[
+    "To make it look nicer",
+    "So it can be served cheaply at the edge/CDN with minimal routing overhead on the hot path",
+    "Because REST forbids versioning redirects",
+    "To hide it from users",
+  ]}
+  answer={1}
+  explanation="The redirect path carries ~100× the traffic of everything else. Keeping it bare lets it be cached and served at the edge with the least possible work per request, which is where the latency budget is spent."
+/>
+
+<KnowledgeCheck
+  question="What's the main reason to store click analytics in a separate datastore from the mappings?"
+  options={[
+    "Analytics data is larger and has different consistency, write, and retention needs",
+    "Key-value stores can't store integers",
+    "It's required by REST",
+    "To make redirects slower on purpose",
+  ]}
+  answer={0}
+  explanation="Mappings are the source of truth, read on the hot path, and must be durable; analytics is append-heavy, eventually consistent, and short-lived. Mixing them would couple two very different workloads and put analytics writes in the redirect path."
+/>
+
+<Faq
+  items={[
+    { question: "How long should the short code be?", answer: "Seven Base62 characters give 62⁷ ≈ 3.5 trillion combinations — far more than the ~6 billion links we expect in five years. Start at 7 and you have years of headroom; you can always lengthen later without touching existing codes." },
+    { question: "Should I use 301 or 302 redirects?", answer: "Default to 302. A 301 is cached aggressively by browsers and proxies, which breaks click analytics and makes disabling or revoking a link ineffective. Use 301 only when links are guaranteed immutable and analytics don't matter." },
+    { question: "How do I guarantee short codes are unique?", answer: "Mint unique numeric IDs from a distributed generator (or pre-allocated ranges) and Base62-encode them — they're unique by construction, so there's no collision check on writes. The alternative is random tokens with a conditional insert that retries on the rare collision." },
+    { question: "What stops someone from guessing or scraping every link?", answer: "Purely sequential codes are enumerable. Interleave shards or add random bits before encoding to break the obvious sequence, rate-limit the redirect endpoint, and use fully random tokens for private links." },
+    { question: "What happens when the cache goes down?", answer: "The redirect service falls back to the mapping store and keeps serving — latency rises but the system stays up. Single-flight protects the store from stampedes, and the cache refills on demand via cache-aside." },
+    { question: "How are custom aliases kept unique under races?", answer: "A conditional 'insert if not exists' on the alias key. Exactly one concurrent request succeeds; the others get a 409 Conflict. No external locks are needed." },
+    { question: "Why is the write path so much simpler than the read path?", answer: "Writes are ~1% of traffic and aren't latency-critical, so a single write tier handles them easily. Reads are ~100× heavier and latency-sensitive, so nearly all the architecture — caching, replication, edge serving — exists to serve redirects fast." },
+    { question: "How do click counts stay accurate if analytics crashes?", answer: "Click events are written to a durable event stream and aggregated asynchronously. If the consumer crashes, events buffer on the stream and are replayed on recovery; redirects are never affected and counts simply catch up." },
+    { question: "How do I make redirects fast for a global audience?", answer: "Replicate read-only mappings to other regions and serve redirects from the region nearest the user, optionally caching at the edge. Writes can still home to a single region because they're rare." },
+    { question: "Do I need a relational database?", answer: "No. The only access pattern on the hot path is a point lookup by code, which a sharded key-value store serves better at this scale. Reach for relational features only if you add query patterns the key alone can't satisfy." },
+    { question: "How do expiring links work?", answer: "Store an expires_at and treat a past value as a non-resolution (410 Gone), invalidating the cache entry. A background job can also sweep expired rows to reclaim space." },
+    { question: "How do I handle a link that turns out to be malicious after creation?", answer: "Asynchronous safe-browsing scans flag it; set status=disabled and invalidate the cache so it stops resolving quickly. Using 302 (not 301) is what makes this revocation actually take effect for users." },
+    { question: "What's the single most important design decision here?", answer: "Recognizing the ~100:1 read-to-write ratio and splitting the read and write paths so each scales independently — with caching on the read path. Almost every other choice follows from optimizing redirects." },
+  ]}
+/>
