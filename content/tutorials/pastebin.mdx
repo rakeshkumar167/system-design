@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section sets the context for designing Pastebin in a system design interview.
+
+<h2 id="requirements">Requirements</h2>
+
+This section covers the functional and non-functional requirements for the Pastebin system.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section walks through storage, throughput, and bandwidth calculations for Pastebin at scale.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core data entities: the Paste record with its blob key, owner, visibility, expiry, and size.
+
+<h2 id="api-design">API Design</h2>
+
+This section specifies the REST API for creating, reading, and managing pastes.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the high-level architecture: clients, CDN, app servers, metadata database, and object storage.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section traces the create, cache-hit read, cache-miss read, and expiry flows step by step.
+
+<h2 id="blob-metadata-split">Blob & Metadata Storage</h2>
+
+This section explains why content lives in object storage while metadata lives in a relational database.
+
+<h2 id="expiry-and-ttl">Expiry & TTL</h2>
+
+This section covers lazy expiry on read, active deletion by the expiry worker, and burn-after-read semantics.
+
+<h2 id="caching-cdn">Caching & CDN</h2>
+
+This section describes how immutable paste content is cached at CDN edges with long TTLs and how invalidation works on expiry.
+
+<h2 id="access-control">Access Control & Privacy</h2>
+
+This section details the public, unlisted, private, and password-protected visibility modes and how each interacts with CDN caching.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section traces the scaling journey from a single node to a globally distributed system.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section analyses failure scenarios including object storage outage, metadata DB outage, CDN stale content, expiry worker lag, hot pastes, and region loss.
+
+<h2 id="security-abuse">Security & Abuse</h2>
+
+This section covers size limits, secret scanning, spam and phishing detection, stored-XSS mitigation, and id enumeration resistance.
+
+<h2 id="observability">Observability</h2>
+
+This section identifies the key metrics to monitor: read latency, CDN hit ratio, expiry backlog, storage growth, and 404/410 rates.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares design decisions and alternative approaches across storage, expiry, and access control.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section provides a concise 60-second answer and common follow-up questions for the Pastebin interview problem.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section contains knowledge check questions and a FAQ covering the most important concepts from the Pastebin tutorial.

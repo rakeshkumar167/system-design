@@ -32,7 +32,7 @@ export const problems: readonly Problem[] = [
       "Store and serve large text snippets with expiry, privacy controls, and CDN delivery.",
     difficulty: "Foundational",
     concepts: ["Blob storage", "TTL & expiry", "CDN", "Access control"],
-    status: "coming-soon",
+    status: "available",
     sequence: 3,
   },
   {

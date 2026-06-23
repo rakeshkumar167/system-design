@@ -2,13 +2,14 @@ import { describe, it, expect } from "vitest";
 import { getTutorial, tutorials } from "@/lib/tutorial-registry";
 
 describe("tutorial registry", () => {
-  it("registers the URL Shortener and Rate Limiter tutorials", () => {
-    expect(Object.keys(tutorials).sort()).toEqual(["rate-limiter", "url-shortener"]);
+  it("registers the URL Shortener, Rate Limiter, and Pastebin tutorials", () => {
+    expect(Object.keys(tutorials).sort()).toEqual(["pastebin", "rate-limiter", "url-shortener"]);
   });
 
-  it("describes the URL Shortener's eighteen sections and the Rate Limiter's fifteen", () => {
+  it("describes the URL Shortener's eighteen sections, the Rate Limiter's fifteen, and the Pastebin's eighteen", () => {
     expect(getTutorial("url-shortener")?.sections).toHaveLength(18);
     expect(getTutorial("rate-limiter")?.sections).toHaveLength(15);
+    expect(getTutorial("pastebin")?.sections).toHaveLength(18);
   });
 
   it("gives every section a unique id and a valid depth", () => {
@@ -21,6 +22,6 @@ describe("tutorial registry", () => {
   });
 
   it("returns undefined for unregistered tutorials", () => {
-    expect(getTutorial("pastebin")).toBeUndefined();
+    expect(getTutorial("notification-service")).toBeUndefined();
   });
 });
