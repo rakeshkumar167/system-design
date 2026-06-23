@@ -28,13 +28,26 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(24);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(22);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
     page.getByRole("heading", { name: "Payment System" }),
   ).toBeVisible();
   await expect(page.getByText(/showing 1 of 25/i)).toBeVisible();
+});
+
+test("learner can open the pastebin tutorial", async ({ page }) => {
+  await page.goto("/learn/pastebin");
+  await expect(
+    page.getByRole("heading", { name: /design a pastebin/i }),
+  ).toBeVisible();
+  // Navigate to the section via URL fragment (TOC is hidden on mobile viewports)
+  await page.goto("/learn/pastebin#expiry-and-ttl");
+  await expect(page.locator("#expiry-and-ttl")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /pastebin architecture/i }).first(),
+  ).toBeVisible();
 });
 
 test("theme toggle switches between light and dark", async ({ page }) => {
