@@ -19,6 +19,7 @@ import {
   AnalyticsSequence,
 } from "@/components/diagrams/request-flow-diagrams";
 import { ScaleEvolution } from "@/components/diagrams/scale-evolution";
+import { RateLimitVisualizer } from "@/components/diagrams/rate-limit-visualizer";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -45,6 +46,7 @@ const teachingComponents = {
   RedirectCacheMissSequence,
   AnalyticsSequence,
   ScaleEvolution,
+  RateLimitVisualizer,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
