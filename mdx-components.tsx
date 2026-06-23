@@ -11,6 +11,7 @@ import { DepthSection } from "@/components/learning/depth-section";
 import { Faq } from "@/components/learning/faq";
 import { KnowledgeCheck } from "@/components/learning/knowledge-check";
 import { RateLimiterCapacity } from "@/components/learning/rate-limiter-capacity";
+import { PastebinCapacity } from "@/components/learning/pastebin-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -46,6 +47,7 @@ const teachingComponents = {
   Faq,
   KnowledgeCheck,
   RateLimiterCapacity,
+  PastebinCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
