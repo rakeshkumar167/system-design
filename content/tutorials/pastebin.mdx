@@ -1,71 +1,444 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section sets the context for designing Pastebin in a system design interview.
+A Pastebin takes a blob of text — a stack trace, a config file, a snippet of code — stores it, and hands back a short, shareable URL like `pst.io/aZ4kP9`. Anyone with the link reads the content back; the paste may be public or private, and it usually carries an expiry so it doesn't live forever. It is the canonical way to share text that is too long to drop into a chat and too transient to deserve a Git repo.
+
+At a glance it looks like a URL shortener — short id in, content out, read-heavy — and a weak candidate will spend the interview re-deriving key generation. The reframe that earns points: a URL shortener stores a *tiny* string (a URL) and the hard part is generating keys; a Pastebin stores a *large* blob (kilobytes to megabytes) that **expires** and has **privacy**, and the hard parts are where that blob lives, how it dies on time, and who is allowed to read it. Spend the opening minutes establishing scope. Good questions to ask:
+
+- How big can a paste be — a few KB of logs, or 10 MB of data? What's the cap?
+- Do pastes expire? Is there a one-time "burn after reading" mode?
+- What privacy levels — public, unlisted (link-only), private, password-protected?
+- Read:write ratio and scale — how many pastes created and read per day?
+- Do we render/syntax-highlight content, or just serve raw text?
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and scope · **5 min** requirements and the size cap · **5 min** capacity (the blob-vs-metadata split falls out here) · **5 min** entity model and API · **10 min** architecture, storage, and the read path through the CDN · **10 min** expiry, privacy, and failure modes · **5 min** wrap-up. Say your assumptions out loud — the interviewer is grading whether you separate large immutable content from small mutable metadata and how you reason about expiry, not whether you can invent a base-62 encoder.
+</Callout>
+
+This tutorial commits to concrete assumptions so the numbers stay consistent end to end. **In scope:** create / read / raw-fetch APIs, the blob-plus-metadata storage split, expiry and TTL (lazy and active deletion, one-time pastes), CDN delivery of immutable content, and access control (public / unlisted / private / password). **Out of scope:** real-time collaborative editing (that's the Collaborative Document Editor problem), the internals of syntax highlighting, full-text search across all pastes, and account/billing productization — name them so the interviewer sees the boundary, then set them aside.
 
 <h2 id="requirements">Requirements</h2>
 
-This section covers the functional and non-functional requirements for the Pastebin system.
+Separate what the service must *do* from how *well* it must do it. For a Pastebin the load-bearing non-functional targets are read latency (it's read-heavy and globally shared), content durability (losing a paste is losing user data), and a hard size cap (it bounds every capacity number that follows).
+
+<RequirementsTable
+  functional={[
+    "Create a paste: text plus optional title, language, expiry, and visibility",
+    "Read a paste by its short id (rendered view and raw text/plain)",
+    "Expire pastes by TTL; support one-time 'burn after reading'",
+    "Visibility: public, unlisted (link-only), private (owner), password-protected",
+    "Return a short, shareable URL on create",
+    "Enforce a maximum paste size",
+  ]}
+  nonFunctional={[
+    { goal: "Read latency (p99)", target: "< 100 ms (CDN-served)" },
+    { goal: "Content durability", target: "11 nines (object storage)" },
+    { goal: "Availability", target: "99.95%" },
+    { goal: "Max paste size", target: "10 MB" },
+    { goal: "Read : write ratio", target: "~10 : 1, read-heavy" },
+    { goal: "Scalability", target: "horizontal" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **read latency at p99 must stay under ~100 ms globally**, and since paste content never changes after it's written, the way we hit that is a CDN: serve immutable content from the edge so most reads never reach the origin. Second, **content durability is non-negotiable** — a paste is user data, so content belongs in object storage engineered for eleven nines of durability, not on a service node's local disk. Third, the **10 MB size cap** is not a detail; it bounds the largest single object, the upload path, the per-request memory, and — multiplied by volume — the entire storage estimate. Pin it down early.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section walks through storage, throughput, and bandwidth calculations for Pastebin at scale.
+Estimates are directional — their job is to reveal *which* resource is under pressure. For a Pastebin there are two stories: a modest **request rate** (writes are light, reads are ~10× heavier) and a **storage split** where content and metadata live on wildly different scales. We size both from one set of assumptions.
+
+<PastebinCapacity
+  assumptions={{
+    newPastesPerMonth: 30000000,
+    readWriteRatio: 10,
+    peakMultiplier: 5,
+    avgPasteSizeKb: 10,
+    retentionYears: 2,
+    metadataBytesPerPaste: 400,
+  }}
+/>
+
+The takeaways. First, the **request rate is small**: thirty million pastes a month is only about **12 writes per second** on average and **~116 reads per second**, peaking near **580 reads per second** — numbers a single well-provisioned tier handles, and that a CDN shaves down to a trickle at the origin. This is not a QPS problem. Second, the **storage split is the whole story**: 720 million retained pastes hold about **7.2 TB of content** but only **~288 GB of metadata** — content outweighs metadata by ~25× *even at a tiny 10 KB average*, and real pastes (logs, dumps) push that ratio toward 1000×. That gap is the design: **content goes to object storage; metadata — a pointer plus a few attributes — goes to a database.** Third, because content dominates and is immutable, the read path is a **caching problem, not a scaling problem** — the CDN, not the origin, carries peak reads.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core data entities: the Paste record with its blob key, owner, visibility, expiry, and size.
+The entity model encodes the central decision: a paste is split into a small **metadata** record in a database and a large **content blob** in object storage, joined by a pointer. The metadata row never holds the bytes — it holds a `blob_key` that locates them.
+
+<EntityModel
+  name="Paste"
+  description="A single metadata record per paste. The large content blob lives in object storage; this row holds only a pointer to it plus the attributes we query, expire, and authorize on."
+  fields={[
+    { name: "id", type: "string (PK)", notes: "short shareable code, e.g. 'aZ4kP9'" },
+    { name: "blob_key", type: "string", notes: "object-storage key for the content (not the content)" },
+    { name: "owner_id", type: "string | null", notes: "null for anonymous pastes" },
+    { name: "visibility", type: "enum", notes: "public | unlisted | private | password" },
+    { name: "password_hash", type: "string | null", notes: "set only for password visibility" },
+    { name: "expires_at", type: "timestamp | null", notes: "null = never; drives lazy + active deletion" },
+    { name: "one_time", type: "bool", notes: "burn-after-read: delete on first successful read" },
+    { name: "size_bytes", type: "int", notes: "content length; enforced against the 10 MB cap" },
+    { name: "language", type: "string | null", notes: "hint for syntax highlighting on render" },
+    { name: "created_at", type: "timestamp", notes: "creation time" },
+  ]}
+  keys="Primary key is the short id, which is also how the public read path looks a paste up — a single point lookup. Secondary index on expires_at lets the active sweeper find expired pastes cheaply; an index on owner_id backs an owner's 'my pastes' listing. The row is small (~400 bytes) and partitions cleanly by id."
+/>
+
+The id doubles as the access token for unlisted pastes, so it must be **long and random enough to be unguessable** — a short sequential counter would let anyone enumerate every "link-only" paste. A 6–8 character base-62 id gives billions of values; for unlisted/private pastes you lean on that entropy (or a longer id) so the link itself is the secret. Everything the read path needs to *authorize and expire* a request — visibility, password hash, `expires_at`, `one_time` — lives in this small row, so those checks are one fast metadata lookup, never a fetch of the multi-megabyte blob.
 
 <h2 id="api-design">API Design</h2>
 
-This section specifies the REST API for creating, reading, and managing pastes.
+Three endpoints carry the product: create a paste, read it (rendered), and fetch the raw bytes. The raw endpoint is the one the CDN caches hardest, because raw content is immutable and identical for every reader.
+
+<ApiContract
+  method="POST"
+  path="/v1/pastes"
+  summary="Create a paste. The body holds the content and options; the response returns the short id and URL."
+  request={`{
+  "content": "def hello():\\n    print('hi')",
+  "language": "python",
+  "visibility": "unlisted",
+  "expires_in": 86400,
+  "one_time": false
+}`}
+  response={`HTTP/1.1 201 Created
+Location: https://pst.io/aZ4kP9
+
+{
+  "id": "aZ4kP9",
+  "url": "https://pst.io/aZ4kP9",
+  "raw_url": "https://pst.io/aZ4kP9/raw",
+  "expires_at": "2026-06-24T12:00:00Z"
+}`}
+  statusCodes={[
+    { code: "201", meaning: "Created — id and URLs returned" },
+    { code: "400", meaning: "Malformed body or unknown visibility/language" },
+    { code: "413", meaning: "Payload too large — exceeds the 10 MB cap" },
+    { code: "429", meaning: "Too many creates — rate limited (see Security & Abuse)" },
+  ]}
+  notes="The server writes the content blob to object storage first, then commits the metadata row pointing at it, so a committed row always references a real blob. expires_in (seconds) is converted to an absolute expires_at. The 10 MB cap is enforced on the upload before the blob is stored."
+/>
+
+<ApiContract
+  method="GET"
+  path="/{id}/raw"
+  summary="Fetch the raw paste content as text/plain. Immutable and aggressively CDN-cacheable for public/unlisted pastes."
+  response={`HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Cache-Control: public, max-age=31536000, immutable
+
+def hello():
+    print('hi')`}
+  statusCodes={[
+    { code: "200", meaning: "Found and not expired — raw content returned" },
+    { code: "403", meaning: "Forbidden — private paste, or wrong/absent password" },
+    { code: "404", meaning: "No such id" },
+    { code: "410", meaning: "Gone — the paste existed but has expired" },
+  ]}
+  notes="Raw content is served as text/plain (never text/html) so a malicious paste can't run as a script in a victim's browser. Public/unlisted pastes get a long immutable Cache-Control so the CDN serves them from the edge; private and password pastes are marked no-store and bypass the shared cache. A 404 means the id never existed; a 410 means it expired — distinct so clients (and caches) can treat them differently."
+/>
+
+The read endpoint (`GET /{id}`) returns the rendered HTML page with syntax highlighting; the `/{id}/raw` endpoint returns the bytes. Splitting them lets the raw path be a pure, cacheable, content-typed `text/plain` response while the rendered page can carry navigation and ads without polluting the cacheable artifact. Crucially, the metadata lookup (expiry, visibility, password) happens **before** the blob is fetched, so an expired or forbidden request is rejected without ever touching the multi-megabyte object.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the high-level architecture: clients, CDN, app servers, metadata database, and object storage.
+The architecture is shaped entirely by the blob-vs-metadata split and the read-heavy, immutable workload: a **CDN** in front of reads, stateless **app servers** holding no content, a **metadata database** for the small rows, **object storage** for the large blobs, and an **expiry worker** that reaps dead pastes out of band.
+
+<PastebinArchitecture />
+
+- **CDN.** The front door for reads. Because raw content is immutable, the edge caches it with a long TTL keyed by id, so the vast majority of reads are served near the user and never reach the origin — this is what buys the sub-100 ms p99 globally.
+- **App / API servers.** Stateless and horizontally scalable. On create they enforce the size cap, write the blob, then commit metadata; on a cache miss they authorize the request from metadata, fetch the blob, and respond. They hold no durable state, so any instance serves any request.
+- **Metadata database.** The small, queryable source of truth: id → blob pointer plus visibility, expiry, and ownership. Partitioned by id; the only thing the authorize-and-expire checks consult.
+- **Object storage.** The durable home for content blobs (eleven nines). It holds the bytes and nothing about access logic; a lifecycle policy can even expire objects on its own.
+- **Expiry worker.** An out-of-band sweeper that finds pastes past `expires_at` and deletes both the metadata row and the blob, so expired storage is actually reclaimed rather than merely hidden.
+
+The decisive boundary is **small mutable metadata versus large immutable content**. Keeping them in different stores lets each scale on its own axis — the database stays small and fast for point lookups and expiry queries, while object storage absorbs terabytes of blobs cheaply — and lets the CDN treat content as the immutable artifact it is. Every section that follows is a consequence of that split.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section traces the create, cache-hit read, cache-miss read, and expiry flows step by step.
+Four flows cover the system: creating a paste, the common cached read, the cache-miss read, and expiry. Trace each so the ordering — especially "blob before metadata" — is explicit.
+
+**Create.** The server enforces the size cap, writes the content to object storage to get a `blob_key`, then commits the metadata row pointing at it. Blob-before-metadata means a committed row never dangles; a blob with no row is just unreferenced garbage the sweeper collects.
+
+<CreatePasteSequence />
+
+**Read — cache hit.** The overwhelmingly common case. The CDN has the immutable raw content at the edge and returns it directly; the origin, the database, and object storage are never touched.
+
+<ReadCacheHitSequence />
+
+**Read — cache miss.** On a miss the request reaches an app server, which first authorizes and expiry-checks the paste from its small metadata row, then fetches the blob from object storage, returns it, and lets the CDN backfill with a long TTL so the next reader hits the edge.
+
+<ReadCacheMissSequence />
+
+**Expiry.** Expiry is enforced two ways at once. *Lazily*, a read of a paste whose `expires_at` has passed is rejected with `410 Gone` before the blob is served — so an expired paste is never readable even if its bytes still physically exist. *Actively*, the expiry worker sweeps the metadata index and deletes both the row and the blob, reclaiming storage.
+
+<ExpirySequence />
 
 <h2 id="blob-metadata-split">Blob & Metadata Storage</h2>
 
-This section explains why content lives in object storage while metadata lives in a relational database.
+This is the core structural decision, so make the reasoning explicit. A paste has two parts with opposite characteristics: **content** is large (KBs–MBs), immutable, and read as an opaque whole; **metadata** is tiny (hundreds of bytes), queried and mutated, and the thing you filter, authorize, and expire on. Storing them together is the classic mistake.
+
+**Why content goes to object storage.** Object stores (S3 and friends) are purpose-built for exactly this: large immutable objects, eleven-nines durability, cheap per-GB pricing, virtually unlimited capacity, and direct CDN integration. They give you durable blob storage without you operating replicas or worrying about a 10 MB row.
+
+**Why metadata goes to a database.** The attributes you query — *find pastes that expired*, *list this owner's pastes*, *is this one private?* — need indexes and fast point lookups on small rows. A database does that well; an object store cannot (it has no secondary indexes, no `WHERE expires_at < now`).
+
+<Callout variant="info" title="Why not just put the blob in the database?">
+Storing multi-megabyte blobs as database rows or BLOB columns bloats row size, balloons backups, blows up replication traffic, and evicts the small hot rows you actually query from the buffer cache — all to get durability and scale a database is worse at than an object store. The pointer indirection (`blob_key`) costs one extra fetch on a cache miss and buys cheap, durable, CDN-frontable content storage. It is almost always the right trade.
+</Callout>
+
+The join between them is the `blob_key` pointer. One refinement is **content-addressed storage**: name the blob by the hash of its content, so two identical pastes share one object and you get **deduplication** for free — handy when the same stack trace gets pasted a thousand times. The cost is that deletion must be reference-counted (don't delete a blob another paste still points at), so most designs start with one blob per paste and add content-addressing only when dedup measurably pays.
+
+<KnowledgeCheck
+  question="Why store paste content in object storage and only a pointer in the database, rather than the content itself in a database column?"
+  options={[
+    "Databases cannot store text at all",
+    "Large blobs bloat rows, backups, and replication and evict hot rows from cache — object storage gives cheap, durable, CDN-frontable content while the DB stays small and fast for the queries that need indexes",
+    "Object storage is faster than a database for every operation",
+    "It is required to generate the short id",
+  ]}
+  answer={1}
+  explanation="Content and metadata have opposite profiles: content is large, immutable, and read whole; metadata is small and queried. Object storage is built for durable immutable blobs and integrates with the CDN; the database is built for indexed point lookups and expiry queries on small rows. Putting blobs in the DB bloats backups and replication and pushes the hot small rows out of cache — for none of the benefits."
+/>
 
 <h2 id="expiry-and-ttl">Expiry & TTL</h2>
 
-This section covers lazy expiry on read, active deletion by the expiry worker, and burn-after-read semantics.
+Pastes are ephemeral, and getting expiry right is what separates a Pastebin from a URL shortener. The semantics: a paste with a non-null `expires_at` must become unreadable the instant that time passes, and its storage must eventually be reclaimed. Two mechanisms together deliver both halves.
+
+**Lazy deletion** checks `expires_at` on every read and returns `410 Gone` if it has passed, refusing to serve the content even though the bytes still physically exist. This makes expiry *correct immediately* — there is no window where an expired paste is still readable — and costs nothing extra, since the read already loads the metadata row. Its weakness is that it never reclaims storage: a paste that's created and never read again would sit on disk forever.
+
+**Active deletion** closes that gap. An expiry worker periodically queries the `expires_at` index for pastes past due and deletes both the metadata row and the object-storage blob; alternatively, an **object-storage lifecycle policy** can expire blobs by age directly. This *reclaims storage* but runs in batches, so on its own it would leave a paste briefly readable between its expiry time and the next sweep.
+
+The two are complementary, so you run **both**: lazy deletion guarantees an expired paste is never served (correctness, immediate), and active deletion guarantees the storage is actually freed (cost, eventual). Lazy alone leaks storage; active alone has a correctness gap. Together they're tight.
+
+<Callout variant="warning" title="One-time pastes need an atomic read-and-delete">
+A "burn after reading" paste must be served exactly once, so the read and the delete have to be a single atomic step. If you check-then-serve-then-delete, two concurrent readers can both pass the check and both get the content — the secret leaks twice. Make the first read a conditional, atomic operation (e.g. a compare-and-delete on the metadata row, or a single-use token consumed transactionally) so exactly one reader wins and the loser gets a 410.
+</Callout>
+
+A subtle interaction: **expiry must propagate to the CDN.** If the edge cached the content with a long TTL, the paste can outlive its `expires_at` at the edge. The fixes are to bound the edge TTL to something shorter than typical paste lifetimes and revalidate, or to actively **purge the CDN key** when a paste is deleted, or to make short-lived pastes `no-store` so they're never edge-cached at all. Expiry is only as tight as the most stale copy.
 
 <h2 id="caching-cdn">Caching & CDN</h2>
 
-This section describes how immutable paste content is cached at CDN edges with long TTLs and how invalidation works on expiry.
+The read path is a caching problem because paste content has the perfect property for caching: it is **immutable**. Once written, `/{id}/raw` returns identical bytes to every reader forever (until the paste is deleted), so it can be cached at the edge with a long TTL and served near the user — which is exactly how a globally read-heavy service hits sub-100 ms p99 while the origin stays nearly idle.
+
+- **Cache the immutable raw content.** Public and unlisted pastes get `Cache-Control: public, max-age=…, immutable`, keyed by id. The first reader anywhere warms the edge; everyone after hits it. The origin sees only misses and creates.
+- **Negative-cache misses.** Cache `404` (unknown id) and `410` (expired) briefly so a flood of requests for a dead or guessed id doesn't stampede the origin and database.
+- **Invalidate on death.** When a paste is deleted or expires, the cached copy must go — either by purging the CDN key, or by keeping the edge TTL short enough (with origin revalidation) that staleness is bounded. This is the one crack in "immutable": content never changes, but it can *cease to exist*.
+- **Private content bypasses the shared cache.** A private or password paste must never sit in a shared edge cache where another user could be served it. Mark those responses `no-store`, or serve their blobs through **signed, time-limited URLs** that the CDN treats as per-user and uncacheable.
+
+<KnowledgeCheck
+  question="What property of paste content makes a CDN so effective for the read path, and what is the one case it complicates?"
+  options={[
+    "Content is small, so it fits in cache — expiry is never an issue",
+    "Content is immutable, so it can be cached at the edge with a long TTL and served identically to all readers; the complication is that a paste can cease to exist (expire/delete), so the cache must be invalidated or kept short",
+    "Content is private by default, so the CDN encrypts it",
+    "The CDN generates the short id",
+  ]}
+  answer={1}
+  explanation="Immutability means every reader gets identical bytes, so the edge can cache aggressively and the origin stays idle — the basis for low global latency. The wrinkle is that immutable content can still be deleted or expire, so caching must be paired with invalidation (purge on delete) or a bounded TTL, and private pastes must bypass the shared cache entirely."
+/>
 
 <h2 id="access-control">Access Control & Privacy</h2>
 
-This section details the public, unlisted, private, and password-protected visibility modes and how each interacts with CDN caching.
+Visibility is a per-paste attribute checked from metadata on every read, before the blob is fetched. Four levels cover the product, and they differ in *where* the secret lives and *whether the content can be edge-cached*.
+
+- **Public** — listed and indexable; anyone can find and read it. Fully CDN-cacheable.
+- **Unlisted** — readable by anyone with the link but not listed or indexed. The security is the **id's entropy**: the link itself is the secret, which is why ids must be long and random enough to resist enumeration. Still CDN-cacheable (the URL is the capability).
+- **Private** — only the owner, authenticated, may read it. The check hits the origin (an authenticated session), so private content **bypasses the shared CDN cache**.
+- **Password-protected** — readable by anyone who supplies the password. The metadata holds a `password_hash`; the origin verifies the supplied password against it before serving, so these also bypass the shared cache.
+
+The design tension is **privacy versus cacheability**: anything that requires a per-user authorization decision can't be served from a shared edge cache, because the cache can't make that decision. So public and unlisted pastes — where the URL *is* the authorization — ride the CDN, while private and password pastes are authorized at the origin and served `no-store` or via **signed, time-limited URLs** that grant one reader temporary access to the blob without making it publicly cacheable.
+
+<Callout variant="info" title="Unlisted is only as private as the id is unguessable">
+"Unlisted" leans entirely on the id being infeasible to guess or enumerate. A short sequential id (`/1`, `/2`, `/3`) would let anyone scrape every unlisted paste. Use long, random, high-entropy ids for unlisted/private pastes so the link is a genuine secret, and never expose a sequential counter as the public id.
+</Callout>
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section traces the scaling journey from a single node to a globally distributed system.
+Don't build the global form on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before you take on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single DB + local disk", "Day one; one node stores rows and files together", "No durability or scale — a disk loss is data loss; content and metadata compete for the same node"],
+    ["Object storage for blobs + DB for metadata", "Content outgrows a node and needs real durability", "A pointer indirection and a second system to operate; an extra fetch on cache miss"],
+    ["CDN in front of reads", "Read latency and origin load climb as readership globalizes", "Cache invalidation on expiry/delete and private-content bypass rules to get right"],
+    ["Partition metadata + multi-region", "Metadata or traffic exceeds one DB / one region", "Partition-key routing, cross-region replication, and consistency/latency trade-offs"],
+  ]}
+  recommendedRow={1}
+/>
+
+The progression maps onto the capacity numbers. A single node storing rows and files is fine for a prototype but has no durability story, so the first real move is to **split content into object storage** (durable, cheap, unbounded) and keep small metadata in a database — the split this whole design is built on. As readership globalizes, a **CDN** in front of the immutable content drops origin load and latency together, which is the highest-leverage step for a read-heavy service. Only when metadata itself outgrows one database — hundreds of millions of small rows, or a need to serve regions locally — do you **partition by id and go multi-region**. Most Pastebins live comfortably at "object storage + DB + CDN"; partitioning and multi-region are justified only by measured scale.
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section analyses failure scenarios including object storage outage, metadata DB outage, CDN stale content, expiry worker lag, hot pastes, and region loss.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery — rather than hand-waving "it's highly available." The split architecture has a few failure modes unique to it, especially the partial write between the two stores.
+
+<FailureMatrix
+  rows={[
+    { failure: "Object storage outage", impact: "Cache-miss reads can't fetch content; creates can't store blobs. CDN-cached reads still succeed", detection: "Object-store error/latency; create failure rate", mitigation: "Serve from CDN where possible; retry with backoff; cross-region/replicated buckets", recovery: "Store recovers; misses repopulate the CDN; queued creates retry" },
+    { failure: "Metadata DB outage", impact: "No authorize/expiry checks, so origin reads and all creates fail; cached public reads still serve", detection: "DB error rate, connection-pool saturation", mitigation: "Replicas with failover; read from a replica; fail creates fast and shed load", recovery: "Failover promotes a replica; writes resume; caches absorbed the gap" },
+    { failure: "CDN outage or stale edge", impact: "All reads fall back to the origin (load spike); or an expired/deleted paste is briefly served from a stale edge", detection: "Origin read-rate surge; cache hit-ratio drop; staleness alarms", mitigation: "Origin autoscales to absorb the fallback; bounded edge TTLs and purge-on-delete cap staleness", recovery: "CDN recovers; edges rewarm; origin load normalizes" },
+    { failure: "Expiry worker lag / failure", impact: "Storage isn't reclaimed (cost grows); expired pastes stay unreadable (lazy 410 still holds)", detection: "Rising count of past-due-but-present pastes; storage-growth alarms", mitigation: "Lazy deletion keeps correctness; object-storage lifecycle policy as a backstop sweep", recovery: "Worker catches up or lifecycle policy reaps; storage drops back" },
+    { failure: "Hot paste (viral link)", impact: "One id gets enormous read traffic", detection: "Per-id request-rate skew at the edge/origin", mitigation: "The CDN absorbs it natively — immutable content fans out from the edge; origin sees one miss", recovery: "Traffic subsides; edge entry ages out" },
+    { failure: "Partial write (blob stored, metadata commit failed)", impact: "An orphan blob with no metadata row — unreferenced but harmless", detection: "Reconciliation job comparing blobs to rows; create error logs", mitigation: "Blob-before-metadata ordering means no dangling pointer ever; a GC sweep deletes orphan blobs", recovery: "Garbage-collection reclaims the orphan; the user simply retries the create" },
+    { failure: "Region loss", impact: "Pastes homed in that region are unavailable", detection: "Regional health checks; cross-region replication lag", mitigation: "Replicate object storage and metadata cross-region; route reads to a healthy region", recovery: "Failover to the replica region; reconcile on return" },
+  ]}
+/>
+
+The theme: **blob-before-metadata ordering turns the dangerous failure into a harmless one.** Because the blob is always written before the row that points at it, a crash mid-create can only leave an *orphan blob* — unreferenced storage a garbage collector reclaims — never a metadata row pointing at content that doesn't exist. And because lazy deletion enforces expiry on read, even a totally stalled expiry worker can't make an expired paste readable; it only delays reclaiming storage.
+
+<KnowledgeCheck
+  question="During create, why write the content blob to object storage before committing the metadata row, rather than the other way around?"
+  options={[
+    "Object storage is faster to write than the database",
+    "So a committed metadata row always points at a real blob; a crash can only leave an unreferenced orphan blob (harmless, GC-able), never a row pointing at missing content",
+    "It makes the short id shorter",
+    "The CDN requires the blob first",
+  ]}
+  answer={1}
+  explanation="Ordering blob-before-metadata means the only inconsistent state a mid-create crash can produce is an orphan blob with no row — unreferenced storage that a garbage-collection sweep reclaims. The reverse order would risk a committed row pointing at content that was never stored, which is a user-visible broken paste. The safe failure is the one you want."
+/>
 
 <h2 id="security-abuse">Security & Abuse</h2>
 
-This section covers size limits, secret scanning, spam and phishing detection, stored-XSS mitigation, and id enumeration resistance.
+A Pastebin accepts arbitrary text from anonymous users and serves it back to others, which makes it a magnet for abuse. The defenses fall into content safety, platform abuse, and a serving rule that prevents the worst class of attack.
+
+- **Serve raw as `text/plain`, never `text/html`.** The single most important rule. If you serve untrusted paste content with an HTML content type, a paste containing `<script>` becomes **stored XSS** that runs in the reader's browser on your domain. Serve raw content as `text/plain` (and render the highlighted view only through a sandboxed, escaped pipeline, ideally on a separate origin) so pasted markup is inert.
+- **Enforce the size cap and rate-limit creates.** The 10 MB cap bounds storage and memory; rate-limiting paste creation per IP/account (the Rate Limiter problem) blunts spammers using the service as free hosting for phishing or malware payloads.
+- **Scan for secrets and malware.** Asynchronously scan new pastes for leaked credentials (API keys, tokens) and known-malicious payloads, flagging or quarantining hits — both to protect users who paste secrets by accident and to keep the platform off abuse blocklists.
+- **Support abuse reports and takedown.** Provide a report path and a fast takedown mechanism (delete row + blob + purge CDN), since public pastes are routinely abused for phishing pages and pirated content.
+- **Don't leak unlisted ids.** Unlisted privacy rests on id entropy, so never expose a sequential or guessable id, and negative-cache `404`s so an attacker can't cheaply probe the id space.
+
+<Callout variant="warning" title="Untrusted content is the threat, and text/plain is the seatbelt">
+The defining security fact of a Pastebin is that it stores attacker-controlled content and serves it to victims. Always serve the raw artifact as `text/plain` so it can't execute, isolate any rendered/highlighted view (sandbox, separate origin, strict escaping), and treat every paste as hostile. Most Pastebin security incidents are stored XSS from serving untrusted content with an executable content type.
+</Callout>
 
 <h2 id="observability">Observability</h2>
 
-This section identifies the key metrics to monitor: read latency, CDN hit ratio, expiry backlog, storage growth, and 404/410 rates.
+Instrument the two things that define the service's health: the read path's latency and cache effectiveness, and the storage system's growth and expiry hygiene.
+
+- **Read latency (p99) and CDN hit ratio** — the headline SLIs. A falling hit ratio means more reads are hitting the origin and latency will follow; alert on it before users feel it.
+- **Create rate and error mix** — creates per second plus the breakdown of `413` (oversize) and `429` (rate-limited), which together reveal abuse spikes and client misbehavior.
+- **Expiry backlog and storage growth** — the count of past-due-but-still-present pastes and total bytes stored. A growing backlog means the expiry worker is falling behind and cost is leaking; this is the metric that catches a silently dead sweeper.
+- **404 vs 410 rates** — a spike in `404`s can signal id enumeration (an abuse probe); a spike in `410`s is just normal expiry but worth distinguishing.
+- **Durability / replication health** — object-storage and metadata replication status, since this is user data and silent replication lag is a latent data-loss risk.
+
+<Callout variant="info" title="The metric that catches the silent failure">
+Lazy deletion masks a broken expiry worker: pastes still correctly return 410 on read, so nothing looks wrong — while storage quietly grows forever. Alert on the **count of expired-but-not-yet-deleted pastes** (and on storage growth outpacing create volume) so a dead sweeper becomes a visible, paged event rather than a surprise on the cloud bill.
+</Callout>
+
+Define SLOs the way you would for any read-heavy service: an availability SLO on reads, a latency SLO on the cached read path, and an explicit budget for expiry-sweep lag — because every hour the sweeper is behind is storage you're paying for and can't account for.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares design decisions and alternative approaches across storage, expiry, and access control.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Store large immutable content in object storage and small queryable metadata in a partitioned database joined by a blob_key pointer, serve immutable raw content through a CDN, and enforce expiry with both lazy deletion (410 on read) and an active sweeper."
+  rationale="Content and metadata have opposite profiles, so splitting them lets each scale on its own axis — durable cheap blobs in object storage, fast indexed point lookups and expiry queries in the DB. Immutability makes the read path a caching problem the CDN solves, hitting sub-100 ms p99 while the origin idles. Lazy + active expiry gives immediate correctness and eventual storage reclamation; blob-before-metadata ordering makes the only crash state a harmless orphan blob."
+  alternatives="Blob-in-database when pastes are tiny and volume is low (one system, no indirection) — at the cost of bloated backups and replication; content-addressed storage for free dedup when the same content repeats — at the cost of reference-counted deletes; active-only or lazy-only expiry — each gives up either correctness or storage reclamation; no CDN when readership is single-region and small."
+  revisitWhen="Average paste size or volume shifts the storage math, dedup would materially cut cost, readership globalizes (add/expand the CDN), metadata outgrows one database (partition + multi-region), or a new privacy tier changes what can be edge-cached."
+/>
+
+Three axes capture the real tension:
+
+- **Blob-in-DB vs. object storage.** Keeping content in the database is simpler (one system, no pointer) and fine at tiny scale, but it bloats backups, replication, and cache for none of the durability or cost benefits object storage gives. We split because content and metadata have opposite needs.
+- **Lazy vs. active expiry.** Lazy deletion is immediate and correct but never reclaims storage; active deletion reclaims but lags. Neither alone is enough, so we run both — lazy for correctness, active for cost.
+- **Privacy vs. cacheability.** Anything needing a per-user authorization decision can't ride a shared edge cache. Public/unlisted pastes (where the URL is the capability) are aggressively cached; private/password pastes are authorized at the origin and served no-store or via signed URLs — trading the CDN's speed for the access control they require.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section provides a concise 60-second answer and common follow-up questions for the Pastebin interview problem.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A Pastebin stores a blob of text and returns a short shareable URL, with expiry and privacy. It looks like a URL shortener, but the real problems are large blobs, expiry, and access control — not key generation. So I split storage: the large, immutable *content* goes to object storage for durability and cheap scale, and small *metadata* — id, a blob pointer, visibility, expires_at — goes to a partitioned database that I authorize and expire on with fast point lookups. Because content never changes, the read path is a caching problem: a CDN serves immutable raw content from the edge, so the origin sees a fraction of reads and p99 stays under 100 ms globally. Expiry runs two ways — lazy deletion returns 410 on read so an expired paste is never served, and an active sweeper (or object-storage lifecycle policy) reclaims the storage. On create I write the blob before the metadata row so the worst crash state is a harmless orphan blob. Privacy is a per-paste check: public and unlisted pastes ride the CDN because the URL is the capability, while private and password pastes are authorized at the origin and bypass the shared cache. And I serve raw content as text/plain so a malicious paste can't run as stored XSS."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Where does the blob live versus the metadata, and why? How do you expire pastes correctly and reclaim the storage? Why write the blob before the metadata? How does the CDN help, and what breaks when a paste is deleted? How do you serve private pastes without caching them? What stops a malicious paste from running in a reader's browser? How does unlisted stay private?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section contains knowledge check questions and a FAQ covering the most important concepts from the Pastebin tutorial.
+<KnowledgeCheck
+  question="A Pastebin and a URL shortener both return a short id and are read-heavy. What is the defining difference that drives the Pastebin design?"
+  options={[
+    "The Pastebin needs a faster key generator",
+    "The Pastebin stores a large, immutable content blob that expires and has privacy, forcing a blob/metadata storage split, expiry, and access control — not just key generation",
+    "The URL shortener is write-heavy and the Pastebin is not",
+    "There is no real difference",
+  ]}
+  answer={1}
+  explanation="A URL shortener stores a tiny string and the hard part is generating keys. A Pastebin stores a large blob that must expire and respect privacy, so the design centers on splitting large immutable content (object storage) from small queryable metadata (database), expiry/TTL, and access control. Key generation is the easy, shared part."
+/>
+
+<KnowledgeCheck
+  question="Why run both lazy deletion and active deletion for expiry instead of just one?"
+  options={[
+    "Redundancy in case one has a bug",
+    "Lazy deletion (410 on read) makes expiry correct immediately but never frees storage; active deletion frees storage but lags — together they give immediate correctness and eventual reclamation",
+    "Active deletion is only for private pastes",
+    "Lazy deletion reclaims storage faster",
+  ]}
+  answer={1}
+  explanation="Lazy deletion checks expires_at on read and returns 410, so an expired paste is never served — correct the instant it expires — but it never reclaims the bytes. Active deletion (a sweeper or lifecycle policy) reclaims storage but runs in batches, leaving a brief readable gap on its own. Running both closes both gaps."
+/>
+
+<KnowledgeCheck
+  question="Why must raw paste content be served as text/plain rather than text/html?"
+  options={[
+    "text/plain compresses better",
+    "Because paste content is attacker-controlled; serving it as HTML lets a paste containing <script> run as stored XSS in a reader's browser on your domain",
+    "Browsers can't display text/html",
+    "It is required for CDN caching",
+  ]}
+  answer={1}
+  explanation="A Pastebin serves attacker-controlled content to other users. With an HTML content type, a paste containing a script executes in the victim's browser on your origin — stored XSS. Serving raw content as text/plain makes pasted markup inert; any highlighted render must go through a sandboxed, escaped pipeline."
+/>
+
+<KnowledgeCheck
+  question="What does the capacity estimate reveal about a Pastebin's dominant constraint?"
+  options={[
+    "Request rate — it's a high-QPS system",
+    "Storage, and specifically that content outweighs metadata massively (~7.2 TB vs ~288 GB even at 10 KB pastes), which forces content into object storage and metadata into a database",
+    "Metadata storage dominates",
+    "CPU for syntax highlighting",
+  ]}
+  answer={1}
+  explanation="Writes are ~12/s and reads ~116/s — not a QPS problem. The story is storage: content (7.2 TB) dwarfs metadata (288 GB) by ~25× even at a tiny 10 KB average, and far more for real pastes. That gap is exactly why content belongs in object storage and metadata in a database."
+/>
+
+<KnowledgeCheck
+  question="A private paste must never be served to the wrong user. Why can't it ride the shared CDN cache the way a public paste does?"
+  options={[
+    "Private pastes are too large to cache",
+    "A shared edge cache can't make a per-user authorization decision, so it could serve cached private content to another user; private/password pastes are authorized at the origin and served no-store or via signed URLs",
+    "The CDN doesn't support text/plain",
+    "Private pastes have no id",
+  ]}
+  answer={1}
+  explanation="The CDN caches by URL and serves identical bytes to everyone who hits that key — it can't evaluate 'is this requester the owner?'. Public and unlisted pastes are cacheable because the URL itself is the capability; private and password pastes require a per-user decision, so they're authorized at the origin and either marked no-store or served through signed, time-limited URLs."
+/>
+
+<KnowledgeCheck
+  question="The expiry worker has been dead for a week, but reads of expired pastes still correctly return 410. What's actually going wrong, and how do you catch it?"
+  options={[
+    "Nothing is wrong — 410s prove expiry works",
+    "Storage is leaking: lazy deletion keeps reads correct but masks that no bytes are being reclaimed; alert on the count of expired-but-present pastes and on storage growth outpacing creates",
+    "All pastes are now public",
+    "The CDN is serving stale content",
+  ]}
+  answer={1}
+  explanation="Lazy deletion enforces correctness on read independently of the worker, so 410s still fire and nothing looks broken — while storage grows without bound because nothing is reclaiming expired blobs. The catch is a metric on the backlog of past-due-but-present pastes and on storage growing faster than create volume."
+/>
+
+<Faq
+  items={[
+    { question: "Where does the paste content live versus the metadata?", answer: "The large content blob lives in object storage (S3-style), which gives eleven-nines durability, cheap per-GB pricing, and CDN integration for immutable objects. The small metadata — id, a blob_key pointer, visibility, expires_at, owner — lives in a partitioned database that supports the indexed point lookups and expiry queries the read path needs. They're joined by the blob_key pointer." },
+    { question: "Why not just store the blob in a database column?", answer: "Multi-megabyte blobs bloat row size, backups, and replication traffic, and evict the small hot rows you actually query from cache — all to get durability and scale a database is worse at than an object store. The pointer indirection costs one extra fetch on a cache miss and buys cheap, durable, CDN-frontable content storage. It's the right trade except at trivial scale." },
+    { question: "How do you generate the short id?", answer: "The same way as a URL shortener — a base-62 code over a counter or a random value. The Pastebin-specific twist is that for unlisted and private pastes the id is also the access secret, so it must be long and random enough to resist enumeration; never expose a short sequential counter as the public id." },
+    { question: "How does expiry work, exactly?", answer: "Two mechanisms together. Lazy deletion checks expires_at on every read and returns 410 Gone if it's passed, so an expired paste is never served (immediate correctness). Active deletion — a sweeper over the expires_at index, or an object-storage lifecycle policy — deletes the row and blob to reclaim storage (eventual). Lazy alone leaks storage; active alone has a readable gap; both together are tight." },
+    { question: "How do one-time 'burn after reading' pastes work safely?", answer: "The first successful read must atomically serve and delete, so two concurrent readers can't both pass a check and both receive the content. Use a conditional atomic operation — a compare-and-delete on the metadata row or a single-use token consumed transactionally — so exactly one reader wins and everyone else gets a 410." },
+    { question: "Why is a CDN so effective here?", answer: "Paste content is immutable: once written, the raw bytes never change, so the edge can cache them with a long TTL and serve every reader identically near their location. That makes a globally read-heavy workload cheap and fast — sub-100 ms p99 — while the origin sees only misses and creates. The catch is invalidation: deleted/expired pastes must be purged or kept on a bounded TTL." },
+    { question: "What's the difference between a 404 and a 410 response?", answer: "404 means the id never existed; 410 Gone means the paste existed but has expired (or was deleted). Distinguishing them lets clients and caches behave correctly — a 410 is a definitive 'it's gone, don't retry,' and a spike in 404s can indicate someone enumerating the id space. Both are negative-cached briefly to protect the origin." },
+    { question: "How do you keep private pastes private?", answer: "Visibility is a per-paste metadata attribute checked before the blob is fetched. Public and unlisted pastes can be served from the shared CDN because the URL is the capability. Private and password pastes require a per-user authorization decision the shared cache can't make, so they're authorized at the origin and served no-store or through signed, time-limited URLs that grant one reader temporary blob access." },
+    { question: "What stops a malicious paste from attacking readers?", answer: "Serving raw content as text/plain (never text/html) so pasted markup and scripts are inert — this prevents stored XSS, the dominant Pastebin vulnerability. The rendered/highlighted view is produced through a sandboxed, escaped pipeline, ideally on a separate origin. Add size caps, create rate-limiting, and async secret/malware scanning on top." },
+    { question: "Why write the blob before the metadata row on create?", answer: "So a committed metadata row always points at a real blob. If the process crashes mid-create, the worst state is an orphan blob with no row — unreferenced storage a garbage-collection sweep reclaims. The reverse order risks a row pointing at content that was never stored, which is a user-visible broken paste. The safe failure is the one you engineer for." },
+    { question: "What happens when object storage or the metadata DB is down?", answer: "CDN-cached public reads keep succeeding in both cases. An object-storage outage fails cache-miss reads and creates (mitigated by replicated buckets and retries); a metadata-DB outage fails origin reads and creates but is mitigated by replicas with failover. The CDN absorbs much of the read traffic during either, which is a side benefit of caching immutable content." },
+    { question: "How does the design scale as it grows?", answer: "Start with object storage for blobs plus a database for metadata. Add a CDN in front of reads when readership globalizes — the highest-leverage step for a read-heavy service. Partition metadata by id and go multi-region only when the database or a single region can't keep up. Content storage scales on its own in the object store; the database stays small because it holds only metadata." },
+    { question: "Should you deduplicate identical pastes?", answer: "Optionally, via content-addressed storage: name the blob by a hash of its content so identical pastes share one object. It saves storage when the same content repeats (common stack traces), at the cost of reference-counted deletion so you don't delete a blob another paste still references. Most designs start one-blob-per-paste and add dedup only when it measurably pays." },
+  ]}
+/>
