@@ -43,6 +43,13 @@ import {
   DeadLetterSequence,
   IdempotentSendSequence,
 } from "@/components/diagrams/notification-flows";
+import { TicketBookingArchitecture } from "@/components/diagrams/ticket-booking-architecture";
+import {
+  HoldSeatSequence,
+  ContentionSequence,
+  ConfirmPaymentSequence,
+  HoldExpirySequence,
+} from "@/components/diagrams/booking-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -87,6 +94,11 @@ const teachingComponents = {
   RetryBackoffSequence,
   DeadLetterSequence,
   IdempotentSendSequence,
+  TicketBookingArchitecture,
+  HoldSeatSequence,
+  ContentionSequence,
+  ConfirmPaymentSequence,
+  HoldExpirySequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

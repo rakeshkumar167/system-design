@@ -111,3 +111,34 @@ describe("notification flow sequences", () => {
     expect(screen.getByRole("img", { name: /idempoten|duplicate/i })).toBeInTheDocument();
   });
 });
+
+import { TicketBookingArchitecture } from "@/components/diagrams/ticket-booking-architecture";
+import {
+  HoldSeatSequence,
+  ContentionSequence,
+  ConfirmPaymentSequence,
+  HoldExpirySequence,
+} from "@/components/diagrams/booking-flows";
+
+describe("TicketBookingArchitecture", () => {
+  it("exposes the ticket booking architecture to non-visual readers", () => {
+    render(<TicketBookingArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /ticket booking architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/oversell/i)).toBeInTheDocument();
+  });
+});
+
+describe("booking flow sequences", () => {
+  it("renders the hold, contention, confirm, and expiry sequences", () => {
+    render(<HoldSeatSequence />);
+    expect(screen.getByRole("img", { name: /hold/i })).toBeInTheDocument();
+    render(<ContentionSequence />);
+    expect(screen.getByRole("img", { name: /contention|race|conflict/i })).toBeInTheDocument();
+    render(<ConfirmPaymentSequence />);
+    expect(screen.getByRole("img", { name: /confirm|payment/i })).toBeInTheDocument();
+    render(<HoldExpirySequence />);
+    expect(screen.getByRole("img", { name: /expir/i })).toBeInTheDocument();
+  });
+});
