@@ -180,32 +180,241 @@ The decisive boundary is **where enforcement happens versus where state lives**.
 
 <h2 id="distributed-counting">Distributed Counting</h2>
 
-Counting across a fleet requires a shared, low-latency store like Redis. _(Full content in Task 5.)_
+Here is the crux of doing this at scale. A single in-memory counter is trivial; the moment you have a fleet of stateless enforcement points, each one only sees *its own* slice of a key's traffic. If every node keeps a local count, a client spread across ten nodes can do ten times the limit before any single node notices. The fleet has to agree on **one number per key**, and that number has to be updated a million times a second without races. The standard answer is a **shared, low-latency counter store** — Redis — that holds the only authoritative count.
+
+**The allow path.** On each request the enforcement point assembles the composite key and issues a single atomic operation against the store. If the returned count is under the limit, it admits the request and sets the `X-RateLimit-*` headers.
+
+<AllowSequence />
+
+**The throttle path.** Same operation; the store returns a count over the limit, so the limiter short-circuits with `429` and a `Retry-After` and never touches the backend.
+
+<ThrottleSequence />
+
+The non-negotiable detail is that the increment is **atomic and a single round trip**. A naive implementation reads the current count, adds one in application code, and writes it back — a classic **read-modify-write** that races: two requests both read `99`, both compute `100`, both write `100`, and the limit of `100` admits both as the 100th request. Under a million requests per second the same key is touched concurrently constantly, so this race is not theoretical — it is continuous. Redis `INCR` (with an `EXPIRE` to set the window TTL on first touch) folds the read, the add, and the write into one server-side operation that the store serializes per key, so concurrent requests can never both see the pre-increment value. For the token bucket — which must read the token count, compute the refill from elapsed time, deduct, and write back — there is no single primitive, so the whole refill-and-deduct runs as a **Lua script**, which Redis executes atomically as one unit. Either way the rule holds: **never read-modify-write; make the counter update one atomic op.**
+
+**Centralized versus local-with-reconciliation.** The centralized store gives **exact** counting (within our ±1 tolerance) because every increment lands on one authoritative counter — at the cost of a network hop per check and a shared dependency. The alternative is **local counters synced out-of-band**: each node counts in memory and periodically gossips or flushes its tally to a global aggregator, which divides the global budget back out. That is **approximate** — between syncs, nodes don't know each other's counts, so the fleet can briefly overshoot — but it removes the per-request hop and survives a store outage gracefully. The trade is exactness and simplicity (centralized) versus latency and blast-radius isolation (local). For a general API limiter we start centralized because the math is honest and the store is cheap, and reach for local-token reconciliation only when the per-request hop or the shared dependency becomes the bottleneck.
+
+<Callout variant="info" title="Why approximate is usually fine">
+Rate limiting is a *coarse* control: the goal is to shed overflow and enforce fairness, not to bill to the exact request. A scheme that admits the limit ±a handful under bursty distributed traffic protects the origin just as well as an exact one, at a fraction of the coordination cost. Reserve exact counting (sliding window log on a centralized store) for the rare case where one-over genuinely matters.
+</Callout>
 
 <h2 id="consistency-races">Consistency & Races</h2>
 
-Atomic increments and Lua scripts eliminate the check-then-act race. _(Full content in Task 5.)_
+Three correctness hazards live in distributed counting: the **check-then-act race**, the **fixed-window boundary burst**, and **clock skew**. Each has a specific, named fix.
+
+**The check-then-act race** is the read-modify-write problem from the previous section, and the fix is the same: make the increment a single atomic operation — `INCR` for counters, a Lua script for token-bucket math. Atomicity is what lets a stateless fleet share one number safely; without it, every concurrent pair of requests on a hot key is a potential double-admit.
+
+**The fixed-window boundary burst.** Even with perfectly atomic increments, a fixed window is *correct but coarse*: it resets to zero at the window boundary, so a client can spend its full limit in the last instant of one window and the full limit again in the first instant of the next — admitting **up to 2× the limit** across a window-length span that straddles the boundary. For a `100/min` limit that is 200 requests in a ~2-second sliver around the minute mark. The named mitigation is the **sliding-window counter**: keep the previous and current window counts and weight the previous one out by the elapsed fraction of the current window (`estimate = prev × (1 − elapsed) + current`). It smooths the reset so the burst can't double up, at the same tiny two-integer cost — which is exactly why it is the default for windowed quotas.
+
+**Clock skew and window alignment.** Windows are defined by time, and in a fleet every node has its own clock. If nodes disagree on *when* the minute boundary falls, they will reset and align windows inconsistently, and the limit smears at the edges. The discipline is to **anchor windows to the counter store's clock, not the caller's** — derive the window key and the TTL from server time (or align to epoch boundaries like `floor(now / window)`), so all enforcement points computing the same key land on the same bucket regardless of their local clocks. Set the window's **TTL from the store** at first touch and let the store expire the key, rather than each node deciding expiry independently. Centralizing the clock the same way we centralize the count removes skew as a correctness variable.
+
+<KnowledgeCheck
+  question="With perfectly atomic increments and a limit of 100/min, how can a client still get 200 requests through in roughly two seconds?"
+  options={[
+    "The atomic increment occasionally double-counts",
+    "The fixed-window boundary burst: full limit at the end of one window, full limit at the start of the next",
+    "Redis loses the counter when the TTL expires",
+    "Clock skew makes the limit count twice",
+  ]}
+  answer={1}
+  explanation="A fixed window resets to zero at the boundary, so a client can spend the limit just before the reset and again just after — up to 2× across the boundary. Atomicity prevents races within a window but not this edge effect; the sliding-window counter is the standard mitigation."
+/>
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Sharding the counter store and local caching address hot-key pressure. _(Full content in Task 5.)_
+Don't build the final form on day one. Each stage solves a specific pressure and adds a specific cost — name the trigger before you take on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single-node in-memory counters", "Day one; one process, modest traffic, no shared state needed", "Counts are per-process — useless the moment you run more than one instance; no durability"],
+    ["Centralized Redis (INCR + TTL)", "A stateless fleet must agree on one count per key", "A network hop per check and a shared dependency to operate and make HA"],
+    ["Sharded Redis by key", "Op load exceeds one node — at 1,000,000 ops/s you need ~10 nodes", "Hash-by-key routing, resharding, and hot-key handling on top of a single store"],
+    ["Local-token + global reconciliation (hybrid)", "The per-request hop or the shared dependency is the bottleneck", "Approximate counting and a reconciliation/gossip loop to operate and reason about"],
+  ]}
+  recommendedRow={1}
+/>
+
+The progression maps directly onto the capacity numbers. A single in-memory counter is fine until you run a second instance — then counts fragment and you move to a **centralized Redis** so the fleet shares one number. At **1,000,000 counter ops per second** a single Redis node (sustaining ~100,000 atomic ops/s) is swamped, so you **shard by key** across ~10 nodes; because the key determines the shard, each increment lands on exactly one node and the load spreads evenly. Only when the per-request hop to Redis or the shared-dependency blast radius genuinely hurts do you reach for the **local-token hybrid**: each node holds a slice of the budget locally and reconciles with a global aggregator out-of-band, trading exactness for the removal of the hot-path hop. Most systems stop at sharded Redis; the hybrid is justified only when latency or availability targets demand it.
+
+<KnowledgeCheck
+  question="Your centralized Redis is at 1,000,000 counter ops/s and a single node tops out near 100,000 ops/s. What is the next evolution step?"
+  options={[
+    "Switch every node back to local in-memory counters",
+    "Shard the counter store by key so each increment lands on one of ~10 nodes",
+    "Increase the window size to reduce ops",
+    "Add read replicas to the single Redis node",
+  ]}
+  answer={1}
+  explanation="The pressure is operations per second, not memory (the whole working set is ~4 GB). Sharding by key spreads the 1,000,000 ops/s across ~10 nodes, and because the key picks the shard, each increment is a single-node operation. Read replicas don't help a write-heavy INCR workload."
+/>
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-Fail-open vs. fail-closed is the critical availability trade-off. _(Full content in Task 5.)_
+The limiter sits in the hot path of every request, so its failure behavior is a first-class design decision, not an afterthought. The single most important choice is what happens when the counter store is unreachable.
+
+**Fail open versus fail closed.** *Fail open* allows requests when the limiter can't reach its store; *fail closed* rejects them. Our default is **fail open**: a rate limiter that takes down the service it protects is worse than no rate limiter at all, and a brief loss of enforcement is usually survivable. The risk is real and must be stated — during the outage there is **no enforcement**, so an abusive client can pound the origin unchecked, which is why fail-open must always be paired with a loud alert so the gap is visible and bounded. Fail closed is the right default only for endpoints where unmetered traffic is more dangerous than an outage (e.g. an expensive write path or a hard downstream cap).
+
+<FailOpenSequence />
+
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery — rather than hand-waving "it's highly available."
+
+<FailureMatrix
+  rows={[
+    { failure: "Counter store outage (fail-open default)", impact: "No enforcement: overflow reaches the origin. Fail-closed instead would block all traffic — an outage of the protected service", detection: "Store error/timeout rate; fail-open counter", mitigation: "Fail open and alert loudly; per-node local fallback counters for coarse protection", recovery: "Store recovers; enforcement resumes; TTLs re-establish windows" },
+    { failure: "Hot key (one key on one shard)", impact: "One shard saturates; checks for that key slow or error", detection: "Per-shard op-rate and latency skew", mitigation: "Local pre-aggregation / token batching for the hot key; spread sub-counters across shards", recovery: "Traffic subsides or batching absorbs it; shard load normalizes" },
+    { failure: "Thundering herd on window reset", impact: "All keys reset at the boundary; a synchronized burst hits the store", detection: "Op-rate spikes aligned to window boundaries", mitigation: "Token bucket (continuous refill, no hard reset) or jittered/staggered window alignment", recovery: "Burst clears within a window; rates re-smooth" },
+    { failure: "Network partition (enforcement ↔ store)", impact: "Some nodes can't reach the store and fail open; counting splits", detection: "Per-node store-connectivity health checks", mitigation: "Fail open on the isolated side; short timeouts so requests don't stall", recovery: "Partition heals; nodes reconnect; counts reconverge" },
+    { failure: "Clock skew between nodes", impact: "Windows misalign; the limit smears at boundaries", detection: "NTP drift metrics; boundary-anomaly alerts", mitigation: "Anchor windows and TTLs to the store's clock; tight NTP sync", recovery: "Clocks resync; windows realign on next boundary" },
+    { failure: "Counter-store node loss", impact: "Keys on that node lost; their counts reset mid-window", detection: "Cluster membership / replica health alerts", mitigation: "Replicas with failover; shard rebalances to survivors", recovery: "Replica promoted; ring rebalances; ephemeral counts repopulate" },
+  ]}
+/>
+
+A theme runs through the matrix: counters are **ephemeral**. Losing them degrades enforcement — a key may reset mid-window and briefly admit more than it should — but it loses no business data, which is exactly why fail-open is tolerable and recovery is just "let the counters repopulate."
+
+<KnowledgeCheck
+  question="The counter store becomes unreachable. With the default fail-open posture, what happens and what is the cost?"
+  options={[
+    "All requests are rejected until the store recovers, guaranteeing the limit holds",
+    "Requests are allowed through (no enforcement) and an alert fires; an abusive client can hit the origin unchecked during the gap",
+    "The limiter switches to a local database automatically with no downside",
+    "Requests queue until the store returns",
+  ]}
+  answer={1}
+  explanation="Fail open prefers availability of the protected service over strict enforcement: requests proceed and a loud alert makes the enforcement gap visible. The accepted risk is that, while the store is down, traffic is unmetered — which is why fail-open is always paired with alerting and is the wrong default for endpoints where unmetered traffic is more dangerous than an outage."
+/>
 
 <h2 id="observability">Observability</h2>
 
-Metrics on allowed, throttled, and error rates reveal policy effectiveness. _(Full content in Task 5.)_
+A rate limiter fails silently by nature — when it stops enforcing, traffic still flows and nothing looks broken until the origin buckles. Observability is what turns a silent loss of enforcement into a visible, actionable event.
+
+- **Allowed vs. throttled counts** — the headline SLIs, broken down per policy. The **throttle rate** (throttled ÷ total) is the signal that a limit is biting; a sudden spike means either an attack or a misconfigured policy throttling legitimate traffic.
+- **Fail-open events** — count and alert on *every* fail-open. This is the most important single metric: it means the limiter is no longer enforcing, and it must page, not just log.
+- **Check latency (p99)** — the limiter is in the hot path, so its own latency is part of the service's. Alert against the sub-millisecond budget.
+- **Store health** — error rate, op rate per shard, and per-shard skew that exposes a hot key before it saturates a node.
+- **Per-policy and per-key cardinality** — watch the number of *distinct live keys*, since cardinality (not request rate) drives counter-store memory. A new high-cardinality dimension (per-user where it used to be per-tier) can quietly blow up memory; alert on cardinality growth.
+
+<Callout variant="warning" title="Cardinality is a metrics trap too">
+Exporting a metric label *per key* (e.g. per API key or per IP) creates millions of time series and will melt your metrics backend the same way it would melt the counter store. Aggregate by **policy and tier**, not by individual key; sample or top-N the per-key breakdowns. The cardinality discipline you apply to the counter store applies equally to telemetry.
+</Callout>
+
+Define SLOs the same way as any hot-path component: an availability SLO on the limiter itself (it must not become the thing that's down), a latency SLO on the check, and an explicit budget for fail-open minutes — because every fail-open minute is enforcement you didn't have.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-Service-mesh sidecars, API gateways, and client-side throttling each have distinct cost profiles. _(Full content in Task 5.)_
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Default to the token bucket (with the sliding-window counter for windowed quotas), count in a centralized, key-sharded Redis using atomic INCR / a Lua script, enforce in gateway middleware or a sidecar, and fail open with a loud alert."
+  rationale="Token bucket matches real bursty API traffic and implements as one atomic op; centralized Redis gives an honest shared count cheaply (~4 GB, ~10 nodes at 1,000,000 ops/s); local enforcement keeps the hot-path increment fast while the shared store keeps the fleet's count consistent; fail open keeps the limiter from becoming the outage it was meant to prevent."
+  alternatives="Sliding window log when one-over genuinely matters (exact, but heavy); leaky bucket when a spike-intolerant downstream needs a smooth, constant outflow; local-token counters with global reconciliation when the per-request hop or shared dependency is the bottleneck — at the cost of approximate counting; fail closed on endpoints where unmetered traffic is more dangerous than an outage."
+  revisitWhen="Accuracy requirements tighten to exact, a per-key dimension explodes cardinality and memory, the centralized hop dominates p99, or an endpoint's risk profile flips fail-open to fail-closed."
+/>
+
+Three axes capture the real tension:
+
+- **Accuracy vs. cost.** Exactness costs memory and coordination. A sliding window log is exact but stores an entry per request; the sliding-window counter is approximate (within ±1 for realistic traffic) at two integers per key. Because rate limiting is a coarse control, we buy "good enough" cheaply and reserve exactness for where one-over actually matters.
+- **Centralized vs. distributed counting.** A centralized store gives an honest, exact count but adds a per-check hop and a shared dependency. Distributed local counting removes the hop and isolates blast radius but counts approximately and needs reconciliation. We start centralized because the math is honest and the store is cheap, and distribute only under measured pressure.
+- **Sync (centralized store) vs. sidecar (local enforcement).** Enforcing *in a sidecar* keeps the latency-critical increment local to the request path; *synchronizing* through a shared store is what lets the fleet agree on one number. The winning shape is usually both at once — local enforcement, central count — which is why the architecture splits *where enforcement happens* from *where state lives*.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-A one-page cheat sheet of the decisions and their justifications. _(Full content in Task 5.)_
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A rate limiter caps requests per window per key and sheds the overflow with a 429. I separate the *policy* (limit, window, algorithm, scope) from the *key* (policy + identity, like `login:user:42`), so one engine enforces thousands of distinct limits. For the algorithm I default to a token bucket because it handles real bursty traffic and implements as one atomic op; for windowed quotas I use a sliding-window counter, which fixes the fixed window's 2× boundary burst at two integers per key. The hard part is distributed counting: a stateless fleet has to agree on one number per key, so I count in a centralized Redis with an atomic INCR plus TTL — or a Lua script for token-bucket math — never a read-modify-write. At a million requests a second that's a million atomic ops, ~4 GB of counters, and about 10 Redis nodes sharded by key. I enforce in gateway middleware or a sidecar to keep the increment local, and I fail open with a loud alert if the store is down, because the limiter must never become the outage it was meant to prevent. Responses carry X-RateLimit-* headers and a Retry-After on the 429."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *How do you count correctly across a stateless fleet? Why is read-modify-write wrong, and what replaces it? How does the fixed window admit 2× the limit, and how do you fix it? Token bucket or leaky bucket — when each? Fail open or fail closed, and what's the risk? How do you handle a hot key or a thundering herd on window reset? What sizes the counter store — throughput or memory?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Common interview questions and the answers that distinguish good candidates. _(Full content in Task 5.)_
+<KnowledgeCheck
+  question="Why must the counter update be a single atomic operation (INCR or a Lua script) rather than read-then-write in application code?"
+  options={[
+    "Atomic operations are faster to type",
+    "Read-modify-write races: two concurrent requests both read the same value and both write the same incremented value, admitting one request too many",
+    "Redis can't store integers otherwise",
+    "It reduces the memory each counter uses",
+  ]}
+  answer={1}
+  explanation="A read-modify-write lets two requests both observe the pre-increment value and both write the same result, so the limit admits an extra request. At a million requests per second on a hot key this race is continuous. INCR (or a Lua script for token-bucket math) serializes the update on the store so concurrent requests can never both see the old value."
+/>
+
+<KnowledgeCheck
+  question="For a general-purpose API limiter that should tolerate real-world bursty clients, which algorithm is the recommended default?"
+  options={[
+    "Fixed window",
+    "Sliding window log",
+    "Token bucket",
+    "Leaky bucket",
+  ]}
+  answer={2}
+  explanation="The token bucket lets an idle client save up tokens and spend them in a burst while still capping the long-run average at the refill rate — which matches how real clients call APIs. It costs two numbers per key and implements as one atomic op. The leaky bucket instead smooths bursts into a constant outflow, which is for protecting spike-intolerant downstreams, not general API limiting."
+/>
+
+<KnowledgeCheck
+  question="What sizes the number of Redis nodes in the counter tier at peak?"
+  options={[
+    "The total counter memory (~4 GB)",
+    "The number of distinct policies",
+    "The atomic operations per second (1,000,000 ops/s ÷ ~100,000 ops/s per node ≈ 10 nodes)",
+    "The number of regions",
+  ]}
+  answer={2}
+  explanation="Counters are tiny — fifty million keys at 80 bytes is only ~4 GB, which fits easily in RAM. The constraint is throughput: 1,000,000 atomic ops/s divided by the ~100,000 a node sustains gives ~10 nodes. Because ops (not memory) drive the count, the store is sharded by key so the op load spreads evenly."
+/>
+
+<KnowledgeCheck
+  question="When is the leaky bucket the better choice than the token bucket?"
+  options={[
+    "When clients are bursty and you want to allow the bursts",
+    "When the thing you're protecting cannot tolerate spikes and needs a smooth, constant outflow",
+    "When you need exact counting on small limits",
+    "When you have no shared store",
+  ]}
+  answer={1}
+  explanation="The leaky bucket absorbs and smooths bursts into a steady, constant-rate output, which is ideal when a downstream has a hard fixed capacity and spikes would hurt it. The token bucket does the opposite — it permits controlled bursts — so it's the default for general API limiting where bursty traffic is normal."
+/>
+
+<KnowledgeCheck
+  question="The counter store is unreachable. What is the default posture and its accepted risk?"
+  options={[
+    "Fail closed — reject everything; risk is a self-inflicted outage of the protected service",
+    "Fail open — allow requests and alert; risk is unmetered traffic reaching the origin during the gap",
+    "Queue all requests until the store returns; risk is unbounded latency",
+    "Fall back to a relational database; risk is none",
+  ]}
+  answer={1}
+  explanation="The default is fail open: the limiter allows traffic and fires a loud alert, because a limiter that takes down the service it protects is worse than a brief loss of enforcement. The accepted, stated risk is that traffic is unmetered while the store is down — so fail-open is always paired with alerting, and fail-closed is reserved for endpoints where unmetered traffic is the bigger danger."
+/>
+
+<KnowledgeCheck
+  question="A fixed window resets all keys at the same boundary, producing a synchronized burst against the store every window. Which mitigations address this thundering herd?"
+  options={[
+    "Increase every key's limit",
+    "Use a token bucket (continuous refill, no hard reset) or jitter/stagger window alignment",
+    "Switch to a single Redis node",
+    "Disable TTLs on counters",
+  ]}
+  answer={1}
+  explanation="The token bucket refills continuously and has no synchronized reset, so it avoids the boundary stampede entirely; for window-style limits, jittering or staggering when each key's window aligns spreads the resets out instead of firing them all at once."
+/>
+
+<Faq
+  items={[
+    { question: "What's the difference between a policy and a key?", answer: "A policy is the rule — a limit, a window, an algorithm, and the scope dimension it applies to (user, IP, API key, or global). A key is what the rule is counted against: the policy name concatenated with the caller's identity on that dimension, like `login:user:42`. Separating them lets one engine enforce thousands of distinct limits from a small set of reusable policies." },
+    { question: "Why is read-modify-write wrong for counting, and what replaces it?", answer: "Reading the count, adding one in application code, and writing it back lets two concurrent requests both observe the same value and both write the same result, admitting one request over the limit. At a million requests per second on a hot key this race is continuous. Replace it with a single atomic operation: Redis INCR (plus an EXPIRE for the window TTL) for counters, or a Lua script for token-bucket refill-and-deduct math." },
+    { question: "Which algorithm should I default to?", answer: "The token bucket for general-purpose API limiting — it permits controlled bursts (matching how real clients call APIs), caps the long-run average at the refill rate, costs two numbers per key, and implements as one atomic op. For a windowed quota (N per minute) rather than a rate, prefer the sliding-window counter." },
+    { question: "How does a fixed window admit twice the limit, and how do I fix it?", answer: "A fixed window resets to zero at the boundary, so a client can spend the full limit just before the reset and the full limit again just after — up to 2× the limit across a window-length span straddling the boundary. The fix is the sliding-window counter, which keeps the previous and current window counts and weights the previous one out by the elapsed fraction of the current window, smoothing the reset at the same two-integer cost." },
+    { question: "Token bucket or leaky bucket — when do I use each?", answer: "Token bucket when you want to allow controlled bursts and cap the average — the default for general API limiting. Leaky bucket when the thing you're protecting can't tolerate spikes and needs a smooth, constant outflow; the rate-limiter variant rejects immediately when its queue is full rather than queuing callers." },
+    { question: "How do I count correctly across a stateless fleet of enforcement points?", answer: "Keep the only authoritative count in a shared, low-latency store (Redis) and have every node issue one atomic operation against it per check. Local per-node counters can't see each other, so a client spread across nodes would overshoot; centralizing the count lets the whole fleet agree on one number per key." },
+    { question: "Centralized counting or local-with-reconciliation?", answer: "Centralized gives exact counting (within ±1) at the cost of a network hop per check and a shared dependency. Local counters synced out-of-band remove the hop and isolate blast radius but count approximately, since nodes don't know each other's tallies between syncs. Start centralized because the math is honest and the store is cheap; distribute only when the hop or the shared dependency is measurably the bottleneck." },
+    { question: "What sizes the counter store — throughput or memory?", answer: "Throughput. Fifty million live keys at 80 bytes is only ~4 GB, which fits easily in RAM, so memory isn't the constraint. The pressure is operations per second: 1,000,000 atomic ops/s divided by the ~100,000 a Redis node sustains gives about 10 nodes, sharded by key so the op load spreads evenly." },
+    { question: "What does fail open mean, and when would I fail closed instead?", answer: "Fail open means that when the counter store is unreachable the limiter allows requests rather than blocking traffic — because a limiter that takes down the service it protects is worse than a brief loss of enforcement. It's the default, always paired with a loud alert because traffic is unmetered during the gap. Fail closed (reject when the store is down) is right only for endpoints where unmetered traffic is more dangerous than an outage, like an expensive write path." },
+    { question: "How do I handle a hot key that overloads one shard?", answer: "A single very hot key lands on one shard and can saturate it. Mitigate by pre-aggregating or batching tokens for that key locally before touching the store, or by spreading sub-counters for the key across shards and summing them. Detect it early by watching per-shard op-rate and latency skew." },
+    { question: "How do clock skew and window alignment cause errors?", answer: "Windows are defined by time, and each node has its own clock; if nodes disagree on when a boundary falls, they reset windows inconsistently and the limit smears at the edges. Anchor windows and TTLs to the counter store's clock (or align to epoch boundaries like floor(now/window)) so every node computing the same key lands on the same bucket, and keep clocks tightly NTP-synced." },
+    { question: "What headers does the limiter return?", answer: "On every response it exposes X-RateLimit-Limit (the ceiling), X-RateLimit-Remaining (quota left in the window), and X-RateLimit-Reset (the epoch second the window refills), so clients can self-throttle before hitting a limit. On rejection it returns 429 Too Many Requests with a Retry-After indicating how long to back off." },
+    { question: "Where should enforcement run?", answer: "In gateway middleware or a sidecar colocated with each service instance, so the increment-and-compare is a local call and only the shared counter store is remote. A standalone limiter service adds a network hop per request to the hot path; embedding or co-locating the enforcement point avoids that hop while still centralizing the count." },
+    { question: "How accurate does a rate limiter actually need to be?", answer: "Coarse is usually fine. Rate limiting sheds overflow and enforces fairness; admitting the limit ±a handful under bursty distributed traffic protects the origin just as well as exact counting, at a fraction of the coordination cost. We accept a ±1 tolerance and reserve exact schemes (a sliding window log on a centralized store) for the rare case where one-over genuinely matters." },
+  ]}
+/>
