@@ -35,6 +35,13 @@ import {
   ReadCacheMissSequence,
   ExpirySequence,
 } from "@/components/diagrams/paste-flows";
+import { NotificationArchitecture } from "@/components/diagrams/notification-architecture";
+import {
+  SendFanoutSequence,
+  RetryBackoffSequence,
+  DeadLetterSequence,
+  IdempotentSendSequence,
+} from "@/components/diagrams/notification-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -73,6 +80,11 @@ const teachingComponents = {
   ReadCacheHitSequence,
   ReadCacheMissSequence,
   ExpirySequence,
+  NotificationArchitecture,
+  SendFanoutSequence,
+  RetryBackoffSequence,
+  DeadLetterSequence,
+  IdempotentSendSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

@@ -80,3 +80,34 @@ describe("paste flow sequences", () => {
     expect(screen.getByRole("img", { name: /expir/i })).toBeInTheDocument();
   });
 });
+
+import { NotificationArchitecture } from "@/components/diagrams/notification-architecture";
+import {
+  SendFanoutSequence,
+  RetryBackoffSequence,
+  DeadLetterSequence,
+  IdempotentSendSequence,
+} from "@/components/diagrams/notification-flows";
+
+describe("NotificationArchitecture", () => {
+  it("exposes the notification architecture to non-visual readers", () => {
+    render(<NotificationArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /notification architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/dead.?letter/i)).toBeInTheDocument();
+  });
+});
+
+describe("notification flow sequences", () => {
+  it("renders the fan-out, retry, dead-letter, and idempotent sequences", () => {
+    render(<SendFanoutSequence />);
+    expect(screen.getByRole("img", { name: /fan.?out/i })).toBeInTheDocument();
+    render(<RetryBackoffSequence />);
+    expect(screen.getByRole("img", { name: /retry|backoff/i })).toBeInTheDocument();
+    render(<DeadLetterSequence />);
+    expect(screen.getByRole("img", { name: /dead.?letter/i })).toBeInTheDocument();
+    render(<IdempotentSendSequence />);
+    expect(screen.getByRole("img", { name: /idempoten|duplicate/i })).toBeInTheDocument();
+  });
+});
