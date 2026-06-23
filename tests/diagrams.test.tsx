@@ -49,3 +49,34 @@ describe("rate limit flow sequences", () => {
     expect(screen.getByRole("img", { name: /fail.?open/i })).toBeInTheDocument();
   });
 });
+
+import { PastebinArchitecture } from "@/components/diagrams/pastebin-architecture";
+import {
+  CreatePasteSequence,
+  ReadCacheHitSequence,
+  ReadCacheMissSequence,
+  ExpirySequence,
+} from "@/components/diagrams/paste-flows";
+
+describe("PastebinArchitecture", () => {
+  it("exposes the pastebin architecture to non-visual readers", () => {
+    render(<PastebinArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /pastebin architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/object storage/i)).toBeInTheDocument();
+  });
+});
+
+describe("paste flow sequences", () => {
+  it("renders the create, read-hit, read-miss, and expiry sequences", () => {
+    render(<CreatePasteSequence />);
+    expect(screen.getByRole("img", { name: /creat/i })).toBeInTheDocument();
+    render(<ReadCacheHitSequence />);
+    expect(screen.getByRole("img", { name: /cache hit/i })).toBeInTheDocument();
+    render(<ReadCacheMissSequence />);
+    expect(screen.getByRole("img", { name: /cache miss/i })).toBeInTheDocument();
+    render(<ExpirySequence />);
+    expect(screen.getByRole("img", { name: /expir/i })).toBeInTheDocument();
+  });
+});

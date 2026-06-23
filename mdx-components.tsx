@@ -27,6 +27,13 @@ import {
   ThrottleSequence,
   FailOpenSequence,
 } from "@/components/diagrams/rate-limit-flows";
+import { PastebinArchitecture } from "@/components/diagrams/pastebin-architecture";
+import {
+  CreatePasteSequence,
+  ReadCacheHitSequence,
+  ReadCacheMissSequence,
+  ExpirySequence,
+} from "@/components/diagrams/paste-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -59,6 +66,11 @@ const teachingComponents = {
   AllowSequence,
   ThrottleSequence,
   FailOpenSequence,
+  PastebinArchitecture,
+  CreatePasteSequence,
+  ReadCacheHitSequence,
+  ReadCacheMissSequence,
+  ExpirySequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
