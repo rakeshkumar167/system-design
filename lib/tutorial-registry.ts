@@ -122,6 +122,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "ticket-booking": {
+    slug: "ticket-booking",
+    title: "Design a Ticket Booking System",
+    description:
+      "An interview-grade walkthrough of a ticket booking system that sells limited inventory under heavy contention without overselling: the seat reservation lifecycle, optimistic vs pessimistic concurrency control, strong consistency on inventory, the idempotent hold-pay-confirm payment saga, high-contention on-sale management, scaling, and failure modes.",
+    difficulty: "Advanced",
+    readingMinutes: 36,
+    concepts: ["Distributed locking", "Inventory", "Strong consistency", "Reservations"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "reservation-lifecycle", label: "Reservation Lifecycle", depth: "advanced" },
+      { id: "concurrency-control", label: "Concurrency Control", depth: "advanced" },
+      { id: "strong-consistency", label: "Strong Consistency", depth: "advanced" },
+      { id: "payment-saga", label: "Payment & Booking Saga", depth: "advanced" },
+      { id: "high-contention", label: "High-Contention On-Sales", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "security-abuse", label: "Security & Abuse", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

@@ -162,7 +162,7 @@ export const problems: readonly Problem[] = [
       "Sell limited inventory under heavy contention without overselling a single seat.",
     difficulty: "Advanced",
     concepts: ["Distributed locking", "Inventory", "Strong consistency", "Reservations"],
-    status: "coming-soon",
+    status: "available",
     sequence: 16,
   },
   {

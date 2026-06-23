@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section frames the ticket booking problem as interviewers present it: limited, strongly-consistent inventory under high-contention demand.
+
+<h2 id="requirements">Requirements</h2>
+
+This section covers functional and non-functional requirements, including the no-oversell invariant, seat hold TTL, and throughput targets.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section derives the daily seat inventory, contention ratio, peak hold attempts per second, and peak availability reads per second.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core entities: Event, Seat (with status, version, hold_id, held_until), Hold, and Booking.
+
+<h2 id="api-design">API Design</h2>
+
+This section specifies the REST API: POST /v1/holds (201 or 409 Conflict) and POST /v1/bookings (idempotent confirm), plus the cached GET seat-map endpoint.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the high-level architecture: waiting room, booking service, inventory DB, hold expiry worker, payment service, booking store, and availability cache.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section traces the four key flows: hold a seat, contention rejection, confirm payment, and hold expiry release.
+
+<h2 id="reservation-lifecycle">Reservation Lifecycle</h2>
+
+This section explains the seat state machine: available → held (with TTL) → booked, and why holds must expire to prevent seat leakage.
+
+<h2 id="concurrency-control">Concurrency Control</h2>
+
+This section is the centerpiece: the oversell race condition, optimistic concurrency (compare-and-set / conditional UPDATE WHERE status='available'), and pessimistic locking (SELECT FOR UPDATE).
+
+<h2 id="strong-consistency">Strong Consistency</h2>
+
+This section explains why the inventory of record must be strongly consistent, what "strongly consistent" means in this context, and the tradeoffs with eventual consistency approaches.
+
+<h2 id="payment-saga">Payment &amp; Booking Saga</h2>
+
+This section covers the idempotent hold-pay-confirm saga: charging payment atomically, flipping held→booked, and handling partial failures with idempotency keys.
+
+<h2 id="high-contention">High-Contention On-Sales</h2>
+
+This section addresses the on-sale crush: waiting rooms, request queuing, virtual queues, and admission control to protect inventory DB from thundering herds.
+
+<h2 id="scalability-evolution">Scalability &amp; Evolution</h2>
+
+This section discusses sharding the inventory DB by event, caching seat-map reads, and evolving from a single-region to multi-region active-passive setup.
+
+<h2 id="resiliency-failure-modes">Resiliency &amp; Failure Modes</h2>
+
+This section catalogs failure modes: hold expiry worker lag, payment service downtime, inventory DB unavailability, and the compensating actions for each.
+
+<h2 id="security-abuse">Security &amp; Abuse</h2>
+
+This section covers bot mitigation, rate limiting hold creation, seat scalping defenses, and idempotency key abuse prevention.
+
+<h2 id="tradeoffs-alternatives">Trade-offs &amp; Alternatives</h2>
+
+This section compares optimistic vs pessimistic locking, single-writer vs distributed inventory, and SQL vs NoSQL for the inventory store.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section summarizes the key design decisions and the invariants an interviewer expects a candidate to uphold: no oversell, atomic conditional hold, hold TTL, idempotent saga.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks &amp; FAQ</h2>
+
+This section provides practice questions and frequently asked interview questions about the ticket booking system design.
