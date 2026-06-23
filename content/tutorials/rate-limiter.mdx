@@ -76,7 +76,7 @@ This is the centerpiece. Every algorithm answers the same question — *has this
 
 <RateLimitVisualizer algorithm="sliding-window-log" />
 
-**Sliding window counter.** The pragmatic fix for the fixed-window boundary burst. Keep just two counters — the previous window and the current one — and estimate the rate as `current + previous × (fraction of the previous window still inside the trailing span)`. This **mitigates the 2× boundary burst** of the fixed window by smoothly weighting the prior window out as time advances, while costing only two integers per key instead of a full log. The estimate is approximate (it assumes requests were spread evenly across the previous window), but it stays within our ±1 tolerance for realistic traffic, which is why it is the usual default for window-style limits.
+**Sliding window counter.** The pragmatic fix for the fixed-window boundary burst. Keep just two counters — the previous window and the current one — and estimate the rate as: `estimate = previous-window count × (1 − elapsed fraction of the current window) + current-window count`. This **mitigates the 2× boundary burst** of the fixed window by smoothly weighting the prior window out as time advances, while costing only two integers per key instead of a full log. The estimate is approximate (it assumes requests were spread evenly across the previous window), but it stays within our ±1 tolerance for realistic traffic, which is why it is the usual default for window-style limits.
 
 <RateLimitVisualizer algorithm="sliding-window-counter" />
 
@@ -84,7 +84,7 @@ This is the centerpiece. Every algorithm answers the same question — *has this
 
 <RateLimitVisualizer algorithm="token-bucket" />
 
-**Leaky bucket.** Requests enter a fixed-size queue that drains (leaks) at a constant rate; an arrival to a full queue is rejected. Where the token bucket *permits* bursts, the leaky bucket *absorbs and smooths* them — output is a perfectly steady stream regardless of how bursty the input was, which is ideal when the thing you are protecting cannot tolerate spikes at all (a downstream with a hard, fixed capacity). The cost is added latency for queued requests and a queue to manage.
+**Leaky bucket.** Requests enter a fixed-size queue that drains (leaks) at a constant rate; an arrival to a full queue is rejected. Where the token bucket *permits* bursts, the leaky bucket *absorbs and smooths* them — output is a perfectly steady stream regardless of how bursty the input was, which is ideal when the thing you are protecting cannot tolerate spikes at all (a downstream with a hard, fixed capacity). Note that the leaky bucket has two variants: some implementations queue callers and add latency until the queue drains, while the rate-limiter variant — and this tutorial's visualizer — rejects immediately when the queue is full, giving a constant admission rate with bursts absorbed only up to the queue's capacity. The cost of either variant is a queue to manage per key.
 
 <RateLimitVisualizer algorithm="leaky-bucket" />
 
@@ -95,7 +95,7 @@ This is the centerpiece. Every algorithm answers the same question — *has this
     ["Sliding window log", "1 entry/request — heavy", "Smooth, no burst leak", "Exact", "Small limits needing perfect accuracy"],
     ["Sliding window counter", "2 counters/key — tiny", "Mitigates the 2× boundary burst", "Approximate, within ±1", "Window-style limits at scale"],
     ["Token bucket", "2 numbers/key — tiny", "Allows controlled bursts", "Good", "General-purpose API limiting (default)"],
-    ["Leaky bucket", "queue/key — small", "Smooths bursts into a steady rate", "Good", "Protecting spike-intolerant downstreams"],
+    ["Leaky bucket", "up to limit entries/key", "Smooths bursts into a steady rate", "Good", "Protecting spike-intolerant downstreams"],
   ]}
   recommendedRow={3}
 />
@@ -142,7 +142,7 @@ X-RateLimit-Reset: 1750684860
     { code: "400", meaning: "Unknown policy or malformed key" },
     { code: "503", meaning: "Counter store unreachable — caller should fail open" },
   ]}
-  notes="Headers are the contract: X-RateLimit-Limit is the ceiling, -Remaining the quota left in the window, -Reset the epoch second the window refills. The whole call is one atomic increment-and-compare on the counter store. Each check is a network hop from the gateway to the limiter; a sidecar or embedded middleware avoids that hop by colocating the check with the caller."
+  notes="Headers are the contract: X-RateLimit-Limit is the ceiling, -Remaining the quota left in the window, -Reset the epoch second the window refills. For fixed-window and sliding-window-counter, the check is one atomic increment-and-compare on the counter store; for token bucket, the refill-and-deduct math runs as a Lua script to keep it atomic (see the architecture section). Each check is a network hop from the gateway to the limiter; a sidecar or embedded middleware avoids that hop by colocating the check with the caller."
 />
 
 <ApiContract
