@@ -4,10 +4,12 @@ import type { ComponentType } from "react";
 import { getTutorial, tutorials } from "@/lib/tutorial-registry";
 import { TutorialLayout } from "@/components/tutorial/tutorial-layout";
 import UrlShortenerContent from "@/content/tutorials/url-shortener.mdx";
+import RateLimiterContent from "@/content/tutorials/rate-limiter.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
   "url-shortener": UrlShortenerContent,
+  "rate-limiter": RateLimiterContent,
 };
 
 export function generateStaticParams() {

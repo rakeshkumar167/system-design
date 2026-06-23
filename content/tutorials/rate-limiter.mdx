@@ -1,0 +1,59 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+A rate limiter caps how many requests a client may make in a time window. _(Full content in Task 5.)_
+
+<h2 id="requirements">Requirements</h2>
+
+We separate functional behavior from non-functional targets. _(Full content in Task 5.)_
+
+<h2 id="limit-policies">Limit Policies & Keys</h2>
+
+Limit keys determine the granularity at which requests are counted and throttled. _(Full content in Task 5.)_
+
+<h2 id="algorithms">Algorithms</h2>
+
+Five classic algorithms each make different trade-offs between accuracy and memory. _(Full content in Task 5.)_
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+Back-of-envelope math sizes the counter store and network throughput. _(Full content in Task 5.)_
+
+<h2 id="api-design">API Design</h2>
+
+The allow/throttle API surface is small but its response headers matter. _(Full content in Task 5.)_
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+A sidecar or gateway intercepts every request before it reaches the origin service. _(Full content in Task 5.)_
+
+<h2 id="distributed-counting">Distributed Counting</h2>
+
+Counting across a fleet requires a shared, low-latency store like Redis. _(Full content in Task 5.)_
+
+<h2 id="consistency-races">Consistency & Races</h2>
+
+Atomic increments and Lua scripts eliminate the check-then-act race. _(Full content in Task 5.)_
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+Sharding the counter store and local caching address hot-key pressure. _(Full content in Task 5.)_
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+Fail-open vs. fail-closed is the critical availability trade-off. _(Full content in Task 5.)_
+
+<h2 id="observability">Observability</h2>
+
+Metrics on allowed, throttled, and error rates reveal policy effectiveness. _(Full content in Task 5.)_
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+Service-mesh sidecars, API gateways, and client-side throttling each have distinct cost profiles. _(Full content in Task 5.)_
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+A one-page cheat sheet of the decisions and their justifications. _(Full content in Task 5.)_
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+Common interview questions and the answers that distinguish good candidates. _(Full content in Task 5.)_

@@ -7,13 +7,11 @@ describe("curriculum", () => {
     expect(new Set(problems.map((p) => p.slug)).size).toBe(25);
   });
 
-  it("only exposes URL Shortener as available", () => {
+  it("exposes URL Shortener and Rate Limiter as available", () => {
     expect(
-      problems
-        .filter((p) => p.status === "available")
-        .map((p) => p.slug),
-    ).toEqual(["url-shortener"]);
-    expect(getProblem("url-shortener")?.title).toBe("URL Shortener");
+      problems.filter((p) => p.status === "available").map((p) => p.slug),
+    ).toEqual(["url-shortener", "rate-limiter"]);
+    expect(getProblem("rate-limiter")?.title).toBe("Rate Limiter");
   });
 
   it("numbers problems sequentially from 1 to 25", () => {
