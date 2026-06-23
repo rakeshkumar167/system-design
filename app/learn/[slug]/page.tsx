@@ -6,12 +6,14 @@ import { TutorialLayout } from "@/components/tutorial/tutorial-layout";
 import UrlShortenerContent from "@/content/tutorials/url-shortener.mdx";
 import RateLimiterContent from "@/content/tutorials/rate-limiter.mdx";
 import PastebinContent from "@/content/tutorials/pastebin.mdx";
+import NotificationServiceContent from "@/content/tutorials/notification-service.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
   "url-shortener": UrlShortenerContent,
   "rate-limiter": RateLimiterContent,
   "pastebin": PastebinContent,
+  "notification-service": NotificationServiceContent,
 };
 
 export function generateStaticParams() {

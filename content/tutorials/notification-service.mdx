@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+A notification service is a classic async systems design question that tests your grasp of fan-out, message queues, and delivery reliability.
+
+<h2 id="requirements">Requirements</h2>
+
+The system must deliver push, SMS, and email notifications reliably to millions of users across multiple channels.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+At 500 million notifications per day with a fan-out factor of two, the delivery tier processes roughly 11,500 deliveries per second on average.
+
+<h2 id="entity-model">Entity Model</h2>
+
+The core entities are NotificationRequest, Notification (per-channel delivery record), UserPreference, and Template.
+
+<h2 id="api-design">API Design</h2>
+
+The accept endpoint is `POST /v1/notifications`, which returns 202 Accepted immediately and enqueues the work; `GET /v1/notifications/{id}` polls delivery status.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+An ingestion API enqueues requests to a fan-out service, which consults user preferences and publishes per-channel messages to dedicated queues consumed by channel workers.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+The four key flows are send and fan-out, retry with exponential backoff, dead-letter on exhaustion, and idempotent duplicate suppression.
+
+<h2 id="fanout-pipeline">Fan-out Pipeline</h2>
+
+The fan-out service reads a single NotificationRequest and emits one message per enabled channel queue, decoupling ingestion throughput from per-channel delivery speed.
+
+<h2 id="delivery-guarantees">Delivery Guarantees & Idempotency</h2>
+
+At-least-once delivery is made effectively-once by requiring callers to supply an `Idempotency-Key` checked against a dedup store before processing.
+
+<h2 id="retries-dlq">Retries & Dead-Letter Queue</h2>
+
+Transient provider failures trigger exponential backoff with jitter; messages that exhaust the retry budget are routed to a dead-letter queue for alerting and manual reprocessing.
+
+<h2 id="user-preferences">Preferences & Rate Limiting</h2>
+
+The fan-out service filters channels against each user's stored preferences and applies per-user rate limits before publishing to channel queues.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+Channel worker pools autoscale independently behind their queues; adding a new channel type requires only a new queue and worker deployment with no ingestion changes.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+Provider outages are isolated per channel; queue depth metrics and circuit breakers prevent cascade failures from propagating back to the ingestion path.
+
+<h2 id="security-abuse">Security & Abuse</h2>
+
+Caller authentication, per-tenant send-rate caps, and payload validation at the ingestion boundary prevent abuse and protect downstream providers.
+
+<h2 id="observability">Observability</h2>
+
+Key metrics are accept QPS, fan-out latency, per-channel delivery latency, retry rate, DLQ depth, and end-to-end delivery success rate.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+Push-based fan-out trades write amplification for low read latency; pull-based aggregation at read time reduces writes but adds per-request cost.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+The core insight is that async fan-out over durable queues decouples ingestion from delivery, and idempotency keys turn at-least-once into effectively-once.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+Review the key trade-offs: why 202 over 200, how the dedup store prevents double sends, and when to prefer a single broad queue over per-channel queues.

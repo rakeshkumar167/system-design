@@ -42,7 +42,7 @@ export const problems: readonly Problem[] = [
       "Fan out push, SMS, and email reliably with retries, deduplication, and user preferences.",
     difficulty: "Intermediate",
     concepts: ["Fan-out", "Message queues", "Idempotency", "Retries"],
-    status: "coming-soon",
+    status: "available",
     sequence: 4,
   },
   {

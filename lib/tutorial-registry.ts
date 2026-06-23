@@ -93,6 +93,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "notification-service": {
+    slug: "notification-service",
+    title: "Design a Notification Service",
+    description:
+      "An interview-grade walkthrough of a multi-channel notification service: an asynchronous fan-out pipeline over message queues, at-least-once delivery made safe with idempotency, retries with backoff and a dead-letter queue, user preferences and rate limiting, scaling, and failure modes.",
+    difficulty: "Intermediate",
+    readingMinutes: 34,
+    concepts: ["Fan-out", "Message queues", "Idempotency", "Retries"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "fanout-pipeline", label: "Fan-out Pipeline", depth: "advanced" },
+      { id: "delivery-guarantees", label: "Delivery Guarantees & Idempotency", depth: "advanced" },
+      { id: "retries-dlq", label: "Retries & Dead-Letter Queue", depth: "advanced" },
+      { id: "user-preferences", label: "Preferences & Rate Limiting", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "security-abuse", label: "Security & Abuse", depth: "advanced" },
+      { id: "observability", label: "Observability", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {
