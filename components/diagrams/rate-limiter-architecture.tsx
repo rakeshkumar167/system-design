@@ -74,16 +74,16 @@ export function RateLimiterArchitecture() {
 
       {/* Fail-open path: store unreachable → limiter bypasses → backend (control variant) */}
       <Edge
-        from={{ x: N.limiter.x + N.limiter.w / 2, y: N.limiter.y + N.limiter.h }}
-        to={{ x: N.store.x + N.store.w / 2, y: N.store.y + N.store.h }}
+        from={anchors.right(N.limiter)}
+        to={anchors.left(N.backend)}
         variant="control"
-        label="store down"
-        labelOffset={8}
+        label="store down → allow"
+        labelOffset={-12}
       />
 
       {/* Telemetry: limiter → alerts */}
       <Edge
-        from={anchors.bottom(N.backend)}
+        from={anchors.bottom(N.limiter)}
         to={anchors.top(N.alerts)}
         variant="muted"
         label="alert"
