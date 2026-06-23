@@ -1,30 +1,182 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-A rate limiter caps how many requests a client may make in a time window. _(Full content in Task 5.)_
+A rate limiter caps how many requests a client may make in a time window — `100 requests per minute per API key`, say — and rejects the overflow, usually with a `429 Too Many Requests`. It is the control plane that protects a service from being overwhelmed: it shields the origin from traffic spikes, enforces fair sharing between tenants, defends against brute-force and scraping abuse, and turns a fuzzy "be nice to the API" guideline into a hard, observable contract. It sits at the very front of the request path — in an API gateway, a service-mesh sidecar, or middleware — because the cheapest request to handle is the one you reject before it touches your business logic.
+
+It looks like a counter with an `if`, which is exactly why it is a good interview problem: the interesting parts are doing that count **correctly under concurrency**, **cheaply at a million requests per second**, and **across a fleet of stateless servers** that share no memory. Spend the first few minutes establishing scope rather than naming algorithms. Good questions to ask:
+
+- What are we limiting on — user, IP, API key, or a global ceiling? Often several at once.
+- One global policy, or many named policies with per-tier limits (free vs. paid)?
+- How strict must the limit be — is an occasional one-over acceptable, or must it be exact?
+- What happens when the limiter's own datastore is down: do we block all traffic, or let it through?
+- What is the throughput, and therefore the per-check latency budget?
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and scope · **5 min** requirements and limit policies · **10 min** algorithms and the accuracy/memory trade-off · **5 min** capacity estimates · **5 min** API and headers · **10 min** architecture and distributed counting deep dive · **5 min** failure modes and wrap-up. Say your assumptions out loud and write them down — the interviewer is grading how you reason about concurrency and the fail-open decision, not whether you memorized five algorithm names.
+</Callout>
+
+This tutorial commits to a concrete set of assumptions so the numbers stay consistent end to end. **In scope:** application-layer request rate limiting keyed by user / IP / API-key / global, multiple named policies with tiered limits, the standard rate-limit response headers, and distributed enforcement across a server fleet. **Out of scope:** volumetric DDoS mitigation at L3/L4 (handled upstream by the network and scrubbing centers), a Web Application Firewall's content inspection, and billing or usage-metering dashboards — mention them so the interviewer knows you see the boundary, then set them aside.
 
 <h2 id="requirements">Requirements</h2>
 
-We separate functional behavior from non-functional targets. _(Full content in Task 5.)_
+Separate what the limiter must *do* from how *well* it must do it. For a rate limiter the non-functional targets are unusually load-bearing: it runs in the hot path of every single request, so its own overhead and failure behavior define whether it is safe to deploy at all.
+
+<RequirementsTable
+  functional={[
+    "Enforce 'N requests per window' for a given key",
+    "Support multiple named policies (e.g. login, search, write)",
+    "Apply tiered limits per plan (free vs. paid)",
+    "Count on configurable dimensions: user, IP, API key, or global",
+    "Return the caller's remaining quota and reset time",
+    "Enable, disable, or change a policy without a redeploy",
+  ]}
+  nonFunctional={[
+    { goal: "Enforcement overhead (p99)", target: "< 1 ms" },
+    { goal: "Availability", target: "99.99%" },
+    { goal: "Accuracy tolerance", target: "±1 request" },
+    { goal: "Behavior on store outage", target: "fail open" },
+    { goal: "Scalability", target: "horizontal" },
+    { goal: "Throughput", target: "1M req/s peak" },
+  ]}
+/>
+
+Three targets dominate every later decision. First, **enforcement overhead must be sub-millisecond at p99** — the limiter runs before every request, so even a few milliseconds tax the entire service; this is why the counter store must be in-memory and the check a single atomic operation. Second, the limiter **fails open**: if the counter store is unreachable, we allow requests rather than block all traffic, because a rate limiter that takes down the service it protects is worse than no rate limiter at all. Third, we accept an **accuracy tolerance of ±1 request** — chasing perfect exactness across a distributed fleet costs latency and coordination we are not willing to pay, and one request over a limit of a thousand harms no one.
 
 <h2 id="limit-policies">Limit Policies & Keys</h2>
 
-Limit keys determine the granularity at which requests are counted and throttled. _(Full content in Task 5.)_
+A *policy* is the rule; a *key* is what the rule is counted against. Separating them is what lets one engine enforce thousands of distinct limits. A policy names a limit, a window, an algorithm, and the dimension it applies to; the counter key is then assembled at request time from the policy plus the caller's identity on that dimension.
+
+<EntityModel
+  name="RateLimitPolicy"
+  description="A reusable, hot-reloadable rule. The engine looks one up per request and assembles a counter key from it."
+  fields={[
+    { name: "name", type: "string (PK)", notes: "e.g. 'login', 'search', 'write-api'" },
+    { name: "limit", type: "int", notes: "max requests allowed per window" },
+    { name: "window_seconds", type: "int", notes: "window length, e.g. 60" },
+    { name: "algorithm", type: "enum", notes: "token-bucket | sliding-window-counter | ..." },
+    { name: "scope", type: "enum", notes: "user | ip | api_key | global" },
+  ]}
+  keys="Policies are configuration, read far more than written. Keep them in a small store (or config service) and cache them in-process so a lookup never touches the network on the hot path."
+/>
+
+The actual counter is stored under a **composite key** that concatenates the policy name with the identity value on the policy's scope dimension — for example `login:user:42`, `search:ip:203.0.113.7`, or `write-api:key:ak_9f3c`. A single request can be evaluated against several policies at once: a per-IP ceiling to blunt scraping, a per-user limit for fairness, and a global cap to protect the origin — the request is admitted only if **every** applicable policy allows it. Tiered plans are just policies parameterized by the caller's tier: a `search` policy might resolve to `100/min` for free accounts and `10,000/min` for enterprise, selected from the API key's metadata.
+
+<Callout variant="info" title="Key cardinality is the capacity driver">
+The number of *distinct keys live in any window* — not the request rate — determines how much memory the counter store needs. One global policy is a single counter; a per-user policy over fifty million active users is fifty million counters. When you estimate capacity, you size memory from key cardinality and throughput from the request rate; they are independent axes.
+</Callout>
 
 <h2 id="algorithms">Algorithms</h2>
 
-Five classic algorithms each make different trade-offs between accuracy and memory. _(Full content in Task 5.)_
+This is the centerpiece. Every algorithm answers the same question — *has this key exceeded its limit?* — and they differ only in how they remember recent history, which trades **memory** against **accuracy** and **burst behavior**. Play with each simulation below (limit 5 requests per 10-second window); the patterns you feel are exactly the ones that matter in production.
+
+**Fixed window.** Keep one counter per key per fixed calendar window (e.g. the current minute); increment on each request, reject once it hits the limit, and reset to zero at the boundary. It is the cheapest possible scheme — a single integer and a TTL per key — and trivially understood. Its flaw is the **boundary burst**: a client can send the full limit in the last instant of one window and the full limit again in the first instant of the next, admitting **2× the limit** across a window-length span that straddles the boundary. For a `100/min` limit that means 200 requests in a two-second sliver around the minute mark.
+
+<RateLimitVisualizer algorithm="fixed-window" />
+
+**Sliding window log.** Store a timestamp for every request in the trailing window and admit a new one only if the count of timestamps newer than `now − window` is under the limit. It is **exact** — no boundary artifact, no estimation — but it pays for that exactness in memory: it stores one entry per request, so a key doing the full limit holds the full limit's worth of timestamps, and trimming the log on every check adds work. Use it only when perfect accuracy on small limits is worth the cost.
+
+<RateLimitVisualizer algorithm="sliding-window-log" />
+
+**Sliding window counter.** The pragmatic fix for the fixed-window boundary burst. Keep just two counters — the previous window and the current one — and estimate the rate as `current + previous × (fraction of the previous window still inside the trailing span)`. This **mitigates the 2× boundary burst** of the fixed window by smoothly weighting the prior window out as time advances, while costing only two integers per key instead of a full log. The estimate is approximate (it assumes requests were spread evenly across the previous window), but it stays within our ±1 tolerance for realistic traffic, which is why it is the usual default for window-style limits.
+
+<RateLimitVisualizer algorithm="sliding-window-counter" />
+
+**Token bucket.** A bucket holds up to `capacity` tokens and refills at a steady rate; each request spends one token, and a request with no token available is rejected. It is memory-cheap — two numbers, the token count and the last-refill timestamp — and uniquely good at **allowing controlled bursts**: a client that has been idle accumulates a full bucket and may spend it in a rush, while the long-run average is still capped by the refill rate. That "save up then spend" behavior matches how real clients actually call APIs, which is why it is the most widely deployed algorithm and our recommendation.
+
+<RateLimitVisualizer algorithm="token-bucket" />
+
+**Leaky bucket.** Requests enter a fixed-size queue that drains (leaks) at a constant rate; an arrival to a full queue is rejected. Where the token bucket *permits* bursts, the leaky bucket *absorbs and smooths* them — output is a perfectly steady stream regardless of how bursty the input was, which is ideal when the thing you are protecting cannot tolerate spikes at all (a downstream with a hard, fixed capacity). The cost is added latency for queued requests and a queue to manage.
+
+<RateLimitVisualizer algorithm="leaky-bucket" />
+
+<TradeoffTable
+  columns={["Algorithm", "Memory", "Burst handling", "Accuracy", "Best for"]}
+  rows={[
+    ["Fixed window", "1 counter/key — tiny", "Allows 2× at the boundary", "Poor at edges", "Coarse, simple caps where the boundary burst is harmless"],
+    ["Sliding window log", "1 entry/request — heavy", "Smooth, no burst leak", "Exact", "Small limits needing perfect accuracy"],
+    ["Sliding window counter", "2 counters/key — tiny", "Mitigates the 2× boundary burst", "Approximate, within ±1", "Window-style limits at scale"],
+    ["Token bucket", "2 numbers/key — tiny", "Allows controlled bursts", "Good", "General-purpose API limiting (default)"],
+    ["Leaky bucket", "queue/key — small", "Smooths bursts into a steady rate", "Good", "Protecting spike-intolerant downstreams"],
+  ]}
+  recommendedRow={3}
+/>
+
+For a general-purpose API limiter we default to the **token bucket**: it is cheap, it handles real-world bursty traffic gracefully, and it implements cleanly as an atomic operation in the counter store. When the requirement is specifically a windowed quota (`N per minute`) rather than a rate, the **sliding window counter** is the right pick because it gives near-exact window enforcement at the same tiny memory cost while sidestepping the fixed window's boundary burst.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-Back-of-envelope math sizes the counter store and network throughput. _(Full content in Task 5.)_
+Estimates are directional — their job is to tell us *which* dimension is under pressure. For a rate limiter there are two independent axes: **throughput** (requests per second, which sizes compute and counter ops) and **cardinality** (distinct live keys, which sizes memory). We size both from one set of assumptions.
+
+<RateLimiterCapacity
+  assumptions={{
+    peakRequestsPerSecond: 1000000,
+    checksPerRequest: 1,
+    activeKeys: 50000000,
+    bytesPerCounter: 80,
+    redisOpsPerNode: 100000,
+  }}
+/>
+
+The three takeaways. First, at **1,000,000 peak requests per second** with one check each, the counter tier must absorb **1,000,000 atomic counter ops per second** — that throughput, not data volume, is what sizes the cluster. Second, fifty million live keys at 80 bytes each is only about **4 GB of counter memory**: counters are minuscule, the entire working set fits comfortably in RAM, and reads never touch disk — memory is not the constraint here. Third, dividing the op load by the ~100,000 atomic ops a single Redis node sustains gives **10 nodes**, sized purely by operations per second. Because ops, not memory, drive the count, we **shard the counter store by key** so each request's increment lands on exactly one node and the op load spreads evenly across the cluster.
 
 <h2 id="api-design">API Design</h2>
 
-The allow/throttle API surface is small but its response headers matter. _(Full content in Task 5.)_
+A rate limiter exposes two surfaces: a control API to manage policies, and — when it runs as a standalone service rather than embedded middleware — a data-plane check API that the gateway calls per request. The check is where latency lives, and its response headers are the contract every well-behaved client reads.
+
+<ApiContract
+  method="POST"
+  path="/v1/ratelimit/check"
+  summary="Synchronous admission decision for one request. Returns allow/deny plus the caller's current quota."
+  request={`{
+  "key": "search:user:42",
+  "policy": "search",
+  "cost": 1
+}`}
+  response={`HTTP/1.1 200 OK
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 87
+X-RateLimit-Reset: 1750684860
+
+{ "allowed": true, "remaining": 87 }`}
+  statusCodes={[
+    { code: "200", meaning: "Decision returned (check 'allowed' in the body)" },
+    { code: "400", meaning: "Unknown policy or malformed key" },
+    { code: "503", meaning: "Counter store unreachable — caller should fail open" },
+  ]}
+  notes="Headers are the contract: X-RateLimit-Limit is the ceiling, -Remaining the quota left in the window, -Reset the epoch second the window refills. The whole call is one atomic increment-and-compare on the counter store. Each check is a network hop from the gateway to the limiter; a sidecar or embedded middleware avoids that hop by colocating the check with the caller."
+/>
+
+<ApiContract
+  method="GET"
+  path="/v1/search"
+  summary="A throttled origin request — what the client sees when a policy rejects it."
+  response={`HTTP/1.1 429 Too Many Requests
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 1750684860
+Retry-After: 30
+
+{ "error": "rate_limit_exceeded", "retryAfter": 30 }`}
+  statusCodes={[
+    { code: "200", meaning: "Allowed — request proceeds to the origin" },
+    { code: "429", meaning: "Too Many Requests — limit exceeded" },
+  ]}
+  notes="On rejection, return 429 with Retry-After (seconds until the client may try again) so well-behaved clients back off instead of hammering. The same X-RateLimit-* headers ride on every response — allowed or not — so clients can self-throttle before they ever hit a 429."
+/>
+
+The per-request **network hop** to a standalone limiter is the main cost of the check API: at a million requests per second it adds latency and a dependency to the hot path. Two deployment shapes avoid it — embedding the limiter as **gateway middleware**, or running it as a **sidecar** colocated with each service instance — so the increment-and-compare is a local call and only the shared counter store is remote.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-A sidecar or gateway intercepts every request before it reaches the origin service. _(Full content in Task 5.)_
+The architecture is small, and its discipline is in the boundaries: a thin **enforcement point** in the request path, a **shared counter store** holding the only durable state, and an **observability** path that makes both visible. The enforcement point is stateless and replicated; all coordination happens through the counter store.
+
+<RateLimiterArchitecture />
+
+- **Enforcement point (gateway middleware or sidecar).** Intercepts every request before it reaches the backend, looks up the applicable policy from an in-process cache, builds the composite key, and performs the atomic increment-and-compare. It is stateless, so it scales horizontally — any instance can serve any request because the count lives elsewhere.
+- **Counter store (Redis).** The single source of truth for live counts. Each check is one atomic operation (an `INCR`, or a small Lua script for token-bucket math) so concurrent requests on the same key can't race. It is sharded by key so the op load spreads across nodes, and it holds only ephemeral counters with TTLs — losing it degrades enforcement but loses no business data.
+- **Backend service.** Receives only admitted requests; the limiter has already shed the overflow.
+- **Observability.** The limiter emits allowed/throttled/error counts and, critically, an alert whenever it has to **fail open** because the counter store was unreachable — so a silent loss of enforcement becomes a visible, actionable event.
+
+The decisive boundary is **where enforcement happens versus where state lives**. Putting the check in middleware or a sidecar keeps the latency-critical increment local to the request path, while centralizing the *count* in the shared store is what lets a fleet of stateless enforcement points agree on a single number per key. That split — local enforcement, central counting — is the spine of every section that follows.
 
 <h2 id="distributed-counting">Distributed Counting</h2>
 
