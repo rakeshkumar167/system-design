@@ -20,6 +20,12 @@ import {
 } from "@/components/diagrams/request-flow-diagrams";
 import { ScaleEvolution } from "@/components/diagrams/scale-evolution";
 import { RateLimitVisualizer } from "@/components/diagrams/rate-limit-visualizer";
+import { RateLimiterArchitecture } from "@/components/diagrams/rate-limiter-architecture";
+import {
+  AllowSequence,
+  ThrottleSequence,
+  FailOpenSequence,
+} from "@/components/diagrams/rate-limit-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -47,6 +53,10 @@ const teachingComponents = {
   AnalyticsSequence,
   ScaleEvolution,
   RateLimitVisualizer,
+  RateLimiterArchitecture,
+  AllowSequence,
+  ThrottleSequence,
+  FailOpenSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
