@@ -1,71 +1,435 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section frames the ticket booking problem as interviewers present it: limited, strongly-consistent inventory under high-contention demand.
+A ticket booking system sells a fixed, finite inventory — the seats at a concert, a flight, a theater — to whoever wants them, and its one inviolable rule is that **the same seat is never sold twice**. A user browses a seat map, picks a seat, pays, and gets a ticket; behind that simple flow is the hardest property in the whole curriculum to guarantee: **correctness under concurrency**. When a popular show opens, far more people than there are seats arrive in the same few seconds, all clicking the same good rows. The system must let exactly one of them win each seat and tell everyone else "taken," instantly, without ever double-selling.
+
+The trap is to treat this as CRUD on an events table. The real problem is that buying takes *time* — you choose a seat, enter payment, the charge takes seconds — yet during that time the seat must be *yours and no one else's*, and if you walk away it must return to the pool. That forces a **reservation** model (hold the seat, then pay), **concurrency control** (so two buyers can't both grab it), and **strong consistency** (so nobody oversells on a stale view). Spend the opening minutes scoping. Good questions to ask:
+
+- Is overselling ever acceptable? (For seats: never. This is a hard invariant, not an SLO.)
+- Reserved seating with a seat map, or general admission (a pure count)?
+- How long does a user get to hold a seat while paying? What happens if they abandon it?
+- How extreme is the contention — a steady trickle, or a million people at a 10am on-sale?
+- One person can buy several seats together — is partial success allowed, or all-or-nothing?
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the no-oversell invariant · **5 min** requirements and the seat model · **5 min** capacity (the contention ratio falls out here) · **5 min** entity model and the hold/book API · **10 min** the reservation lifecycle and concurrency control — the centerpiece · **10 min** strong consistency, the payment saga, and hot on-sales · **5 min** failure modes and wrap-up. Say your assumptions out loud — the interviewer is grading whether you can prevent a double-sell under concurrency with an atomic operation and reason about holds and consistency, not whether you can list venues.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the seat/inventory model, the hold → pay → confirm reservation lifecycle, concurrency control (optimistic vs pessimistic), strong consistency on inventory, the idempotent payment saga and compensation, and high-contention on-sale management. **Out of scope:** dynamic/surge pricing, seat-map rendering and UX, fraud-scoring ML, the payment processor's internals (we integrate with one), and resale/transfer marketplaces — name them so the interviewer sees the boundary, then set them aside.
 
 <h2 id="requirements">Requirements</h2>
 
-This section covers functional and non-functional requirements, including the no-oversell invariant, seat hold TTL, and throughput targets.
+Separate what the system must *do* from how *well* it must do it. For a booking system the non-functional list is dominated by a single hard invariant — **never oversell** — that is not a tunable target but a correctness property the entire design exists to protect.
+
+<RequirementsTable
+  functional={[
+    "Browse seat availability for an event",
+    "Hold one or more seats while the user pays",
+    "Confirm a booking by paying against a held seat",
+    "Release a hold automatically on expiry, or on cancel",
+    "Make booking idempotent so a retry can't double-charge or double-book",
+    "Support buying multiple seats together (all-or-nothing)",
+  ]}
+  nonFunctional={[
+    { goal: "Oversell a seat", target: "never (hard invariant)" },
+    { goal: "Inventory consistency", target: "strong (linearizable)" },
+    { goal: "Hold action latency (p99)", target: "< 200 ms" },
+    { goal: "Survive on-sale spikes", target: "yes (waiting room)" },
+    { goal: "Availability", target: "99.95%" },
+    { goal: "Fairness under contention", target: "queue / first-come" },
+  ]}
+/>
+
+Three targets dominate every later decision. First, **never oversell**: a seat may be sold at most once, full stop — this is why seat state changes go through an atomic, strongly-consistent operation rather than a read-then-write. Second, **inventory must be strongly consistent**: you cannot decide whether a seat is free from an eventually-consistent replica that might be seconds stale, because that staleness is exactly a double-sell. Third, the system must **survive on-sale spikes** where demand briefly exceeds inventory by 20× or more — which it does by admitting users through a waiting room and rejecting losing hold attempts instantly, rather than melting down trying to serve everyone at once.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section derives the daily seat inventory, contention ratio, peak hold attempts per second, and peak availability reads per second.
+Estimates here tell a different story than a content system's. The raw write rate is modest, but every write **contends** on a tiny, fixed pool of seats — so the challenge is correctness under contention, not throughput. We size the contention from one set of assumptions.
+
+<TicketBookingCapacity
+  assumptions={{
+    eventsPerDay: 1000,
+    seatsPerEvent: 50000,
+    peakConcurrentUsers: 1000000,
+    onsaleWindowSeconds: 60,
+    availabilityReadsPerHold: 20,
+  }}
+/>
+
+The takeaways. First, inventory is **bounded**: 50 million seats a day is a finite resource, unlike the unbounded content of a Pastebin — you can sell out, and you must never sell *past* out. Second, the **contention ratio is 20:1** — at a hot on-sale a million users chase fifty thousand seats, so for every seat that exists, twenty people are fighting over it, which means **nineteen of every twenty hold attempts on a desirable seat must be rejected** — instantly and correctly. Third, the **write path is modest in raw QPS** (~17,000 hold attempts/sec) but every one of those attempts lands on the same small, strongly-consistent inventory; the difficulty is serializing them per seat, not absorbing the volume. Fourth, **reads dominate** at ~333,000/sec — users browse far more than they buy — so the seat-map *display* is cached and approximate, while the **hold is the one authoritative write** that must be exactly right. That asymmetry — cheap approximate reads, precious exact writes — shapes the whole architecture.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core entities: Event, Seat (with status, version, hold_id, held_until), Hold, and Booking.
+The model centers on the **Seat** as a row whose `status` is the contended resource. Two fields make safe concurrency possible: `status`, which the hold transitions, and `version`, an optimistic-locking counter that detects competing writers.
+
+<EntityModel
+  name="Seat"
+  description="One row per physical seat — the unit that is held and sold. Its status is the thing every concurrent buyer competes to change, and the version column is what lets us change it safely without a lock."
+  fields={[
+    { name: "id", type: "string (PK)", notes: "stable seat id, e.g. 'evt9:A:12'" },
+    { name: "event_id", type: "string", notes: "the event; also the shard key" },
+    { name: "label", type: "string", notes: "human seat label (section / row / number)" },
+    { name: "status", type: "enum", notes: "available | held | booked" },
+    { name: "hold_id", type: "string | null", notes: "the hold currently reserving it, if held" },
+    { name: "held_until", type: "timestamp | null", notes: "when the hold expires and the seat frees" },
+    { name: "version", type: "int", notes: "optimistic-lock counter; bumped on every state change" },
+    { name: "price", type: "int", notes: "price in minor units" },
+  ]}
+  keys="The primary key is the seat id; the seat is found by (event_id, label) when browsing. event_id is the shard key, so all of one event's contention stays on one shard. The crucial property is that a hold is a conditional update guarded by status (and optionally version), so concurrent writers can't both succeed — covered in Concurrency Control."
+/>
+
+Three related entities complete the picture. An **Event** holds the show's metadata and on-sale time and owns a set of seats. A **Hold** is a short-lived reservation (id, user, the seat ids it covers, `expires_at`, status) created when a user grabs seats and consumed when they pay or it expires. A **Booking** is the durable record of a completed purchase (id, user, seat ids, `payment_id`, confirmed time, total) — the proof of sale that outlives the ephemeral hold. Keeping the hold separate from the booking is what lets a seat be *reserved* without being *sold*, which is the entire point of the reservation model.
 
 <h2 id="api-design">API Design</h2>
 
-This section specifies the REST API: POST /v1/holds (201 or 409 Conflict) and POST /v1/bookings (idempotent confirm), plus the cached GET seat-map endpoint.
+Two write endpoints carry the system: take a hold, then confirm it with payment. The hold is where contention is resolved, so its defining response is **409 Conflict** — the honest answer when the seat you wanted was just taken by someone else.
+
+<ApiContract
+  method="POST"
+  path="/v1/holds"
+  summary="Atomically reserve one or more available seats for a short window. Succeeds only if every requested seat is free."
+  request={`POST /v1/holds
+
+{
+  "event_id": "evt_9",
+  "seat_ids": ["evt9:A:12", "evt9:A:13"],
+  "user_id": "u_42"
+}`}
+  response={`HTTP/1.1 201 Created
+
+{
+  "hold_id": "hld_7c3",
+  "seat_ids": ["evt9:A:12", "evt9:A:13"],
+  "held_until": "2026-06-24T10:10:00Z",
+  "expires_in": 600
+}`}
+  statusCodes={[
+    { code: "201", meaning: "All seats held; you have until held_until to pay" },
+    { code: "409", meaning: "Conflict — at least one seat is already held or booked" },
+    { code: "404", meaning: "Unknown event or seat" },
+    { code: "400", meaning: "Malformed request" },
+  ]}
+  notes="Each seat is reserved by an atomic conditional update that only succeeds if the seat is still available, so two concurrent holds on the same seat cannot both win — the loser gets 409. A multi-seat hold is all-or-nothing: if any seat can't be reserved, the whole hold fails and any seats already grabbed in the attempt are rolled back. The hold has a TTL (held_until); if the user doesn't pay in time, the seats are released automatically."
+/>
+
+<ApiContract
+  method="POST"
+  path="/v1/bookings"
+  summary="Confirm a hold by paying for it. Idempotent: a retried request with the same key returns the same booking, never a second charge."
+  request={`POST /v1/bookings
+Idempotency-Key: 4c1f...e9
+
+{
+  "hold_id": "hld_7c3",
+  "payment_token": "tok_visa_x"
+}`}
+  response={`HTTP/1.1 201 Created
+
+{
+  "booking_id": "bkg_d41",
+  "seat_ids": ["evt9:A:12", "evt9:A:13"],
+  "status": "confirmed"
+}`}
+  statusCodes={[
+    { code: "201", meaning: "Payment captured and seats booked" },
+    { code: "200", meaning: "Idempotent replay — the existing booking is returned" },
+    { code: "402", meaning: "Payment failed — the hold is released" },
+    { code: "409", meaning: "Hold expired or already consumed" },
+  ]}
+  notes="Booking is a saga: validate the hold, charge the payment provider, then flip the held seats to booked. The Idempotency-Key makes the whole thing safe to retry — a client that times out and resubmits gets the same booking, never a double charge. If the hold has already expired (the seats were released), the booking fails with 409 and the user must start over."
+/>
+
+Reads — `GET /v1/events/{id}/seats` for the seat map — take the opposite stance: they're served from a **cache** and are allowed to be slightly stale, because a display that shows a seat as free a half-second after someone grabbed it is harmless; the authoritative check happens at hold time, where the conditional update is the final word.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the high-level architecture: waiting room, booking service, inventory DB, hold expiry worker, payment service, booking store, and availability cache.
+The architecture protects one small, precious thing — the inventory — behind a controlled front door and an authoritative write path, while serving cheap approximate reads from the side.
+
+<TicketBookingArchitecture />
+
+- **Waiting room.** At a hot on-sale, the front door is a queue that admits users into the booking flow at a controlled rate. It converts an un-survivable instantaneous spike into a steady stream the inventory store can actually serve, and it's where fairness (first-come queue position) is enforced.
+- **Booking service.** Stateless and replicated. It executes the hold (the atomic conditional update), runs the payment saga, and confirms bookings. It owns no inventory state itself — all coordination is through the inventory store.
+- **Inventory store (strongly consistent, sharded by event).** The system of record for seat state, and the only place the no-oversell invariant is enforced. It's strongly consistent so a seat's status is never read stale on the write path, and it's sharded by `event_id` so one hot event's contention is isolated to one shard.
+- **Hold expiry worker.** Sweeps for holds past their `held_until` and releases their seats back to `available`, so abandoned holds don't leak inventory. (The hold path also reclaims expired holds lazily, as a backstop.)
+- **Payment provider.** External and slow — the reason buying is a saga rather than a single transaction. Charges run against it during confirm.
+- **Booking store.** The durable record of completed sales, and the availability cache that serves the high-volume, approximate seat-map reads.
+
+The decisive boundary is **authoritative inventory versus everything else**. The seat status lives in exactly one strongly-consistent place that serializes writes per seat; the waiting room shapes the load hitting it, the cache absorbs reads that don't need to be exact, and the payment saga keeps a slow external charge from holding an inventory transaction open. Every section that follows elaborates how that one authoritative write stays correct under a stampede.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section traces the four key flows: hold a seat, contention rejection, confirm payment, and hold expiry release.
+Four flows cover the system: taking a hold, two buyers contending for the same seat, confirming with payment, and a hold expiring. The contention flow is the one that proves the invariant.
+
+**Hold a seat.** The booking service issues a single atomic conditional update that flips the seat to `held` only if it's still `available`. One round trip decides it: you either reserved the seat or you didn't.
+
+<HoldSeatSequence />
+
+**Contention.** Two users target the same seat at the same instant. Both conditional updates race at the inventory store, but the store serializes them: the first matches the `available` row and wins; the second now finds the row in `held` state, matches **zero** rows, and is rejected with `409`. Exactly one buyer wins — no oversell, no lock held across the network.
+
+<ContentionSequence />
+
+**Confirm with payment.** With a valid hold, the user pays. The booking service charges the external provider, and only on success flips the held seats to `booked` and writes the booking — idempotently, so a retry can't charge twice.
+
+<ConfirmPaymentSequence />
+
+**Hold expiry.** If the user never pays, the hold's TTL passes and the expiry worker releases the seats back to `available`, returning them to the pool for someone else. Without this, abandoned holds would slowly make a sold-out-looking event that isn't.
+
+<HoldExpirySequence />
 
 <h2 id="reservation-lifecycle">Reservation Lifecycle</h2>
 
-This section explains the seat state machine: available → held (with TTL) → booked, and why holds must expire to prevent seat leakage.
+A seat moves through a tiny state machine, and getting its transitions right is most of the design. The states are **available → held → booked**, with a path back from `held → available` when a hold expires or is cancelled. `booked` is terminal for the life of the event.
+
+The **hold** exists because buying isn't instantaneous. A user needs time to enter payment, and during that time the seat must be exclusively theirs — otherwise two people would race all the way through checkout and one would be charged for a seat they can't have. The hold reserves the seat *before* payment, decoupling the slow, failure-prone checkout from the inventory decision: the contention is resolved in milliseconds at hold time, and payment then proceeds against a seat that's already guaranteed.
+
+<Callout variant="warning" title="Holds must expire, or inventory leaks">
+A hold without a TTL is a memory leak made of seats. Users abandon checkouts constantly — they close the tab, their card fails, they change their mind — and every abandoned hold that never expires is a seat that looks sold but generates no sale and can never be bought. So every hold carries a `held_until`, and seats are reclaimed two ways: an **active sweeper** releases expired holds in the background, and the hold path **lazily** treats a seat whose `held_until` has passed as available (reclaiming it on the spot). Active deletion bounds how long a leak persists; lazy reclaim guarantees an expired hold never actually blocks a sale. It's the same lazy-plus-active pattern the Pastebin tutorial uses for expiry — here it protects revenue.
+</Callout>
+
+The hold window is a UX-versus-inventory trade. Too short and users fail to check out in time and lose their seats; too long and abandoned holds tie up inventory during the exact minutes when demand is highest. A few minutes is typical, sometimes shortened dynamically when an event is hot and every held-but-unsold seat is costly.
 
 <h2 id="concurrency-control">Concurrency Control</h2>
 
-This section is the centerpiece: the oversell race condition, optimistic concurrency (compare-and-set / conditional UPDATE WHERE status='available'), and pessimistic locking (SELECT FOR UPDATE).
+This is the centerpiece: how do two buyers *not* both get the same seat? The naive implementation is a **read-modify-write** — read the seat, see it's `available`, then write it to `held` — and it is exactly wrong. Two requests both read `available`, both decide they can take it, and both write `held`: the seat is sold twice. Under a 20:1 contention ratio this race isn't rare, it's the common case. The fix is to never read-then-write; make the reservation a **single atomic operation** that only succeeds if the seat is still free.
+
+**Optimistic concurrency control** is the usual answer. The hold is one conditional update that carries its own precondition:
+
+```sql
+UPDATE seats
+   SET status = 'held', hold_id = :h, held_until = :t, version = version + 1
+ WHERE id = :seat AND status = 'available';
+```
+
+The database evaluates the `WHERE` and the write as one atomic, serialized step per row. If the seat was still `available`, **one row** is updated and you won it. If someone beat you, the row is now `held`, the `WHERE` matches **zero rows**, and you know instantly to return `409` — no lock was held, no second read raced. (Equivalently, you can guard on `version`: read the seat with version *v*, then `UPDATE … WHERE id = :seat AND version = :v`; a mismatch means someone changed it under you.) It's called *optimistic* because it assumes conflicts are rare and simply detects the occasional one via the affected-row count, rather than preventing it with a lock up front.
+
+**Pessimistic concurrency control** takes the opposite bet: lock the row first (`SELECT … FOR UPDATE`), then read and write it under the lock, then release. It also prevents the double-sell, and it can be simpler to reason about for multi-row, all-or-nothing holds. But under heavy contention a lock *serializes every contender on a hot seat into a queue*, holds a lock across the transaction, and risks lock waits and deadlocks (especially when one buyer grabs several seats and lock-ordering matters). Optimistic updates have no such held lock — losers fail immediately and cheaply — which is why they're generally preferred for this exact "many buyers, one hot seat" shape.
+
+<KnowledgeCheck
+  question="Why is a read-modify-write ('read the seat, check it's available, then mark it held') wrong for reserving a seat, and what replaces it?"
+  options={[
+    "It's too slow; caching the read fixes it",
+    "Two concurrent buyers both read 'available' and both write 'held', overselling the seat — replace it with a single atomic conditional update (UPDATE … WHERE status='available') or a row lock, so exactly one writer succeeds",
+    "It uses too much memory on the database",
+    "Nothing replaces it; you accept occasional oversells",
+  ]}
+  answer={1}
+  explanation="Read-modify-write lets two requests both observe 'available' and both proceed, selling the seat twice — and at a 20:1 contention ratio this race is constant, not rare. A conditional update folds the check and the write into one atomic operation: only one writer matches the still-'available' row (1 row updated); everyone else matches 0 rows and is rejected with 409. A SELECT … FOR UPDATE row lock achieves the same serialization pessimistically."
+/>
+
+For a multi-seat, all-or-nothing hold, wrap the per-seat conditional updates in one transaction: if any seat's update affects zero rows, roll the whole transaction back so no partial reservation survives. The buyer gets all their seats or none, and no seat is ever left half-held.
 
 <h2 id="strong-consistency">Strong Consistency</h2>
 
-This section explains why the inventory of record must be strongly consistent, what "strongly consistent" means in this context, and the tradeoffs with eventual consistency approaches.
+The no-oversell invariant is a statement about consistency: every buyer must make their hold decision against the *true, current* state of the seat, not a stale copy. That rules out serving the **inventory of record** from an eventually-consistent store. If the hold path read seat status from an asynchronous replica that lagged the primary by even a second, two buyers could both read `available` from two replicas that hadn't yet seen each other's write — and oversell. So seat state lives in a **strongly consistent (linearizable) store**, and the conditional hold update runs against the authoritative copy, where writes are serialized per seat.
 
-<h2 id="payment-saga">Payment &amp; Booking Saga</h2>
+The key move that keeps this affordable is to **separate the authoritative write from the approximate read**. The hold — the thing that must never be wrong — is a single strongly-consistent transaction on one row. The seat-map *display*, by contrast, is read 20× more often and tolerates being a little stale: showing a seat as free a moment after it was taken just means that buyer's hold attempt returns `409`, which the UI already handles. So availability reads come from a cache that's allowed to lag, and only the hold touches the linearizable inventory. You pay for strong consistency exactly where correctness demands it and nowhere else.
 
-This section covers the idempotent hold-pay-confirm saga: charging payment atomically, flipping held→booked, and handling partial failures with idempotency keys.
+<KnowledgeCheck
+  question="Why must the inventory of record be strongly consistent rather than eventually consistent, even though it makes writes more expensive?"
+  options={[
+    "Eventual consistency is always slower than strong consistency",
+    "A stale read on the hold path is itself an oversell: two buyers reading 'available' from lagging replicas could both reserve the same seat — so the authoritative seat state must be linearizable, while only the seat-map display may be cached/approximate",
+    "Strong consistency reduces storage costs",
+    "Because the payment provider requires it",
+  ]}
+  answer={1}
+  explanation="Overselling is exactly the hazard of deciding from stale data. If the hold decision read from an eventually-consistent replica, two concurrent buyers could each see 'available' before the other's write propagated and both succeed. The inventory of record must therefore be linearizable so the conditional update sees the true current state. The high-volume seat-map display can still be cached and approximate, because a slightly stale display only costs the loser a 409, not a double-sell."
+/>
+
+<h2 id="payment-saga">Payment & Booking Saga</h2>
+
+Confirming a booking spans two systems that can't share a transaction: your inventory store and an external payment provider that takes seconds and can fail or time out. You can't hold a database transaction open across a slow third-party call, and you can't make the charge and the seat-flip atomic. So booking is a **saga** — a sequence of steps, each with a compensating action — rather than one transaction: the hold reserves the seat, the payment charges the provider, and confirm flips `held → booked`. The hold is what makes this safe: inventory is already reserved before the slow payment runs, so the charge proceeds against a guaranteed seat.
+
+The hard cases are the partial failures, and **idempotency** is what tames them:
+
+- **Payment fails or is declined.** Release the hold (or let it expire) so the seat returns to the pool; the user retries with a different card. No seat is lost, no charge stands.
+- **Payment succeeds but confirm fails** (the booking service crashes after the charge). The money moved but the booking didn't — the worst case. The `Idempotency-Key` makes the fix safe: retry the confirm, and because flipping `held → booked` and writing the booking are keyed and idempotent, the retry completes the booking exactly once instead of charging again. A **reconciliation job** backstops it: any payment without a matching booking is either completed or refunded.
+- **Client double-submits** the booking. The same idempotency key returns the same booking and the same `200`, never a second charge or a second seat.
+
+<Callout variant="info" title="Idempotency is the glue of the saga">
+Every step that can be retried — confirm, the seat flip, even the hold — carries an idempotency key, so 'at least once' execution becomes 'effectively once.' This is the same principle the Notification Service uses for delivery, applied here to money and inventory: because a timed-out call across a system boundary is ambiguous (did the charge land?), you must be able to retry safely, and idempotency is what makes a retry harmless. Without it, every network hiccup risks a double charge or a double booking.
+</Callout>
 
 <h2 id="high-contention">High-Contention On-Sales</h2>
 
-This section addresses the on-sale crush: waiting rooms, request queuing, virtual queues, and admission control to protect inventory DB from thundering herds.
+The defining operational event is the **on-sale**: a popular show opens and a million people hit "buy" in the same minute. Nothing about steady-state design survives this if you let all that load reach the inventory store at once — the contention collapses into lock waits and timeouts, and legitimate buyers can't get through. Three mechanisms tame it.
 
-<h2 id="scalability-evolution">Scalability &amp; Evolution</h2>
+- **A virtual waiting room.** Instead of admitting everyone instantly, you queue arrivals and admit them into the booking flow at a controlled rate the inventory can actually serve. The crush becomes a steady stream; users see a fair "you're number 12,000 in line" rather than an error. The waiting room also enforces **fairness** — first-come queue order (or an explicit lottery) — instead of rewarding whoever has the fastest connection.
+- **Shard inventory by event.** Each event's seats live on their own shard, so a megastar's on-sale saturates only that event's shard and can't take down bookings for every other event. The shard key is `event_id`, and because a booking never spans events, no cross-shard coordination is needed.
+- **Fail fast.** A hold attempt that loses its seat should return `409` immediately and cheaply, freeing the user to try another seat rather than retrying and amplifying load. Fast rejection is a feature: with 19 of 20 attempts doomed to lose, they must lose *quickly*.
 
-This section discusses sharding the inventory DB by event, caching seat-map reads, and evolving from a single-region to multi-region active-passive setup.
+<KnowledgeCheck
+  question="A million users hit a hot on-sale in the same minute for 50,000 seats. Why put a virtual waiting room in front of the booking flow?"
+  options={[
+    "To collect more analytics about users",
+    "To admit users into the inventory at a controlled, serveable rate and enforce fairness — converting an un-survivable instantaneous spike into a steady stream, instead of letting the contention collapse the inventory store into lock waits and timeouts",
+    "To cache the seat map more aggressively",
+    "Because the payment provider is slow",
+  ]}
+  answer={1}
+  explanation="If all million users reach the strongly-consistent inventory at once, contention on the hot seats turns into lock waits, retries, and timeouts, and even the winners can't get through. A waiting room throttles admission to a rate the inventory can actually serve and imposes a fair first-come (or lottery) order, turning the spike into a manageable stream. Sharding by event isolates the hot event, and fast-failing losing holds keeps doomed attempts cheap."
+/>
 
-<h2 id="resiliency-failure-modes">Resiliency &amp; Failure Modes</h2>
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section catalogs failure modes: hold expiry worker lag, payment service downtime, inventory DB unavailability, and the compensating actions for each.
+Don't build the global on-sale machine on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
 
-<h2 id="security-abuse">Security &amp; Abuse</h2>
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single DB, pessimistic row locks (SELECT … FOR UPDATE)", "Day one; modest concurrency; correctness first", "Locks serialize contenders and risk deadlocks/lock waits under load; one DB caps throughput"],
+    ["Optimistic concurrency + availability cache", "Lock contention hurts and reads dominate", "Retries/409s on conflict; the cached seat map is approximate (fine for display, never for the hold)"],
+    ["Shard inventory by event + virtual waiting room", "A hot event's on-sale swamps the whole system", "Routing by event_id and a waiting room to operate; keep each booking within one event to avoid cross-shard work"],
+    ["Multi-region, inventory pinned to a home region", "Global audience; regional latency and residency", "Each event's inventory has one authoritative region; cross-region reads are stale and failover is complex"],
+  ]}
+  recommendedRow={1}
+/>
 
-This section covers bot mitigation, rate limiting hold creation, seat scalping defenses, and idempotency key abuse prevention.
+The progression maps onto the contention story. Pessimistic row locks are the simplest *correct* start — they guarantee no oversell — but they serialize every buyer on a hot seat, so as contention climbs you move to **optimistic concurrency** (conditional updates that fail fast) with a **cache** absorbing the dominant read load. When a single hot event can swamp the system, you **shard by event** so its load is isolated and front it with a **waiting room** to shape admission. Only a truly global product needs **multi-region**, and even then each event's inventory keeps a single authoritative home region — because two regions both authoritative over the same seats is, once again, an oversell. Most systems live comfortably at "optimistic + sharded + waiting room."
 
-<h2 id="tradeoffs-alternatives">Trade-offs &amp; Alternatives</h2>
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section compares optimistic vs pessimistic locking, single-writer vs distributed inventory, and SQL vs NoSQL for the inventory store.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. The booking system's failures are unusually consequential because one class of them (split-brain inventory) violates the cardinal invariant, and another (payment-without-booking) involves real money.
+
+<FailureMatrix
+  rows={[
+    { failure: "Inventory store outage", impact: "No holds or bookings — the system of record is down; existing bookings stand", detection: "Inventory error rate; health checks", mitigation: "HA with synchronous replication and fenced failover; fail closed (reject) rather than guess availability and risk overselling", recovery: "Promote a replica; resume; no inventory was lost because nothing was guessed" },
+    { failure: "Hold expiry worker lag/failure", impact: "Expired holds aren't released — seats look sold but aren't, suppressing sales", detection: "Count of past-due holds still in 'held'", mitigation: "Lazy reclaim on the hold path treats a past-held_until seat as available, independent of the worker", recovery: "Worker catches up or lazy reclaim frees the seats on next attempt" },
+    { failure: "Payment succeeds but confirm fails", impact: "User charged with no booking — the worst user-facing failure", detection: "Reconciliation: payments without matching bookings", mitigation: "Idempotency-keyed confirm is retried to completion; reconciliation job refunds or completes", recovery: "Retry completes the booking once, or the charge is refunded" },
+    { failure: "Client abandons after holding", impact: "Seats reserved but never paid for", detection: "Holds expiring without a booking", mitigation: "Short hold TTL releases them automatically; lazy reclaim as backstop", recovery: "Hold expires; seats return to available" },
+    { failure: "Hot-event shard saturation", impact: "One event's shard overwhelmed; its holds slow or error", detection: "Per-shard QPS/latency skew", mitigation: "Waiting room throttles admission; shard isolates the blast radius; fail fast on losing holds", recovery: "Admission rate caps load; the queue drains as seats sell" },
+    { failure: "Booking double-submit / retry", impact: "Risk of double charge or double booking", detection: "Duplicate idempotency keys", mitigation: "Idempotency key makes confirm effectively-once; the conditional update prevents a second seat flip", recovery: "Duplicate is suppressed; exactly one booking and one charge stand" },
+    { failure: "Split-brain inventory (two primaries)", impact: "Could oversell — the cardinal sin", detection: "Quorum/replication alarms; conflicting writes", mitigation: "Require strong consistency / quorum writes; one authoritative primary per shard; fence the old primary on failover", recovery: "Heal the partition; one primary wins; reconcile any divergence" },
+  ]}
+/>
+
+The theme: **fail closed on inventory, and lean on idempotency for money.** When the inventory store is uncertain, the safe choice is always to *reject* — a rejected sale is recoverable, an oversell is not. And every money-touching step is idempotent and reconciled, so an ambiguous payment call resolves to exactly one charge and one booking rather than zero or two.
+
+<h2 id="security-abuse">Security & Abuse</h2>
+
+A booking system sells scarce, valuable inventory, which makes it a prime target for automated abuse — and the abuse directly harms real buyers by taking their seats.
+
+- **Scalper bots.** Automated buyers try to grab inventory in bulk to resell. Defenses stack: a virtual waiting room with fair ordering, **per-user purchase caps** (e.g. 4 tickets per account per event), CAPTCHAs or proof-of-work at admission, rate limits on holds (the Rate Limiter problem), and device/identity signals to flag bot farms.
+- **Hold hoarding.** Even without paying, a bot can deny inventory by holding seats and letting them expire repeatedly, keeping seats out of others' reach. Mitigate with short hold TTLs, limits on concurrent holds per user, and treating rapid hold-and-abandon cycles as abuse.
+- **Payment fraud.** Stolen cards and chargebacks. Integrate fraud scoring at the payment step, and because booking is a saga you can decline a confirm without ever having reserved-then-lost the seat dishonestly.
+- **Inventory enumeration.** Don't expose internal seat ids or availability counts in a way that lets a scraper map and target the best seats faster than humans; serve the cached, rate-limited seat map.
+
+<Callout variant="info" title="Fairness is a security property here">
+Unlike most systems, a booking system's main 'attack' is winning legitimately-shaped requests at inhuman speed. So fairness mechanisms — the waiting room's queue order, per-user caps, rate limits — are not just UX, they're the primary abuse defense. The goal is that a real fan with a normal connection has a fair shot against a bot farm, which is why admission control and purchase caps matter as much as authentication.
+</Callout>
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Model each seat as a row with a status and version; reserve seats with an atomic optimistic conditional update (rejecting losers with 409); keep inventory in a strongly-consistent store sharded by event; run hold → pay → confirm as an idempotent saga with TTL'd holds released by a sweeper and reclaimed lazily; and gate hot on-sales behind a virtual waiting room with per-user caps."
+  rationale="The conditional update makes the no-oversell invariant a single atomic operation with no held lock, so it stays correct and fast even at a 20:1 contention ratio. Strong consistency on inventory is non-negotiable because a stale read is itself an oversell, while caching the seat-map display keeps the dominant read load cheap. The hold decouples slow payment from the inventory decision, and idempotency makes the cross-system saga safe to retry. The waiting room turns an un-survivable spike into a serveable, fair stream."
+  alternatives="Pessimistic SELECT … FOR UPDATE locking — simpler reasoning for multi-seat holds, but it serializes contenders and risks deadlocks under load; eventually-consistent inventory — faster reads but it oversells, so it's disqualified; longer hold windows — better checkout UX but more leaked inventory during peak demand; synchronous admission with no waiting room — simpler, but it collapses under a hot on-sale."
+  revisitWhen="The contention profile changes materially, the product ever tolerates general-admission counts instead of assigned seats (a simpler atomic decrement), the payment provider's guarantees change, or global expansion forces regional inventory and its consistency trade-offs."
+/>
+
+Three axes capture the real tension:
+
+- **Optimistic vs. pessimistic concurrency.** Optimistic conditional updates fail fast with no held lock, ideal for many-buyers-one-seat contention; pessimistic locks are simpler to reason about for multi-row holds but serialize contenders and risk deadlocks. We default optimistic and reach for locks only where multi-seat atomicity is cleaner.
+- **Strong vs. eventual consistency.** Inventory must be strongly consistent or it oversells — that's not negotiable. The lever is *scope*: apply strong consistency only to the authoritative hold, and let the high-volume display be eventually-consistent and cached.
+- **Hold-window length.** Short holds free abandoned inventory fast but risk timing out real buyers mid-checkout; long holds are friendlier but tie up seats when demand peaks. The right length is event-dependent and sometimes shortened dynamically for hot on-sales.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section summarizes the key design decisions and the invariants an interviewer expects a candidate to uphold: no oversell, atomic conditional hold, hold TTL, idempotent saga.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A ticket booking system sells finite inventory under heavy contention, and its one hard rule is never to oversell a seat. I model each seat as a row with a status — available, held, or booked — and a version. The crux is concurrency: a read-then-write would let two buyers both grab the same seat, so instead a hold is a single atomic conditional update, 'UPDATE seat SET status=held WHERE status=available' — exactly one writer matches the row and wins, everyone else updates zero rows and gets a 409, with no lock held across the network. Inventory has to be strongly consistent, because a stale read is itself an oversell; only the seat-map display is cached and approximate. Buying is a saga — hold, then pay an external provider, then confirm held→booked — made safe with idempotency keys so a retry can't double-charge, and holds carry a TTL so abandoned ones are released by a sweeper and reclaimed lazily. For a hot on-sale where a million people chase fifty thousand seats, I put a virtual waiting room in front to admit users at a serveable, fair rate, shard inventory by event to isolate the hot one, and fail losing holds fast. The contention ratio, not raw QPS, is the real challenge."
+</Callout>
 
-<h2 id="knowledge-checks-faq">Knowledge Checks &amp; FAQ</h2>
+Common follow-ups an interviewer will use to go deeper: *Why is read-modify-write wrong, and what's the atomic alternative? Optimistic or pessimistic locking — when each? Why must inventory be strongly consistent but the seat map can be cached? Why is buying a saga, and what happens if payment succeeds but confirm fails? Why do holds need a TTL? How do you survive a million-user on-sale? How do you stop scalper bots?* Each maps directly to a section above.
 
-This section provides practice questions and frequently asked interview questions about the ticket booking system design.
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+<KnowledgeCheck
+  question="What is a 'hold' and why does the system need one instead of just booking on payment?"
+  options={[
+    "A hold is a cache of the seat map for faster reads",
+    "A hold is a short, TTL'd reservation that makes a seat exclusively the buyer's while they pay — decoupling the slow, failure-prone checkout from the inventory decision so two buyers can't race through payment for the same seat",
+    "A hold is the final booking record",
+    "A hold permanently removes the seat from inventory",
+  ]}
+  answer={1}
+  explanation="Buying isn't instantaneous — the user needs time to pay — so the seat must be reserved before payment completes. A hold resolves the contention up front (in one atomic operation) and gives the buyer a TTL'd exclusive claim, so payment proceeds against a guaranteed seat. Because users abandon checkouts, the hold must expire and release, or inventory leaks."
+/>
+
+<KnowledgeCheck
+  question="Two buyers submit a hold for the same seat at the same instant. With an optimistic conditional update, what happens?"
+  options={[
+    "Both succeed and the seat is oversold",
+    "Both fail and the seat is lost",
+    "The store serializes the two updates: the first matches the still-'available' row and updates 1 row (wins); the second now finds it 'held', matches 0 rows, and is rejected with 409",
+    "The system asks the users to resolve it manually",
+  ]}
+  answer={2}
+  explanation="The conditional UPDATE … WHERE status='available' is atomic and serialized per row. Exactly one writer sees the seat as available and updates it; the other sees it already held, matches zero rows, and learns immediately to return 409. No lock is held across the network, and the seat is never sold twice."
+/>
+
+<KnowledgeCheck
+  question="Why can't the inventory of record be served from an eventually-consistent replica?"
+  options={[
+    "Replicas are always too slow",
+    "A stale read on the hold path is an oversell — two buyers could read 'available' from lagging replicas and both reserve the same seat; the hold must see the true current state, so inventory is strongly consistent (only the display may be stale)",
+    "Replicas can't store seat data",
+    "It would violate payment regulations",
+  ]}
+  answer={1}
+  explanation="Overselling is precisely the danger of deciding from stale data. If holds read from asynchronous replicas, two concurrent buyers could each see 'available' before the other's write propagated and both win. The authoritative seat state must be linearizable so the conditional update sees reality; the seat-map display, read far more often, can be cached and approximate because a stale display only costs the loser a 409."
+/>
+
+<KnowledgeCheck
+  question="Payment succeeds but the booking service crashes before confirming the seats. How is this handled without double-charging?"
+  options={[
+    "The user is charged again on retry to be safe",
+    "The Idempotency-Key makes the confirm retryable to completion — the keyed seat-flip and booking write happen exactly once — and a reconciliation job refunds or completes any payment lacking a matching booking",
+    "The seat is silently released and the money kept",
+    "Nothing can be done; the user must dispute the charge",
+  ]}
+  answer={1}
+  explanation="Because the charge and the seat-flip can't share a transaction, booking is a saga and every step is idempotent. The confirm is retried under the same idempotency key, completing the booking exactly once rather than charging again. A reconciliation job backstops it: any successful payment without a booking is either completed or refunded, so the user is never charged for nothing."
+/>
+
+<KnowledgeCheck
+  question="Why must holds have a TTL and be actively released?"
+  options={[
+    "To save database storage",
+    "Because users abandon checkouts; an unexpiring hold is a seat that looks sold but generates no sale and can never be bought — so holds expire and seats are reclaimed by a sweeper and lazily on the hold path",
+    "To make the seat map render faster",
+    "Because the payment provider requires it",
+  ]}
+  answer={1}
+  explanation="Abandoned holds are inventory leaks. Without expiry, every closed tab or failed card permanently removes a seat from sale. A TTL plus active sweeping bounds how long a leaked seat persists, and lazy reclaim (treating a past-held_until seat as available on the next attempt) guarantees an expired hold never actually blocks a sale."
+/>
+
+<KnowledgeCheck
+  question="At a hot on-sale, why does optimistic concurrency with fast 409s scale better than pessimistic row locks?"
+  options={[
+    "Locks are always slower to acquire than any update",
+    "Pessimistic locks serialize every contender on a hot seat into a waiting queue and hold the lock across the transaction (risking lock waits and deadlocks), while optimistic conditional updates hold no lock — losers fail immediately and cheaply, which suits the 19-of-20-must-lose contention shape",
+    "Optimistic concurrency never has conflicts",
+    "Locks oversell seats but optimistic updates don't",
+  ]}
+  answer={1}
+  explanation="Both prevent oversell, but under extreme contention a row lock turns every buyer of a hot seat into a serialized queue waiting on the lock, with deadlock risk on multi-seat holds. Optimistic conditional updates hold no lock: the single winner updates the row and the many losers match zero rows and fail fast with a 409. Fast, lock-free rejection is exactly what a 20:1 contention ratio needs."
+/>
+
+<Faq
+  items={[
+    { question: "What is the single most important invariant of a ticket booking system?", answer: "Never oversell: a given seat is sold at most once. It's a hard correctness property, not a tunable SLO — the entire design (atomic conditional holds, strong consistency on inventory, fail-closed behavior) exists to protect it. Everything else, including availability and latency, is negotiated around keeping this absolute." },
+    { question: "How does a hold actually prevent a double-sell?", answer: "By making the reservation a single atomic conditional update — UPDATE seat SET status='held' WHERE status='available' — that the database serializes per row. Exactly one concurrent writer matches the still-available row and updates one row (wins); the rest match zero rows and are rejected with 409. There's no read-then-write gap for a race to slip through, and no lock held across the network." },
+    { question: "Optimistic or pessimistic concurrency control — which should I use?", answer: "Default to optimistic (a conditional update / compare-and-set on a version) because it holds no lock and lets the many losing buyers fail fast — ideal for the many-buyers-one-hot-seat shape. Reach for pessimistic SELECT … FOR UPDATE locks when multi-seat, all-or-nothing atomicity is cleaner to reason about, accepting that locks serialize contenders and risk deadlocks under heavy load." },
+    { question: "Why must inventory be strongly consistent when most large systems prefer eventual consistency?", answer: "Because for inventory, a stale read is an oversell. Two buyers reading 'available' from two lagging replicas would both reserve the same seat. The hold decision must see the true current state, so the inventory of record is linearizable. You contain the cost by scoping strong consistency to just the authoritative hold; the high-volume seat-map display is cached and allowed to be stale." },
+    { question: "Why is booking a saga instead of a single transaction?", answer: "Because confirming spans two systems that can't share a transaction: your inventory store and an external payment provider that takes seconds and can fail. You can't hold a DB transaction open across a slow third-party call. So booking is a sequence — hold, charge, confirm — with compensations (release on payment failure, retry/refund on confirm failure), and the hold guarantees the seat is reserved before the slow charge runs." },
+    { question: "What happens if the payment succeeds but the booking isn't confirmed?", answer: "This is the worst case, and idempotency handles it. The confirm step is keyed, so it's retried to completion — the seat-flip and booking write happen exactly once, not a second charge. A reconciliation job backstops it by finding any payment without a matching booking and either completing the booking or refunding the charge, so the user is never charged for a seat they didn't get." },
+    { question: "Why do holds expire, and how are seats reclaimed?", answer: "Users abandon checkouts all the time, and an unexpiring hold is a seat permanently removed from sale for no revenue. So every hold carries a TTL. Seats are reclaimed two ways: an active sweeper releases expired holds in the background, and the hold path lazily treats any seat whose held_until has passed as available. Active bounds the leak duration; lazy guarantees an expired hold never blocks a real sale." },
+    { question: "How does the system survive a hot on-sale with a million users?", answer: "A virtual waiting room queues arrivals and admits them into the booking flow at a rate the inventory can actually serve, turning an instantaneous spike into a steady, fair stream. Inventory is sharded by event so the hot event's load is isolated, and losing hold attempts fail fast with a 409 so doomed requests stay cheap. Without admission control, the contention collapses the inventory store into lock waits and timeouts." },
+    { question: "How do you handle someone buying several seats together?", answer: "Wrap the per-seat conditional updates in a single transaction with all-or-nothing semantics: if any seat's update affects zero rows (it was taken), roll the whole transaction back so no partial reservation survives. The buyer gets all their seats or none, and no seat is ever left half-held by a failed multi-seat attempt." },
+    { question: "What stops scalper bots from grabbing all the inventory?", answer: "A stack of fairness and rate controls: a virtual waiting room with fair (first-come or lottery) ordering, per-user purchase caps, CAPTCHAs or proof-of-work at admission, hold rate limits, and limits on concurrent holds to stop hold-hoarding. Because the 'attack' is winning normal-looking requests at inhuman speed, fairness and admission control are the primary defense — not just authentication." },
+    { question: "Is the seat map a real-time view of availability?", answer: "No — and it doesn't need to be. The seat-map display is read far more than seats are bought, so it's served from a cache and is allowed to be slightly stale. If it shows a seat as free a half-second after someone grabbed it, the only cost is that the buyer's hold attempt returns 409, which the UI handles. The authoritative, strongly-consistent check happens at hold time." },
+    { question: "How does this differ from a general-admission (no assigned seats) event?", answer: "General admission is simpler: there are no individual seats to assign, just a remaining count. The hold becomes an atomic decrement of an available-count guarded by a 'count > 0' condition (or a conditional update) — the same no-oversell principle, but on one counter per tier rather than per-seat rows. Reserved seating is the harder case because contention concentrates on specific desirable seats." },
+  ]}
+/>
