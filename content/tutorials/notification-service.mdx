@@ -1,71 +1,450 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-A notification service is a classic async systems design question that tests your grasp of fan-out, message queues, and delivery reliability.
+A notification service is the platform other systems call when they need to tell a user something — "your order shipped," "someone mentioned you," "your code finished deploying." A producer hands it a user and a message; the service figures out *which channels* that user wants (push, SMS, email), renders the right template for each, and delivers them through external providers like APNs/FCM, an SMS gateway, and an email provider. It is shared infrastructure: dozens of teams call it instead of each integrating providers themselves.
+
+The trap is to treat it as "call the SMS API." The real problem is that delivery is **slow, external, and flaky** — a provider can be down, rate-limit you, or take seconds to respond — yet the caller wants an answer in milliseconds and the user must not be spammed with duplicates. That tension forces the whole design: accept fast, deliver **asynchronously** through queues, **retry** failures without notifying the user twice, and fan one logical notification out across **many channels**. Spend the opening minutes scoping. Good questions to ask:
+
+- Which channels — push, SMS, email, more? Can one notification go to several at once?
+- How reliable must delivery be — at-least-once? Is a rare duplicate acceptable or forbidden?
+- Do users have preferences, opt-outs, or quiet hours we must honor?
+- What's the volume, and how bursty (e.g. a marketing blast vs. transactional)?
+- What's the latency expectation — instant for the caller, and how fast end-to-end to the user?
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and scope · **5 min** requirements and channels · **5 min** capacity (the fan-out and retry amplification falls out here) · **5 min** entity model and the 202 API · **10 min** the async fan-out pipeline and architecture · **10 min** delivery guarantees, idempotency, retries, and the dead-letter queue · **5 min** preferences, failure modes, and wrap-up. Say your assumptions out loud — the interviewer is grading whether you reach for async queues, reason about at-least-once versus exactly-once, and make retries safe with idempotency, not whether you can name an email provider.
+</Callout>
+
+This tutorial commits to concrete assumptions so the numbers stay consistent end to end. **In scope:** the asynchronous ingestion → queue → fan-out → channel-worker → provider pipeline, delivery guarantees and idempotency/dedup, retries with backoff and a dead-letter queue, user preferences (channels, opt-out, quiet hours, per-user rate limits), and templates. **Out of scope:** an in-app notification inbox/feed (closer to the News Feed problem), real-time WebSocket presence (the Chat problem), marketing-campaign authoring tools, and building the email/SMS providers themselves — name them so the interviewer sees the boundary, then set them aside.
 
 <h2 id="requirements">Requirements</h2>
 
-The system must deliver push, SMS, and email notifications reliably to millions of users across multiple channels.
+Separate what the service must *do* from how *well* it must do it. For a notification service the load-bearing non-functional targets are a fast async accept, at-least-once delivery, and — the one that defines correctness — **no duplicate user-visible notifications** despite retries and at-least-once queues.
+
+<RequirementsTable
+  functional={[
+    "Accept a send request for a user and deliver it asynchronously",
+    "Fan out one notification across multiple channels (push, SMS, email)",
+    "Resolve and honor user preferences and opt-outs per channel",
+    "Retry transient delivery failures; give up to a dead-letter queue",
+    "Deduplicate so a retried or duplicate request notifies the user once",
+    "Render channel-specific templates from a payload",
+    "Expose per-channel delivery status",
+  ]}
+  nonFunctional={[
+    { goal: "Accept latency (p99)", target: "< 50 ms (async 202)" },
+    { goal: "Delivery guarantee", target: "at-least-once" },
+    { goal: "User-visible duplicates", target: "none (idempotent)" },
+    { goal: "Availability", target: "99.9%" },
+    { goal: "End-to-end delivery", target: "seconds (p95)" },
+    { goal: "Scalability", target: "horizontal" },
+  ]}
+/>
+
+Three targets shape every later decision. First, the **accept path must return in under ~50 ms**, which is only possible if it does no provider work: it validates, deduplicates, enqueues, and returns `202 Accepted`, leaving the slow delivery to run asynchronously. Second, delivery is **at-least-once** — across queues and flaky providers you cannot guarantee exactly-once, so messages will sometimes be retried or redelivered. Third, and consequently, the system must be **idempotent** so that at-least-once never becomes "the user got five copies": every delivery is keyed and deduplicated. These three together — async accept, at-least-once, idempotent — are the spine of the design.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-At 500 million notifications per day with a fan-out factor of two, the delivery tier processes roughly 11,500 deliveries per second on average.
+Estimates are directional — their job is to reveal *which* tier is under pressure. For a notification service the lesson is **amplification**: a modest accept rate is multiplied by fan-out (channels per notification) and again by retries, so the *delivery* tier carries far more load than ingestion.
+
+<NotificationCapacity
+  assumptions={{
+    notificationsPerDay: 500000000,
+    fanoutFactor: 2,
+    peakMultiplier: 4,
+    retryOverheadPercent: 20,
+    avgPayloadBytes: 1000,
+  }}
+/>
+
+The takeaways. First, the **accept path is cheap**: 500 million notifications a day is only about **5,800 accepts per second** — a thin API that returns `202` and enqueues handles this trivially, and it is never the bottleneck. Second, **fan-out doubles the work**: at two channels each, that's **~11,600 deliveries per second** to push through queues and workers, and **retries add ~20%** on top, so the channel workers actually perform close to **~13,900 delivery attempts per second**. Third, you **provision for peak, not average**: at a 4× peak the delivery tier must absorb **~46,000 deliveries per second**, and across a day that's **a billion provider calls**. The headline: size the *delivery* tier and provider throughput — the part amplified by fan-out and retries — not the cheap accept path. That asymmetry is exactly why the architecture is asynchronous.
 
 <h2 id="entity-model">Entity Model</h2>
 
-The core entities are NotificationRequest, Notification (per-channel delivery record), UserPreference, and Template.
+The model separates the *logical* notification a caller requests from the *physical* per-channel deliveries it fans out into. The delivery record below is the unit the workers act on, retry, and deduplicate — so it carries the idempotency key, the attempt count, and the backoff schedule.
+
+<EntityModel
+  name="Notification"
+  description="One per-channel delivery — the unit a channel worker sends, retries, and dedupes. A single logical request (NotificationRequest) fans out into several of these, one per enabled channel."
+  fields={[
+    { name: "id", type: "string (PK)", notes: "this delivery's id" },
+    { name: "request_id", type: "string", notes: "groups all channels of one logical send" },
+    { name: "user_id", type: "string", notes: "recipient" },
+    { name: "channel", type: "enum", notes: "push | sms | email" },
+    { name: "idempotency_key", type: "string", notes: "dedup key, e.g. hash(request_id + channel); unique" },
+    { name: "template_id", type: "string", notes: "channel-specific template to render" },
+    { name: "status", type: "enum", notes: "queued | sent | delivered | failed | dead" },
+    { name: "attempts", type: "int", notes: "delivery attempts so far; drives backoff and the retry budget" },
+    { name: "next_attempt_at", type: "timestamp", notes: "when the scheduler may retry next" },
+    { name: "provider_message_id", type: "string | null", notes: "provider's id, for delivery receipts" },
+    { name: "created_at", type: "timestamp", notes: "creation time" },
+  ]}
+  keys="A unique index on idempotency_key is what makes dedup a cheap check-and-set — a duplicate insert simply conflicts. An index on (status, next_attempt_at) lets the retry scheduler find due-for-retry deliveries without scanning. The record partitions cleanly by user_id or request_id."
+/>
+
+Three related entities round out the model and live in their own stores. A **NotificationRequest** is the logical send the API accepted (id, user, template, payload, requested channels, idempotency key) — the parent of the per-channel `Notification` rows. A **UserPreference** record holds, per user and channel, whether it's enabled, any quiet hours, and rate-limit settings — consulted during fan-out to decide which channels to actually create. A **Template** holds the channel-specific rendering (subject/body for email, text for SMS, title/body for push) so content is decoupled from delivery. Keeping these separate lets the hot delivery path touch only the small `Notification` row and a cached preference lookup.
 
 <h2 id="api-design">API Design</h2>
 
-The accept endpoint is `POST /v1/notifications`, which returns 202 Accepted immediately and enqueues the work; `GET /v1/notifications/{id}` polls delivery status.
+The defining API decision is that the send is **asynchronous**: the service accepts the request, returns immediately, and delivers later. That's why the success code is `202 Accepted`, not `200 OK` — "I've taken responsibility for this," not "it's done."
+
+<ApiContract
+  method="POST"
+  path="/v1/notifications"
+  summary="Accept a notification for asynchronous, multi-channel delivery. Returns immediately; delivery happens later."
+  request={`POST /v1/notifications
+Idempotency-Key: 1f2e3d4c-aaaa-bbbb-cccc-000000000001
+
+{
+  "user_id": "u_42",
+  "template": "order_shipped",
+  "channels": ["push", "email"],
+  "data": { "order_id": "A1B2", "eta": "Tuesday" }
+}`}
+  response={`HTTP/1.1 202 Accepted
+
+{
+  "id": "ntf_9f3c",
+  "status": "accepted",
+  "channels": ["push", "email"]
+}`}
+  statusCodes={[
+    { code: "202", meaning: "Accepted for delivery (not yet delivered)" },
+    { code: "400", meaning: "Unknown template/channel or malformed payload" },
+    { code: "401", meaning: "Caller not authorized to send" },
+    { code: "429", meaning: "Sender rate limit exceeded" },
+  ]}
+  notes="The Idempotency-Key header makes the accept safe to retry: a second request with the same key returns the same notification id and enqueues nothing new, so a caller that times out and retries can't create a duplicate send. The service returns 202 — not 200 — because delivery is asynchronous; the response only confirms the service has durably accepted responsibility for the notification."
+/>
+
+<ApiContract
+  method="GET"
+  path="/v1/notifications/{id}"
+  summary="Query the status of a notification and its per-channel deliveries."
+  response={`HTTP/1.1 200 OK
+
+{
+  "id": "ntf_9f3c",
+  "status": "partially_delivered",
+  "deliveries": [
+    { "channel": "push",  "status": "delivered", "attempts": 1 },
+    { "channel": "email", "status": "failed",    "attempts": 3 }
+  ]
+}`}
+  statusCodes={[
+    { code: "200", meaning: "Status returned" },
+    { code: "404", meaning: "No such notification" },
+  ]}
+  notes="Because delivery is asynchronous and per-channel, status is a roll-up over the individual Notification rows: each channel reports its own state and attempt count. A caller polls this (or subscribes to a webhook) to learn the outcome rather than blocking on the original send."
+/>
+
+The `Idempotency-Key` header is the contract that makes the *accept* safe to retry; later sections cover the separate idempotency that makes *delivery* safe to retry. Both matter: a caller can double-submit, and the pipeline can redeliver, and neither may reach the user twice.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-An ingestion API enqueues requests to a fan-out service, which consults user preferences and publishes per-channel messages to dedicated queues consumed by channel workers.
+The architecture is an **asynchronous pipeline**: a thin accept tier puts work on a queue, a fan-out stage explodes one notification into per-channel deliveries, and pools of channel workers drain per-channel queues into external providers. Stores for preferences and deduplication, plus a dead-letter queue, sit alongside.
+
+<NotificationArchitecture />
+
+- **Ingestion API.** Stateless and thin: authenticate the sender, validate, check the idempotency key, write the request durably, enqueue it, and return `202`. It does no provider work, so it stays fast and cheap to scale.
+- **Ingestion queue.** Decouples accept from delivery. It absorbs bursts and lets the slow, failure-prone downstream run at its own pace without ever blocking callers.
+- **Fan-out service.** Consumes the ingestion queue, resolves the user's **preferences** (which channels are enabled, quiet hours), dedupes against the **dedup store**, renders templates, and publishes one message per enabled channel onto the **per-channel queues**.
+- **Per-channel queues + workers.** One queue (and an autoscaled worker pool) per channel, so a slow or rate-limited channel can't head-of-line block the others. Each worker calls its external **provider** and applies retries.
+- **Providers.** External, owned by someone else: APNs/FCM for push, an SMS gateway, an email provider. They are the slow, flaky dependency the whole async design exists to tolerate.
+- **Dead-letter queue (DLQ).** Where a delivery lands after exhausting its retry budget or being identified as poison — captured for inspection and replay rather than retried forever or dropped silently.
+
+The decisive boundary is **accept versus deliver**: everything before the ingestion queue is fast and synchronous to the caller; everything after is asynchronous, retryable, and idempotent. That split is what lets a millisecond accept coexist with a provider that takes seconds and sometimes fails — and every section that follows elaborates one stage of this pipeline.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-The four key flows are send and fan-out, retry with exponential backoff, dead-letter on exhaustion, and idempotent duplicate suppression.
+Four flows cover the system: the happy-path fan-out, a transient failure retried with backoff, exhaustion into the dead-letter queue, and idempotent suppression of a duplicate request.
+
+**Send and fan-out.** The API accepts the request and returns `202` immediately; the fan-out service later consumes it, filters by preference, and publishes one message per enabled channel onto the per-channel queues, where workers pick them up.
+
+<SendFanoutSequence />
+
+**Retry with backoff.** A worker calls the provider and gets a transient failure — a timeout or a `5xx`. Rather than dropping it, the worker re-enqueues the delivery with an **exponential backoff and jitter**; a later attempt succeeds. The user sees one notification, late by seconds, instead of none.
+
+<RetryBackoffSequence />
+
+**Dead-letter.** Some failures don't recover — a permanently bad address, or a message that keeps failing. After the retry budget is exhausted, the worker stops retrying and moves the delivery to the **dead-letter queue**, where it's alerted on and can be inspected and replayed after a fix, instead of looping forever and clogging the channel.
+
+<DeadLetterSequence />
+
+**Idempotent accept.** A caller times out and retries the same request with the same `Idempotency-Key`. The first request did a check-and-set on the dedup store and proceeded; the second finds the key already present and is suppressed, returning the same notification id without enqueuing anything new.
+
+<IdempotentSendSequence />
 
 <h2 id="fanout-pipeline">Fan-out Pipeline</h2>
 
-The fan-out service reads a single NotificationRequest and emits one message per enabled channel queue, decoupling ingestion throughput from per-channel delivery speed.
+The pipeline is asynchronous and queue-based for one reason: **delivery is slow and unreliable, and the caller is neither.** If the accept path called providers inline, a single sluggish SMS gateway would tie up request threads and a provider outage would fail the caller's own request. Putting a **queue** between accept and deliver decouples them — the queue absorbs bursts, smooths load, and lets delivery retry at its own pace while the caller already has its `202`.
+
+Fan-out is the stage that turns one logical notification into N physical deliveries. The fan-out service consumes the ingestion queue, resolves which channels the user actually wants, and **publishes one message per channel** onto separate per-channel queues. This is where the capacity amplification happens — and where a crucial topology decision lives.
+
+<Callout variant="info" title="Why per-channel queues, not one shared queue">
+Channels have wildly different throughput, latency, and failure profiles: email providers accept thousands per second, an SMS gateway might rate-limit you, push has its own quirks. If every channel drained one shared queue, a slow or backed-up channel would **head-of-line block** the others — push notifications would pile up behind stuck SMS messages. Giving each channel its own queue and its own autoscaled worker pool isolates them: a backed-up SMS queue grows without ever delaying push or email, and each pool scales to its channel's provider throughput independently.
+</Callout>
+
+Each per-channel worker is a small loop: pull a message, render the final payload, call the provider, and on the result either mark it delivered or apply the retry logic. Workers are stateless and horizontally scalable, so the pool autoscales on queue depth. When a channel's queue backs up faster than its workers (and provider) can drain it, **back-pressure** is the safety valve — the queue buffers, low-priority traffic can be shed or deprioritized, and ingestion can be throttled — rather than letting an overwhelmed provider melt down.
+
+<KnowledgeCheck
+  question="Why give each delivery channel (push, SMS, email) its own queue and worker pool instead of a single shared queue?"
+  options={[
+    "It uses less memory overall",
+    "To prevent head-of-line blocking: a slow or rate-limited channel backing up its own queue would otherwise delay every other channel's notifications, and channels scale and fail independently",
+    "Because each channel needs a different programming language",
+    "Shared queues can't store more than one message type",
+  ]}
+  answer={1}
+  explanation="Channels differ in throughput, latency, and failure behavior. With one shared queue, messages for a stuck channel sit at the head and block faster channels behind them. Per-channel queues isolate each channel so a backed-up SMS queue never delays push or email, and each worker pool autoscales to its own provider's capacity."
+/>
 
 <h2 id="delivery-guarantees">Delivery Guarantees & Idempotency</h2>
 
-At-least-once delivery is made effectively-once by requiring callers to supply an `Idempotency-Key` checked against a dedup store before processing.
+Start from an uncomfortable truth: **exactly-once delivery is unattainable** here. The worker calls an external provider over a network; if the call times out, the worker cannot know whether the provider sent the message or not. Retry and you risk a duplicate; don't retry and you risk a drop. No amount of cleverness removes that ambiguity across a third-party boundary. So you choose **at-least-once** — always retry on uncertainty, accepting that a message may be delivered more than once — and then make duplicates harmless.
+
+The tool that makes duplicates harmless is **idempotency**. Every delivery carries an idempotency key (for the accept, the client-supplied `Idempotency-Key`; for a per-channel delivery, something like `hash(request_id + channel)`). Before acting, the service does an atomic **check-and-set** against a **dedup store**: if the key is already present, the work has been done (or is in flight) and is suppressed; if not, it's set and the work proceeds. At-least-once delivery plus idempotent suppression yields **effectively-once** — the user sees exactly one notification even though the pipeline may have tried several times.
+
+<Callout variant="warning" title="The dedup check must be atomic">
+If the check ("is this key present?") and the set ("mark it present") are separate steps, two concurrent retries of the same message can both check, both see "absent," and both deliver — the exact duplicate you were preventing. Use a single atomic operation: a conditional insert on the unique `idempotency_key`, or a `SET key … NX` in the dedup store, so exactly one actor wins the key and everyone else observes it already taken. This is the same check-then-act race the Rate Limiter tutorial fixes with an atomic increment.
+</Callout>
+
+Two refinements matter in interviews. First, **provider-side idempotency**: some providers accept an idempotency key of their own, so even if your retry reaches them twice they suppress the duplicate — use it when available, as it closes the gap exactly where the ambiguity lives. Second, the **dedup store's retention**: keys only need to live as long as duplicates can plausibly arrive (minutes to hours), so the store is a TTL'd cache, not a permanent ledger — which keeps it small and fast.
+
+<KnowledgeCheck
+  question="Why does a notification service settle for at-least-once delivery plus idempotency rather than true exactly-once?"
+  options={[
+    "Exactly-once is slower but otherwise works fine",
+    "Across an external provider boundary a timed-out call is ambiguous — you can't know if it was delivered — so you retry (at-least-once) and use an idempotency key + atomic dedup to make any duplicate harmless (effectively-once)",
+    "At-least-once guarantees no duplicates by itself",
+    "Exactly-once requires storing every message forever",
+  ]}
+  answer={1}
+  explanation="When a provider call times out, the worker can't tell whether it succeeded, so genuine exactly-once is impossible across that boundary. The practical answer is at-least-once (always retry on uncertainty) made safe by idempotency: an atomic check-and-set on a dedup key suppresses any duplicate, so the user is notified effectively once."
+/>
 
 <h2 id="retries-dlq">Retries & Dead-Letter Queue</h2>
 
-Transient provider failures trigger exponential backoff with jitter; messages that exhaust the retry budget are routed to a dead-letter queue for alerting and manual reprocessing.
+Retries are where reliability is won, but naive retries cause more harm than the failures they paper over. The discipline has three parts: classify the failure, back off correctly, and bound the effort.
+
+**Classify transient vs. permanent.** A `5xx`, a timeout, or a `429` rate-limit is **transient** — retrying later will likely succeed, so retry. A `4xx` like an invalid address or an unsubscribed recipient is **permanent** — retrying will fail identically forever, so don't waste attempts; fail it immediately. Treating every error the same either gives up too early on recoverable failures or hammers the provider with hopeless ones.
+
+**Back off with exponential delay and jitter.** Retry immediately and you stampede a provider that's already struggling; retry on a fixed schedule and every worker retries in lockstep, creating synchronized spikes. **Exponential backoff** (1s, 2s, 4s, 8s…) gives a recovering provider room, and **jitter** (randomizing each delay) desynchronizes the fleet so retries spread out instead of thundering together.
+
+**Bound the effort and dead-letter the rest.** Every delivery has a **retry budget** — a maximum attempt count or total time. When it's exhausted, the message is not dropped and not retried forever; it's moved to the **dead-letter queue**. The DLQ is also where **poison messages** go — a malformed or buggy message that crashes its worker on every attempt would otherwise loop forever, blocking the channel; capping attempts and routing it to the DLQ isolates the damage. Messages in the DLQ are alerted on, inspected, and — after a fix or a provider recovery — **replayed** back through the pipeline.
+
+<TradeoffTable
+  columns={["Failure", "Classification", "Action"]}
+  rows={[
+    ["Provider 5xx / timeout", "Transient", "Retry with exponential backoff + jitter"],
+    ["429 rate-limited", "Transient (throttle)", "Back off, respect Retry-After, slow the worker"],
+    ["Invalid address / unsubscribed", "Permanent", "Fail immediately; do not retry"],
+    ["Retry budget exhausted", "Terminal", "Move to the dead-letter queue; alert"],
+    ["Poison message (crashes worker)", "Terminal", "Cap attempts; isolate to the DLQ; fix and replay"],
+  ]}
+  recommendedRow={0}
+/>
+
+<KnowledgeCheck
+  question="A delivery has failed its maximum number of attempts. What should happen to it?"
+  options={[
+    "Keep retrying it indefinitely until it succeeds",
+    "Silently drop it to keep the queue clean",
+    "Move it to a dead-letter queue where it's alerted on, inspected, and can be replayed after a fix — never retried forever and never silently dropped",
+    "Immediately delete the user's account",
+  ]}
+  answer={2}
+  explanation="Infinite retries waste resources and a poison message would block the channel; silently dropping loses notifications invisibly. The dead-letter queue is the middle path: exhausted and poison messages are parked there for visibility and later replay, so failures are bounded and recoverable rather than either endless or invisible."
+/>
 
 <h2 id="user-preferences">Preferences & Rate Limiting</h2>
 
-The fan-out service filters channels against each user's stored preferences and applies per-user rate limits before publishing to channel queues.
+A notification service that ignores what users want is a spam cannon. Preferences are resolved during fan-out, **before** any per-channel delivery is created, so an unwanted channel is never even enqueued.
+
+- **Channel preferences and opt-out.** Per user and per notification type, which channels are enabled. Some opt-outs are not just product preference but **legally mandatory** — an unsubscribe from marketing email, a `STOP` reply to SMS — and must be honored absolutely; when in doubt about an opt-out, **fail closed** (don't send) rather than risk a compliance violation.
+- **Quiet hours.** Respect the user's local time: defer non-urgent notifications out of the middle of their night, holding them until quiet hours end. Urgent/transactional notifications may bypass this — a security alert shouldn't wait.
+- **Per-user rate limiting and digesting.** Cap how many notifications a single user receives in a window so a misbehaving producer (or a noisy event) can't flood them — the same token-bucket idea as the Rate Limiter tutorial, keyed per user. Beyond a threshold, **collapse** many notifications into a single **digest** ("12 new mentions") rather than 12 separate pushes.
+
+<Callout variant="info" title="Preferences turn 'send' into 'send if appropriate'">
+Fan-out is not "create one delivery per requested channel" — it's "create one delivery per channel the user *will accept, right now, without being flooded*." Resolving preferences, opt-outs, quiet hours, and rate limits at fan-out time means the expensive delivery machinery only ever runs for notifications that should actually reach the user, and it keeps the service a good citizen instead of a source of complaints and unsubscribes.
+</Callout>
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Channel worker pools autoscale independently behind their queues; adding a new channel type requires only a new queue and worker deployment with no ingestion changes.
+Don't build the global pipeline on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Synchronous direct send", "Day one; low volume; call providers inline in the request", "The caller blocks on slow, flaky providers; a provider outage fails the caller's request; no real retries"],
+    ["Async: one queue + workers", "Provider latency and failures must not block callers", "A queue and workers to operate; at-least-once delivery now forces you to be idempotent"],
+    ["Per-channel queues + autoscaled pools", "One slow channel head-of-line blocks others; channels scale differently", "More queues and consumer pools to manage; per-channel back-pressure and tuning"],
+    ["Partition by user + multi-region/providers", "Single-region throughput or locality limits; need provider redundancy", "Partition routing, cross-region failover, and reasoning about ordering and duplicate provider sends"],
+  ]}
+  recommendedRow={1}
+/>
+
+The progression maps onto the capacity numbers. A synchronous direct send is fine for a prototype but couples the caller to every provider's bad day, so the first real move is to go **asynchronous with a queue** — which immediately makes idempotency mandatory, since at-least-once is now in play. As volume and channel diversity grow, **per-channel queues with autoscaled worker pools** stop a backed-up channel from delaying the others and let each scale to its provider. Only at very large scale — or when users span regions and you need provider redundancy — do you **partition by user and go multi-region**. Most services live comfortably at "async, per-channel queues, autoscaled workers"; partitioning and multi-region are justified only by measured scale.
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-Provider outages are isolated per channel; queue depth metrics and circuit breakers prevent cascade failures from propagating back to the ingestion path.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery — rather than hand-waving "it's highly available." An async pipeline has failure modes the synchronous version never had: backlog, redelivery, and poison messages.
+
+<FailureMatrix
+  rows={[
+    { failure: "Provider outage (e.g. push gateway down)", impact: "That channel's deliveries fail; its queue backs up", detection: "Provider error/timeout rate; channel success-rate drop", mitigation: "Retry with backoff; circuit-break to stop hammering; fail over to an alternate provider; DLQ on exhaustion", recovery: "Provider recovers; workers drain the backlog; DLQ is replayed" },
+    { failure: "Queue backlog / consumer lag", impact: "Delivery latency grows; notifications arrive late", detection: "Queue depth and consumer-lag metrics", mitigation: "Autoscale workers on depth; shed or deprioritize low-priority traffic; back-pressure ingestion", recovery: "Workers catch up; lag drains back to baseline" },
+    { failure: "Poison message", impact: "A malformed message crashes its worker on every attempt, stalling the channel", detection: "Repeated failures on the same message; worker crash loop", mitigation: "Cap attempts and route to the DLQ; isolate so it can't block the queue", recovery: "DLQ holds it; fix the bug and replay" },
+    { failure: "Worker crash mid-delivery", impact: "The message is redelivered (at-least-once) — a possible duplicate", detection: "Redelivery counts; worker health checks", mitigation: "Idempotency + dedup make redelivery safe; queue visibility timeout re-queues only after a stall", recovery: "Another worker redelivers; dedup suppresses the duplicate" },
+    { failure: "Dedup-store outage", impact: "Can't check idempotency — risk of duplicates (fail-open) or blocked sends (fail-closed)", detection: "Dedup-store error rate", mitigation: "Replicate the store; choose fail-open vs fail-closed by duplicate tolerance; provider-side idempotency as a backstop", recovery: "Store recovers; dedup resumes; backstops covered the gap" },
+    { failure: "Preference-service outage", impact: "Can't resolve channels/opt-outs — risk of notifying opted-out users", detection: "Preference-service error rate", mitigation: "Cache preferences locally; fail closed on opt-outs (don't send if unsure) to stay compliant", recovery: "Service recovers; cache refreshes" },
+    { failure: "Duplicate provider send", impact: "User could receive the same notification twice", detection: "Dedup hit rate; user complaints", mitigation: "Atomic idempotency check-and-set; provider-side idempotency keys where supported", recovery: "Dedup suppresses; no user-visible impact" },
+  ]}
+/>
+
+A theme runs through the matrix: **the queue plus idempotency turns most failures into mere latency.** A provider outage or worker crash doesn't lose notifications — they wait in the queue or get redelivered and deduped — it only delays them. The failures that need real care are the ones that *aren't* self-healing: a poison message that must be dead-lettered, and a preference/dedup-store outage where you must consciously choose fail-open or fail-closed.
 
 <h2 id="security-abuse">Security & Abuse</h2>
 
-Caller authentication, per-tenant send-rate caps, and payload validation at the ingestion boundary prevent abuse and protect downstream providers.
+A notification service can reach users directly on their phones and inboxes, which makes it both a high-value abuse target and a compliance surface.
+
+- **Authenticate and authorize senders.** Only trusted services may send, and only to the users and templates they're permitted to — otherwise a compromised caller becomes a phishing channel with your reputation behind it.
+- **Per-sender rate limits.** Bound how much any one producer can send (the Rate Limiter problem) so a buggy or compromised sender can't blast millions of messages, burn provider quota, or flood users.
+- **Minimize and protect PII.** Payloads carry personal data (names, order details, phone numbers). Minimize what's stored, encrypt it at rest and in transit, and keep retention short — a delivered notification's payload rarely needs to live long.
+- **Honor unsubscribe and compliance.** Unsubscribe links, SMS `STOP`, and regional rules (CAN-SPAM, GDPR, TCPA) are legal obligations, not features; opt-out state must be authoritative and fail-closed.
+- **Guard against template injection.** Templates interpolate caller-supplied data; escape it per channel so a malicious payload can't inject markup into an email or smuggle content into a push — the same untrusted-input discipline as serving user content elsewhere.
+- **Protect provider credentials.** The provider API keys are the keys to your sending reputation; store them in a secrets manager, rotate them, and scope them tightly.
 
 <h2 id="observability">Observability</h2>
 
-Key metrics are accept QPS, fan-out latency, per-channel delivery latency, retry rate, DLQ depth, and end-to-end delivery success rate.
+Instrument the pipeline end to end, because in an async system "it was accepted" and "the user got it" are far apart, and the gap between them is where problems hide.
+
+- **Accept latency and accept rate** — the cheap front door; should stay flat and fast. A spike in `429`s flags a sender hitting its limit.
+- **End-to-end delivery latency** — from accept to provider-confirmed delivery, per channel. This is the SLI users actually feel; a rising p95 usually means a backed-up queue or a degraded provider.
+- **Per-channel success and failure rates** — broken down by provider error class, so a degrading provider is visible before it becomes an outage.
+- **Retry rate and DLQ depth** — a climbing retry rate signals provider trouble; a growing **DLQ depth** is a paging signal that notifications are being abandoned and need a human.
+- **Queue depth and consumer lag** — the leading indicator of delivery latency; alert before the backlog turns into missed SLAs.
+- **Dedup hit rate** — how often duplicates are being suppressed; a sudden jump can reveal a caller stuck in a retry loop or a redelivery storm.
+
+<Callout variant="warning" title="The DLQ is your most important alert">
+A dead-letter queue that nobody watches is just a place notifications go to die silently. Every message in the DLQ is a notification a user should have received and didn't. Alert on DLQ depth and growth rate — not just log it — so abandoned deliveries become an actionable, paged event with a clear owner, and define an explicit budget for how many dead-letters are acceptable before it's an incident.
+</Callout>
+
+Define SLOs the way you would for any async pipeline: an availability SLO on the accept path, an end-to-end delivery-latency SLO per channel, and an explicit budget for DLQ volume — because every dead-lettered message is a notification you promised to deliver and didn't.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-Push-based fan-out trades write amplification for low read latency; pull-based aggregation at read time reduces writes but adds per-request cost.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Accept synchronously with a 202 and enqueue; fan out through a message queue into per-channel queues drained by autoscaled channel workers that call external providers; deliver at-least-once made safe by an idempotency key plus an atomic dedup store (effectively-once); retry transient failures with exponential backoff and jitter and dead-letter the rest; and resolve user preferences, opt-outs, quiet hours, and rate limits at fan-out time."
+  rationale="Async accept decouples a millisecond caller from slow, flaky providers, so a provider's bad day is latency, not a failed caller request. Per-channel queues stop a slow channel from head-of-line blocking the others and let each scale to its provider. At-least-once is the only honest guarantee across an external boundary, and idempotency makes its duplicates harmless. Backoff-with-jitter retries recover transient failures without stampeding, and the DLQ bounds the rest. Resolving preferences before delivery keeps the service a good citizen."
+  alternatives="Synchronous direct send for trivial volume (simplest, but couples the caller to providers); exactly-once via distributed transactions (impractical and slow across third-party providers); a single shared queue (simpler, but a slow channel blocks all others); fail-open vs fail-closed dedup/preferences depending on whether a duplicate or a missed opt-out is the worse outcome."
+  revisitWhen="Volume or user locality outgrows one region (partition + multi-region, add provider redundancy), a channel needs strict ordering, duplicate tolerance changes (re-tune fail-open vs fail-closed), or a new channel with different throughput/latency joins the fan-out."
+/>
+
+Three axes capture the real tension:
+
+- **Synchronous vs. asynchronous.** Calling providers inline is simplest and gives the caller an immediate delivered/failed answer, but couples a fast caller to slow, failure-prone providers. We go async because decoupling is the only way to keep accept fast and delivery reliable — at the cost of a queue to operate and the idempotency it forces.
+- **At-least-once vs. exactly-once.** Exactly-once is unattainable across an external provider boundary, so we choose at-least-once and neutralize its duplicates with idempotency. The trade is accepting occasional retries in exchange for never dropping a notification, with dedup ensuring the user still sees it once.
+- **Single vs. per-channel queues.** One queue is simpler to run; per-channel queues cost more moving parts but isolate channels so one slow provider can't delay all notifications. At any real scale the isolation is worth the operational cost.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-The core insight is that async fan-out over durable queues decouples ingestion from delivery, and idempotency keys turn at-least-once into effectively-once.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A notification service delivers messages to users across push, SMS, and email. The hard part isn't calling provider APIs — it's that delivery is slow and flaky while the caller wants a millisecond answer and the user must never be spammed. So I make the accept asynchronous: the API validates, dedupes on an idempotency key, enqueues, and returns 202. A fan-out service consumes that queue, resolves the user's channel preferences and opt-outs, and publishes one message per channel onto per-channel queues — separate queues so a slow channel can't head-of-line block the others. Autoscaled channel workers drain those queues and call the providers. Delivery is at-least-once, because exactly-once is impossible across an external boundary, and I make it safe with idempotency: an atomic check-and-set on a dedup key so retries and redeliveries notify the user only once. Transient failures retry with exponential backoff and jitter; permanent ones fail fast; and anything that exhausts its retry budget or is poison goes to a dead-letter queue to be alerted on and replayed. At 500 million sends a day, fan-out and retries amplify that to over a billion provider calls, so I size the delivery tier, not the cheap accept path."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why 202 and not 200? Why can't you guarantee exactly-once, and what do you do instead? How does the idempotency check avoid its own race? Why per-channel queues? How do retries avoid stampeding a struggling provider? What goes in the dead-letter queue, and what happens to it? How do you keep from spamming a user? What fails when the dedup or preference store is down?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Review the key trade-offs: why 202 over 200, how the dedup store prevents double sends, and when to prefer a single broad queue over per-channel queues.
+<KnowledgeCheck
+  question="Why does the accept API return 202 Accepted instead of 200 OK?"
+  options={[
+    "202 is faster to serialize than 200",
+    "Because delivery is asynchronous: the response confirms the service has durably accepted responsibility for the notification, not that it has been delivered yet",
+    "202 means the notification failed",
+    "It's required by the email RFC",
+  ]}
+  answer={1}
+  explanation="The service validates, dedupes, enqueues, and returns immediately, doing no provider work on the request path. 202 honestly communicates 'accepted for asynchronous processing' — the actual delivery happens later through the pipeline, and the caller polls status or gets a webhook to learn the outcome."
+/>
+
+<KnowledgeCheck
+  question="What is the dominant load lesson from the capacity estimate?"
+  options={[
+    "Ingestion is the bottleneck and must be heavily scaled",
+    "Fan-out and retries amplify a modest accept rate into far more downstream work, so you size the delivery tier and provider throughput — not the cheap accept path",
+    "Storage of notification history dominates everything",
+    "The system is CPU-bound on template rendering",
+  ]}
+  answer={1}
+  explanation="500M sends/day is only ~5.8k accept QPS, but a 2× fan-out makes ~11.6k deliveries/sec, retries add ~20% to ~13.9k attempts/sec, and a 4× peak reaches ~46k deliveries/sec — a billion provider calls a day. The amplified delivery tier is what you provision; the accept path is trivial."
+/>
+
+<KnowledgeCheck
+  question="The same notification could be delivered twice (retry after an ambiguous timeout). How do you keep the user from seeing it twice?"
+  options={[
+    "Switch to a queue that guarantees exactly-once delivery",
+    "An idempotency key plus an atomic check-and-set against a dedup store, so any retry or redelivery for the same key is suppressed (effectively-once on top of at-least-once)",
+    "Never retry, to avoid duplicates",
+    "Ask the provider to call back before sending",
+  ]}
+  answer={1}
+  explanation="Exactly-once across an external provider is impossible, so you retry (at-least-once) and deduplicate. An atomic check-and-set on the idempotency key ensures exactly one actor wins and all duplicates are suppressed, so the user is notified once even though the pipeline may have attempted delivery several times."
+/>
+
+<KnowledgeCheck
+  question="A push provider starts timing out under load. Which retry strategy avoids making it worse?"
+  options={[
+    "Retry immediately and continuously until it responds",
+    "Exponential backoff with jitter — increasing delays so the provider can recover, randomized so the worker fleet doesn't retry in synchronized spikes",
+    "Fixed 1-second retries across all workers",
+    "Move every message straight to the dead-letter queue",
+  ]}
+  answer={1}
+  explanation="Immediate or fixed-interval retries from a whole fleet stampede an already-struggling provider in synchronized waves. Exponential backoff gives it room to recover, and jitter desynchronizes the workers so retries spread out instead of arriving all at once."
+/>
+
+<KnowledgeCheck
+  question="Why resolve user preferences and opt-outs during fan-out, before creating per-channel deliveries?"
+  options={[
+    "It makes the database smaller",
+    "So the expensive delivery machinery only ever runs for channels the user will actually accept, and legally-required opt-outs are never violated — an unwanted channel is never even enqueued",
+    "Because providers require it",
+    "To generate the notification id",
+  ]}
+  answer={1}
+  explanation="Fan-out is where one notification becomes N deliveries, so filtering by preference there means no delivery is created for a disabled channel or an opted-out user. That keeps the service compliant (opt-outs honored, fail-closed when unsure) and avoids doing — and paying for — delivery work that should never happen."
+/>
+
+<KnowledgeCheck
+  question="What is the purpose of the dead-letter queue?"
+  options={[
+    "To store every successfully delivered notification for analytics",
+    "To capture deliveries that exhausted their retry budget or are poison messages — so they're alerted on, inspected, and replayed after a fix, instead of being retried forever or silently dropped",
+    "To rate-limit incoming requests",
+    "To hold notifications during quiet hours",
+  ]}
+  answer={1}
+  explanation="The DLQ is the bounded endpoint for failures that don't self-heal. Infinite retries waste resources and let a poison message block a channel; silent drops lose notifications invisibly. The DLQ parks them for visibility and later replay, making failure handling both bounded and recoverable."
+/>
+
+<Faq
+  items={[
+    { question: "Why is the notification accept path asynchronous?", answer: "Because delivery is slow and unreliable — it depends on external providers that can be down, rate-limit you, or take seconds — while the caller wants a millisecond response. Accepting synchronously and delivering asynchronously through a queue decouples the two: the caller gets an immediate 202, and the pipeline retries delivery at its own pace without ever blocking or failing the caller's request." },
+    { question: "Why 202 Accepted instead of 200 OK?", answer: "202 means 'I've durably accepted responsibility for this and will process it asynchronously,' which is the honest status when delivery hasn't happened yet. 200 would imply the work is done. The caller learns the actual per-channel outcome later by polling GET /v1/notifications/{id} or via a webhook." },
+    { question: "What does 'fan-out' mean here?", answer: "One logical notification (a NotificationRequest) is exploded into several physical per-channel deliveries — one for push, one for email, and so on — each its own message, queue entry, and retry/dedup unit. Fan-out is also where load amplifies: the fan-out factor multiplies the accept rate into the much larger delivery rate." },
+    { question: "Why per-channel queues instead of one shared queue?", answer: "Channels differ in throughput, latency, and failure behavior. With a single shared queue, messages for a slow or rate-limited channel sit at the head and block faster channels behind them (head-of-line blocking). Giving each channel its own queue and autoscaled worker pool isolates them, so a backed-up SMS queue never delays push or email and each scales to its provider independently." },
+    { question: "Why can't you guarantee exactly-once delivery?", answer: "When a worker calls an external provider and the call times out, it cannot know whether the provider actually sent the message. Retrying risks a duplicate; not retrying risks a drop. That ambiguity across a third-party boundary makes true exactly-once impossible, so you choose at-least-once and make duplicates harmless with idempotency." },
+    { question: "How does idempotency make at-least-once safe?", answer: "Every delivery carries an idempotency key, and before acting the service does an atomic check-and-set against a dedup store: if the key is already present the work is suppressed, otherwise it's set and proceeds. So retries and redeliveries for the same key are collapsed to a single user-visible notification — at-least-once delivery plus idempotent suppression equals effectively-once." },
+    { question: "Why must the dedup check be atomic?", answer: "If checking the key and setting it are separate steps, two concurrent retries can both see 'absent' and both deliver — the duplicate you were preventing. A single atomic operation (a conditional insert on a unique key, or SET … NX) ensures exactly one actor wins the key and the rest observe it taken. It's the same check-then-act race the Rate Limiter solves with an atomic increment." },
+    { question: "How do retries avoid making a struggling provider worse?", answer: "By classifying failures and backing off. Transient errors (5xx, timeout, 429) retry; permanent ones (invalid address) fail fast. Retries use exponential backoff so a recovering provider gets breathing room, plus jitter so the worker fleet doesn't retry in synchronized spikes. A retry budget caps the effort before dead-lettering." },
+    { question: "What goes into the dead-letter queue, and what happens to it?", answer: "Deliveries that exhaust their retry budget and poison messages that repeatedly crash a worker. Instead of retrying forever (which would block the channel) or dropping silently (which loses notifications invisibly), they're parked in the DLQ, alerted on, inspected, and replayed after the bug is fixed or the provider recovers." },
+    { question: "How do you keep from spamming a user?", answer: "Resolve preferences at fan-out: honor per-channel opt-outs (some legally mandatory), respect quiet hours for non-urgent messages, and apply per-user rate limits so a noisy producer can't flood one person. Beyond a threshold, collapse many notifications into a single digest rather than sending each separately." },
+    { question: "What happens when the dedup store or preference service is down?", answer: "You make a deliberate fail-open vs fail-closed choice. For dedup, fail-open risks a duplicate while fail-closed risks blocking sends — pick by duplicate tolerance, and lean on provider-side idempotency as a backstop. For preferences/opt-outs, fail closed (don't send when unsure) to avoid notifying an opted-out user, which can be a compliance violation. Both stores are also replicated to make the outage rare." },
+    { question: "How does the system behave when a provider has an outage?", answer: "That channel's deliveries fail and back up in its queue, but they aren't lost — workers retry with backoff, a circuit breaker stops hammering the dead provider, and you can fail over to an alternate provider. Anything that exhausts retries lands in the DLQ. When the provider recovers, workers drain the backlog and the DLQ is replayed, so the failure becomes delay rather than data loss." },
+    { question: "Does the notification service store message history forever?", answer: "No. Delivery records and payloads carry PII and only need to live long enough for status queries, dedup, and debugging — typically a short retention. The dedup store in particular is a TTL'd cache sized to how long duplicates can plausibly arrive (minutes to hours), not a permanent ledger, which keeps it small and fast." },
+  ]}
+/>
