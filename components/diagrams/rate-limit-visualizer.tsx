@@ -45,6 +45,7 @@ interface SlidingWindowCounterState {
   prevCount: number; // requests in the previous window
   currCount: number; // requests in the current window
   windowStart: number;
+  estimate: number; // estimate used for the admission decision
   lastOutcome: "ready" | "allowed" | "rejected";
 }
 
@@ -80,7 +81,7 @@ function initialState(algorithm: Algorithm): SimState {
     case "sliding-window-log":
       return { kind: "sliding-window-log", time: 0, log: [], lastOutcome: "ready" };
     case "sliding-window-counter":
-      return { kind: "sliding-window-counter", time: 0, prevCount: 0, currCount: 0, windowStart: 0, lastOutcome: "ready" };
+      return { kind: "sliding-window-counter", time: 0, prevCount: 0, currCount: 0, windowStart: 0, estimate: 0, lastOutcome: "ready" };
     case "token-bucket":
       return { kind: "token-bucket", time: 0, tokens: LIMIT, lastOutcome: "ready" };
     case "leaky-bucket":
@@ -164,6 +165,7 @@ function reducer(state: SimState, action: Action): SimState {
         windowStart,
         prevCount,
         currCount: allowed ? currCount + 1 : currCount,
+        estimate,
         lastOutcome: allowed ? "allowed" : "rejected",
       };
     }
@@ -253,13 +255,7 @@ function statusText(state: SimState): string {
       return `Rejected — log is full at ${fill}/${LIMIT} entries.`;
     }
     case "sliding-window-counter": {
-      const fraction = Math.max(
-        0,
-        Math.min(1, (state.time - state.windowStart) / WINDOW),
-      );
-      const estimate =
-        state.prevCount * (1 - fraction) + state.currCount;
-      const est = estimate.toFixed(1);
+      const est = state.estimate.toFixed(1);
       if (state.lastOutcome === "ready") return `Ready — estimated rate: ${est}/${LIMIT}.`;
       if (state.lastOutcome === "allowed") return `Allowed — estimated rate: ${est}/${LIMIT}.`;
       return `Rejected — estimated rate ${est} reaches limit of ${LIMIT}.`;
@@ -382,14 +378,13 @@ function SlidingWindowCounterViz({ state }: { state: SlidingWindowCounterState }
     0,
     Math.min(1, (state.time - state.windowStart) / WINDOW),
   );
-  const estimate = state.prevCount * (1 - fraction) + state.currCount;
-  const filled = Math.min(LIMIT, Math.round(estimate));
+  const filled = Math.min(LIMIT, Math.round(state.estimate));
   return (
     <>
       <SlotRow
         filled={filled}
         fillColor="var(--accent)"
-        label={`Estimated rate: ${estimate.toFixed(1)}/${LIMIT}`}
+        label={`Estimated rate: ${state.estimate.toFixed(1)}/${LIMIT}`}
       />
       <text
         x={SVG_W / 2}
