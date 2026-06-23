@@ -38,6 +38,32 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "rate-limiter": {
+    slug: "rate-limiter",
+    title: "Design a Rate Limiter",
+    description:
+      "An algorithm-first, interview-grade walkthrough of a distributed rate limiter: the five classic algorithms, limit policies, the allow/throttle API, distributed counting, consistency, scaling, and failure modes.",
+    difficulty: "Foundational",
+    readingMinutes: 30,
+    concepts: ["Token bucket", "Sliding window", "Distributed counters", "Fail-open"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "limit-policies", label: "Limit Policies & Keys", depth: "interview-ready" },
+      { id: "algorithms", label: "Algorithms", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "distributed-counting", label: "Distributed Counting", depth: "advanced" },
+      { id: "consistency-races", label: "Consistency & Races", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "observability", label: "Observability", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

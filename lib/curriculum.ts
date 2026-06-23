@@ -22,7 +22,7 @@ export const problems: readonly Problem[] = [
       "Throttle requests fairly across a distributed fleet without a single coordination bottleneck.",
     difficulty: "Foundational",
     concepts: ["Token bucket", "Sliding window", "Distributed counters"],
-    status: "coming-soon",
+    status: "available",
     sequence: 2,
   },
   {

@@ -10,6 +10,7 @@ import { FailureMatrix } from "@/components/learning/failure-matrix";
 import { DepthSection } from "@/components/learning/depth-section";
 import { Faq } from "@/components/learning/faq";
 import { KnowledgeCheck } from "@/components/learning/knowledge-check";
+import { RateLimiterCapacity } from "@/components/learning/rate-limiter-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -18,6 +19,13 @@ import {
   AnalyticsSequence,
 } from "@/components/diagrams/request-flow-diagrams";
 import { ScaleEvolution } from "@/components/diagrams/scale-evolution";
+import { RateLimitVisualizer } from "@/components/diagrams/rate-limit-visualizer";
+import { RateLimiterArchitecture } from "@/components/diagrams/rate-limiter-architecture";
+import {
+  AllowSequence,
+  ThrottleSequence,
+  FailOpenSequence,
+} from "@/components/diagrams/rate-limit-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -37,12 +45,18 @@ const teachingComponents = {
   DepthSection,
   Faq,
   KnowledgeCheck,
+  RateLimiterCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
   RedirectCacheMissSequence,
   AnalyticsSequence,
   ScaleEvolution,
+  RateLimitVisualizer,
+  RateLimiterArchitecture,
+  AllowSequence,
+  ThrottleSequence,
+  FailOpenSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

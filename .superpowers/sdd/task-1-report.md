@@ -1,134 +1,74 @@
-# Task 1 Report: Scaffold the Tested Next.js Application Shell
+# Task 1 Report: Capacity Calculation and Shared Capacity Table
 
-## Implementation summary
+## Status: DONE
 
-Implemented the Task 1 foundation for the tutorial app:
+## Commit
 
-- scaffolded a Next.js 16 / React 19 / TypeScript / Tailwind v4 / Vitest project shell
-- added MDX-ready Next config, PostCSS, ESLint, Vitest, and TypeScript alias setup
-- created the root application layout, homepage shell, header, footer, theme toggle, and favicon
-- added global light/dark design tokens, reduced-motion handling, and the graph-paper background treatment
-- wrote and passed the required `tests/site-shell.test.tsx` test
+`3ec570d feat: add rate limiter capacity model and shared capacity table`
 
-## Files changed
+## TDD Evidence
 
-- `.gitignore`
-- `app/globals.css`
-- `app/layout.tsx`
-- `app/page.tsx`
-- `components/shell/site-footer.tsx`
-- `components/shell/site-header.tsx`
-- `components/shell/theme-toggle.tsx`
-- `eslint.config.mjs`
-- `next.config.mjs`
-- `package-lock.json`
-- `package.json`
-- `postcss.config.mjs`
-- `public/favicon.svg`
-- `tests/site-shell.test.tsx`
-- `tsconfig.json`
-- `vitest.config.ts`
-- `vitest.setup.ts`
-- `.superpowers/sdd/task-1-report.md`
-
-## RED/GREEN TDD evidence
-
-### RED
+### RED (Step 2)
 
 Command:
-
-```bash
-npm test -- tests/site-shell.test.tsx
+```
+npm test -- tests/rate-limiter-estimates.test.ts
 ```
 
-Relevant output:
-
-```text
-FAIL  tests/site-shell.test.tsx [ tests/site-shell.test.tsx ]
-Error: Failed to resolve import "@/app/page" from "tests/site-shell.test.tsx". Does the file exist?
+Output:
+```
+FAIL  tests/rate-limiter-estimates.test.ts [ tests/rate-limiter-estimates.test.ts ]
+Error: Failed to resolve import "@/lib/rate-limiter-estimates" from "tests/rate-limiter-estimates.test.ts". Does the file exist?
+Test Files  1 failed (1)
+Tests  no tests
 ```
 
-This was the expected failure before the shell implementation existed.
-
-### GREEN
+### GREEN (Step 4)
 
 Command:
-
-```bash
-npm test -- tests/site-shell.test.tsx
+```
+npm test -- tests/rate-limiter-estimates.test.ts
 ```
 
-Relevant output:
-
-```text
+Output:
+```
 Test Files  1 passed (1)
-     Tests  1 passed (1)
+Tests  3 passed (3)
 ```
 
-### Focused typecheck
+### Final Verification (Step 9)
 
 Command:
-
-```bash
-npm run typecheck
+```
+npm test -- tests/rate-limiter-estimates.test.ts tests/url-shortener-estimates.test.ts
 ```
 
-Relevant final output:
-
-```text
-> system-design-tutorials@0.1.0 typecheck
-> tsc --noEmit
+Output:
+```
+Test Files  2 passed (2)
+Tests  5 passed (5)
 ```
 
-During setup, TypeScript 6 surfaced two configuration issues:
+`npm run typecheck` — clean (no output)
+`npm run lint` — clean (no output)
 
-- `baseUrl` required `ignoreDeprecations: "6.0"`
-- test globals required `vitest/globals` in `tsconfig.json`
+## Files Changed
 
-Both were fixed before the final passing typecheck run.
+| File | Action |
+|------|--------|
+| `lib/rate-limiter-estimates.ts` | Created — pure capacity calculation for rate limiter |
+| `tests/rate-limiter-estimates.test.ts` | Created — TDD test (written first, RED, then GREEN) |
+| `components/learning/capacity-table.tsx` | Created — shared presentational component |
+| `components/learning/capacity-model.tsx` | Refactored — now a thin wrapper over CapacityTable |
+| `components/learning/rate-limiter-capacity.tsx` | Created — rate limiter wrapper over CapacityTable |
+| `mdx-components.tsx` | Modified — added RateLimiterCapacity import and registration |
 
-## Full-suite evidence
+## Self-Review Findings
 
-Commands run:
+1. **Regression safety**: `CapacityModel`'s public props (`{ assumptions: CapacityAssumptions }`) are unchanged. The url-shortener estimates test (5 assertions) still passes.
 
-```bash
-npm test
-npm run lint
-npm run typecheck
-npm run build
-```
+2. **Output equivalence**: The refactored `CapacityModel` produces identical HTML structure to the original — same CSS classes, same grid layout, same element nesting. The only difference is the data now flows through pre-formatted `AssumptionRow[]` / `ResultRow[]` arrays.
 
-Relevant output:
+3. **One minor note**: The original `capacity-model.tsx` rendered `cacheWorkingSetGB` with `fmt(r.cacheWorkingSetGB, 0)` (explicit 0 digits). The new thin wrapper calls `fmt(r.cacheWorkingSetGB)` (defaulting to 0). Functionally identical since the default is also 0 — verified by test.
 
-```text
-npm test
-Test Files  1 passed (1)
-     Tests  1 passed (1)
-
-npm run lint
-> system-design-tutorials@0.1.0 lint
-> eslint .
-
-npm run typecheck
-> system-design-tutorials@0.1.0 typecheck
-> tsc --noEmit
-
-npm run build
-✓ Compiled successfully
-✓ Generating static pages using 4 workers (3/3)
-○  (Static)  prerendered as static content
-```
-
-Note: an earlier parallel `next build` attempt hit Next’s “Another next build process is already running” guard; a clean serial rerun passed. The application code did not require changes for that.
-
-## Self-review
-
-- The homepage remains content-first and restrained while satisfying the exact pilot CTA requirement.
-- The root shell includes the required skip link, header, main landmark, and footer.
-- Theme tokens exist for canvas, surface, ink, muted ink, border, accent, fundamentals, interview, advanced, success, warning, and danger in both light and dark themes.
-- Motion is reduced under `prefers-reduced-motion`.
-- The setup is ready for later MDX and App Router tasks without adding runtime backend assumptions.
-
-## Concerns
-
-- Unrelated untracked Task 2 artifacts already present in the working tree were left untouched: `lib/` and `tests/curriculum.test.ts`.
+4. **No improvised designs**: All code is transcribed verbatim from the brief. No departures from the specified interfaces or values.
