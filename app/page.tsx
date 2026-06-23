@@ -27,6 +27,8 @@ const depths = [
 export default function HomePage() {
   const featured = getProblem("url-shortener")!;
   const preview = problems.slice(0, 6);
+  const liveCount = problems.filter((p) => p.status === "available").length;
+  const inProgressCount = problems.length - liveCount;
 
   return (
     <>
@@ -35,15 +37,17 @@ export default function HomePage() {
         <div className="mx-auto max-w-6xl px-5 py-20 sm:py-28">
           <span className="inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1 text-xs font-medium text-ink-muted">
             <span className="h-1.5 w-1.5 rounded-full bg-success" />
-            1 tutorial live · 24 more in progress
+            {liveCount} {liveCount === 1 ? "tutorial" : "tutorials"} live ·{" "}
+            {inProgressCount} more in progress
           </span>
           <h1 className="mt-5 max-w-3xl text-4xl font-semibold leading-[1.08] tracking-tight sm:text-5xl">
-            Master system design, one rigorous case at a time
+            Learn system design the way it&rsquo;s actually practiced
           </h1>
           <p className="mt-5 max-w-2xl text-lg text-ink-muted">
-            Work through real interview problems the way a senior architect
-            would — from requirements and capacity math to APIs, data models,
-            precise architecture diagrams, trade-offs, and resiliency.
+            Real interview problems worked end to end — requirements, capacity
+            math, APIs, data models, precise architecture diagrams, trade-offs,
+            and failure modes — so you reason from first principles instead of
+            memorizing diagrams.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Link
