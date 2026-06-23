@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(22);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(21);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -47,6 +47,18 @@ test("learner can open the pastebin tutorial", async ({ page }) => {
   await expect(page.locator("#expiry-and-ttl")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /pastebin architecture/i }).first(),
+  ).toBeVisible();
+});
+
+test("learner can open the notification service tutorial", async ({ page }) => {
+  await page.goto("/learn/notification-service");
+  await expect(
+    page.getByRole("heading", { name: /design a notification service/i }),
+  ).toBeVisible();
+  await page.goto("/learn/notification-service#delivery-guarantees");
+  await expect(page.locator("#delivery-guarantees")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /notification architecture/i }).first(),
   ).toBeVisible();
 });
 
