@@ -1,71 +1,420 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section introduces the collaborative document editor problem and sets the stage for the interview discussion.
+A collaborative document editor lets many people open the same document and type into it at the same time — seeing each other's changes and cursors live — and somehow everyone ends up looking at the exact same document. A user types a character and it appears instantly; a collaborator on another continent sees it a moment later; two people editing the same sentence at once both keep their words. The trap is to picture this as a shared text field behind a websocket: broadcast each keystroke, apply it everywhere, done. The real problem is what happens when edits **collide** — and at human typing speed across many editors, they collide constantly.
+
+The hard part is **conflict-free convergence**. Because a keystroke must show up locally with zero latency, you cannot route every character to a server and wait for a verdict — each editor applies edits to its **own local replica immediately**. But that means replicas drift: while your "hello" is in flight, a collaborator inserted a word ahead of it, so your edit's position is already wrong by the time it lands. The system has to reconcile these concurrent, optimistically-applied edits so that **every replica converges to an identical final document** and **no one's edit is silently lost**. The two canonical answers are **operational transformation (OT)** — a server orders edits and transforms each against the ones it didn't see — and **conflict-free replicated data types (CRDTs)** — edits are made commutative so they merge in any order. The reframe to lead with: *it looks like broadcasting keystrokes, but the hard part is making concurrent, offline-tolerant edits converge without lost updates — OT or CRDTs — over a real-time fan-out fabric.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- How many concurrent editors per document — a handful, or a viral doc with hundreds? (It changes the fan-out and ordering story.)
+- Plain text or rich text (formatting, tables, embeds)? We'll design for text and note rich text as harder.
+- Must edits survive going offline and reconnecting, or only brief network blips?
+- Is there a central server we trust to order edits, or must this work peer-to-peer?
+- Do we need full version history and undo, or just the live document?
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the convergence reframe · **5 min** requirements and the two guarantees (convergence, intention preservation) · **5 min** capacity (the fan-out and connection numbers fall out here) · **5 min** entity model and the op/websocket API · **10 min** the concurrent-editing problem and OT vs CRDTs — the centerpiece · **10 min** real-time sync, presence, and persistence · **5 min** failure modes and wrap-up. Say your assumptions out loud — the interviewer is grading whether you understand why naive broadcast loses edits and can compare OT and CRDTs, not whether you can recite a transform function.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the concurrent-editing problem, operational transformation, CRDTs, the real-time sync protocol (websockets, optimistic apply, broadcast, reconnection), presence/awareness, and op-log persistence with history. **Out of scope:** rich-text schema details, the editor UI and rendering, document search, the sharing/permission system (we note access control but don't design it), deep offline-first mobile sync, and in-document calls — name them so the interviewer sees the boundary, then set them aside.
 
 <h2 id="requirements">Requirements</h2>
 
-This section covers the functional and non-functional requirements for a real-time collaborative document editor.
+Separate what the system must *do* from how *well* it must do it. For a collaborative editor the non-functional list is dominated by two **correctness guarantees** about concurrent edits — not a throughput or latency SLO, but properties the entire design exists to protect.
+
+<RequirementsTable
+  functional={[
+    "Multiple users edit one document concurrently",
+    "See others' edits appear in real time",
+    "See others' cursors and selections (presence)",
+    "Edit locally with zero latency (optimistic apply)",
+    "Reconcile edits made while briefly offline, on reconnect",
+    "Keep version history with undo / redo",
+  ]}
+  nonFunctional={[
+    { goal: "Convergence", target: "all replicas reach identical state" },
+    { goal: "Intention preservation", target: "no edit silently lost" },
+    { goal: "Local edit latency", target: "instant (optimistic, no round trip)" },
+    { goal: "Edit propagation (p95)", target: "< 200 ms to collaborators" },
+    { goal: "Document durability", target: "no acknowledged edit lost" },
+    { goal: "Availability", target: "99.95%" },
+  ]}
+/>
+
+Two guarantees dominate every later decision. First, **convergence**: once all edits have propagated, every replica must show the *exact same* document — if two people's screens permanently disagree, the product is broken, full stop. Second, **intention preservation**: a concurrent edit must not silently destroy another — last-write-wins on a shared paragraph would quietly delete someone's sentence, which is unacceptable for a document. These two properties are precisely why naive broadcast fails and why OT and CRDTs exist. The third pillar is **instant local editing**: typing must never wait for a server, so edits are applied optimistically to the local replica and reconciled afterward — which is the very thing that creates concurrency in the first place.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the capacity math: concurrent editors, operations per second, fan-out load, and op-log storage growth.
+Estimates here tell a different story than a storage or streaming system's. The data is tiny — an edit is ~100 bytes — so the constraint isn't bandwidth or disk. It's **fan-out** (every keystroke multiplies across collaborators) and **persistent connections** (millions of open websockets). We size all of it from one set of assumptions.
+
+<CollaborativeDocEditorCapacity
+  assumptions={{
+    peakConcurrentEditors: 2000000,
+    opsPerEditorPerSecond: 2,
+    collaboratorsPerDoc: 4,
+    bytesPerOp: 100,
+    dailyEditedDocs: 5000000,
+    opsPerDocPerDay: 2000,
+  }}
+/>
+
+The takeaways. First, **the load is messages, not bytes**: 4 million operations per second arrive, but each is rebroadcast to the other collaborators on its document, producing **12 million outbound messages per second** — fan-out, not data volume, is the dominant real-time cost, and it's why the system is built around efficient message routing. Second, **connection state is the scaling unit**: the platform holds **2 million persistent websocket connections** open at peak, each consuming memory and needing a home server — so you scale by sharding connections and documents across many servers, not by adding CPU. Third, **the op log grows relentlessly**: ten billion tiny operations a day is only ~**1 TB/day**, but it never stops, so you cannot replay from the beginning of time — periodic **snapshots** plus **log compaction** are mandatory to keep document load times and storage bounded. The shape is the inverse of a content system: minuscule payloads, enormous message and connection counts.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core entities: Document, Operation, Snapshot, and Presence, along with their relationships and storage implications.
+The model centers on the **Document** as the thing users share, but the real unit of work is the **Operation** — the small, ordered edit that the whole convergence story is about. The document's durable truth is not a blob of text; it's the **ordered log of operations** that produced it, periodically materialized into a snapshot.
+
+<EntityModel
+  name="Document"
+  description="One row per document — the thing collaborators share. Its real state is the ordered sequence of operations applied to it; the current version is a sequence number, and a snapshot materializes the text at a version so you don't replay from zero."
+  fields={[
+    { name: "id", type: "string (PK)", notes: "stable document id, e.g. 'doc_5a1'" },
+    { name: "owner_id", type: "string", notes: "creator / owner for access control" },
+    { name: "title", type: "string", notes: "human title" },
+    { name: "version", type: "int", notes: "monotonic sequence number of the last applied op" },
+    { name: "snapshot_key", type: "string | null", notes: "object-storage key of the latest snapshot" },
+    { name: "snapshot_version", type: "int", notes: "the op version the snapshot reflects" },
+    { name: "created_at", type: "timestamp", notes: "creation time" },
+  ]}
+  keys="The primary key is the document id; the document's true state is the snapshot at snapshot_version plus every operation after it. version is the ordering authority for the live session — each new op gets the next version. The session for one document is single-ordering (one server assigns those versions) so the order is unambiguous, which is what makes convergence tractable."
+/>
+
+Three related entities complete the picture. An **Operation** is the unit of change — `(doc_id, version, author_id, type: insert | delete, position, payload)` — and the append-only sequence of operations *is* the document's source of truth; everything else is derived. A **Snapshot** is the materialized document text at a particular version, written periodically so a newly-joining client (or a recovering server) can load the snapshot and replay only the operations since, rather than the entire history. **Presence** is a per-user, in-memory record of a cursor position and selection — deliberately *not* persisted, because it's ephemeral and a lost cursor frame simply self-corrects on the next update.
 
 <h2 id="api-design">API Design</h2>
 
-This section covers the REST and WebSocket APIs for creating documents, connecting to editing sessions, and catching up on missed operations.
+The API has a thin REST surface for document lifecycle and a **persistent websocket** for the real-time editing channel — because the editing path is bidirectional and continuous, not request/response. The defining endpoint is the websocket: it carries operations up, acks and broadcasts down, and presence alongside.
+
+<ApiContract
+  method="POST"
+  path="/v1/documents"
+  summary="Create a new document and get its id. Editing happens over the websocket channel, not here."
+  request={`POST /v1/documents
+
+{
+  "title": "Design doc",
+  "owner_id": "u_42"
+}`}
+  response={`HTTP/1.1 201 Created
+
+{
+  "document_id": "doc_5a1",
+  "version": 0
+}`}
+  statusCodes={[
+    { code: "201", meaning: "Document created; connect the websocket to start editing" },
+    { code: "401", meaning: "Not authenticated" },
+    { code: "403", meaning: "No permission to create" },
+  ]}
+  notes="Document creation is a normal REST call. All editing — sending operations, receiving others' operations, presence — flows over the websocket below. A separate GET /v1/documents/{id}/operations?since={version} serves catch-up reads for a reconnecting client."
+/>
+
+<ApiContract
+  method="WS"
+  path="/v1/documents/{id}/connect"
+  summary="The real-time editing channel. The client sends operations and presence; the server acks, assigns order, and broadcasts collaborators' operations back."
+  request={`// client → server (an edit)
+{ "type": "op", "client_seq": 7,
+  "op": { "type": "insert", "position": 12, "text": "hi",
+          "base_version": 41 } }
+
+// client → server (a cursor move)
+{ "type": "presence", "cursor": 18, "selection": [18, 24] }`}
+  response={`// server → client (ack of your op)
+{ "type": "ack", "client_seq": 7, "version": 42 }
+
+// server → client (a collaborator's op, already transformed)
+{ "type": "op", "version": 43, "author": "u_99",
+  "op": { "type": "insert", "position": 5, "text": "x" } }`}
+  statusCodes={[
+    { code: "101", meaning: "Switching Protocols — websocket established" },
+    { code: "401", meaning: "Auth/token rejected at connect" },
+    { code: "409", meaning: "Op rejected; client must rebase on the latest version" },
+  ]}
+  notes="The client applies its op locally first (optimistic), tags it with base_version and a client_seq, and sends it. The server assigns the next authoritative version, appends to the op log, acks the originator, and broadcasts the (transformed) op to every other connected editor. Presence messages travel the same socket but on a separate, non-durable path. On reconnect the client catches up via the operations?since= read, then resumes live."
+/>
+
+The pattern is **optimistic up, ordered down**: the client never blocks on the server to edit, but the server is the single authority that assigns the canonical order and fans each operation out. That division — instant local apply, authoritative central ordering — is the backbone of the real-time path.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the high-level architecture: editor clients, WebSocket gateway, collaboration service, op log, snapshot store, pub/sub, presence service, and metadata database.
+The architecture routes every editor of one document to a single ordering authority, persists operations durably, and fans them out — while keeping ephemeral presence off the durable path.
+
+<CollaborativeDocEditorArchitecture />
+
+- **Editor (client).** Holds a local replica of the document and applies edits optimistically. It sends operations and presence over a persistent websocket and applies inbound operations from collaborators.
+- **WS gateway.** Terminates the millions of persistent websocket connections and routes each editor of a given document to the same collaboration server (sticky by `doc_id`). It's the connection-management tier — the thing that makes two million open sockets survivable.
+- **Collaboration service (document session).** The ordering authority for a document: it assigns each operation the next version, transforms or merges concurrent operations (OT/CRDT), appends to the op log, and broadcasts to collaborators. One document's live session lives on one server so its order is unambiguous.
+- **Op log.** The append-only source of truth — every operation, in order. The document is, by definition, the replay of this log; nothing is acknowledged until it's durably here.
+- **Snapshot store.** Periodic materialized snapshots of the document, so joining clients and recovering servers replay only recent operations instead of all history.
+- **Pub/sub.** The fan-out bus that delivers a document's operations to every gateway holding one of its editors, so a doc whose collaborators span many connection servers still converges.
+- **Presence service.** Carries ephemeral cursors and selections — high-frequency, lossy, and deliberately never written to the op log.
+- **Metadata DB.** Document records, versions, and access-control data.
+
+The decisive boundary is **one ordering authority per document, with a durable log behind it**. Sticky routing guarantees a document's edits are serialized in one place; the op log makes that order durable and replayable; pub/sub spreads it to wherever the collaborators are connected; and presence is kept entirely off that durable path because it doesn't need to be right forever — only right *now*. Every section that follows elaborates how that authoritative order stays convergent under concurrent, optimistic edits.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section walks through the four key operational flows: edit broadcast, conflict resolution, presence updates, and reconnect/catch-up sync.
+Four flows cover the system: a normal edit broadcasting to collaborators, two concurrent edits being reconciled, a presence update, and a client catching up after reconnecting. The conflict-resolution flow is the one that proves the convergence guarantee.
+
+**Edit & broadcast.** An editor applies a keystroke to its local replica instantly, then sends the operation. The collaboration service assigns it the next version, appends it to the log, acks the originator, and broadcasts it to the other editors, who apply it.
+
+<EditBroadcastSequence />
+
+**Conflict resolution.** Two editors change the same region at the same instant, each against a slightly stale view. The collaboration service orders them and **transforms** the later one against the earlier (OT) — or merges them by element id (CRDT) — so both edits survive and every replica ends up identical.
+
+<ConflictResolutionSequence />
+
+**Presence.** An editor moves its cursor and sends a presence update on the ephemeral channel; the presence service fans it out to collaborators. If a frame is dropped, the next one corrects it — presence never touches the durable log.
+
+<PresenceSequence />
+
+**Reconnect & sync.** An editor's connection drops and comes back. It reconnects with the last version it saw, the service reads the missed operations from the log since that version, sends the delta, and the client catches up and resumes live editing.
+
+<ReconnectSyncSequence />
 
 <h2 id="concurrent-editing">The Concurrent-Editing Problem</h2>
 
-This section explains why naive approaches like last-write-wins and distributed locks fail for concurrent editing, and defines the core invariants of convergence and intention preservation.
+Everything hard about this system lives in one moment: two people edit the same place at the same time. To see why it's hard, watch the naive designs fail. **Last-write-wins** — whoever's edit arrives second overwrites the first — is catastrophic for a document: it silently deletes the loser's sentence, violating intention preservation. **Locking** the document (or a paragraph) while someone types restores correctness but destroys the product: collaboration that makes you wait for a lock isn't real-time collaboration. And **naive broadcast** — just apply every operation everywhere in arrival order — breaks because operations carry **positions**, and positions shift under concurrent edits.
+
+That position problem is the crux. Say the document is `"hat"` and two editors act at once: A inserts `"c"` at position 0 (intending `"chat"`), and B deletes the character at position 2 (the `"t"`, intending `"ha"`). Each applies its own edit locally and ships it. Now B receives A's "insert `c` at 0" and applies it — fine, it shifts everything right. But A receives B's "delete at position 2" and applies it literally — except after A's own insert, position 2 is no longer the `"t"`, it's the `"a"`. A deletes the wrong character, and the two replicas now **permanently disagree**. No edit was lost to a crude overwrite, yet convergence still failed, because an operation's position was interpreted against a document that had changed underneath it.
+
+<Callout variant="info" title="The two properties to guarantee">
+Every correct design here must deliver two things. **Convergence:** after all operations propagate, all replicas are byte-for-byte identical — no permanent disagreement like the `"hat"` example. **Intention preservation:** each edit's *meaning* survives — A's insert and B's delete both take effect on the characters they meant, not whichever character happens to sit at a now-stale index. Last-write-wins fails the second; naive broadcast fails the first. Operational transformation and CRDTs are the two families of solution that deliver both, and the rest of this tutorial is about how each one does it.
+</Callout>
+
+<KnowledgeCheck
+  question="Why does naively broadcasting and applying each operation in arrival order fail to keep replicas consistent?"
+  options={[
+    "Because websockets drop messages",
+    "Because operations carry positions, and concurrent edits shift those positions — an operation generated against one document state is applied against a different state elsewhere, so it lands at the wrong index and replicas permanently diverge (even though no edit was bluntly overwritten)",
+    "Because the server is too slow to order them",
+    "Because clients use different fonts",
+  ]}
+  answer={1}
+  explanation="An operation like 'delete character at position 2' is only meaningful relative to the exact document state it was created against. When a concurrent insert or delete elsewhere shifts the text, applying that operation literally hits the wrong character. The result is replicas that disagree forever — a convergence failure. Fixing it requires either transforming operations against the ones they didn't see (OT) or giving each element a stable identity so positions don't matter (CRDTs)."
+/>
 
 <h2 id="operational-transformation">Operational Transformation</h2>
 
-This section explains how operational transformation works: representing edits as operations, assigning server-side ordering, and transforming concurrent operations so all replicas converge to the same result.
+Operational transformation is the first family of solution, and the one classic web editors were built on. The idea: keep editing as a stream of **operations**, route them through a **central server that assigns a total order**, and whenever an operation arrives that was generated concurrently with operations the recipient has already applied, **transform** it so it accounts for them. Transformation rewrites an operation's parameters — usually its position — so that applying it to the already-changed document achieves the originator's original intent.
+
+Return to `"hat"`. A inserts `"c"` at 0; B deletes at 2. The server picks an order — say A first — and when B's "delete at 2" is delivered to anyone who has already applied A's insert, the transform shifts its position from 2 to **3**, because A's insertion of one character to the left pushed every later index right by one. Now the delete removes the intended `"t"` everywhere, A's `"c"` is preserved everywhere, and all replicas converge to `"chat"` minus... `"chat"` → delete the `t` → `"cha"`. Every replica reaches `"cha"`. The transform function is what encodes "an insert of length 1 before your position bumps your position by 1," and OT is essentially a careful library of these transform rules for every pair of operation types.
+
+OT's strengths are real: operations are **compact** (a position and a few characters), the model maps naturally to a **server-authoritative** design where one ordering authority already exists, and the document stays a plain string with no per-character bookkeeping. Its weakness is equally real: the **transform functions are subtle and easy to get wrong** — the number of operation-pair cases grows quickly, correctness proofs are famously tricky, and bugs manifest as rare, hard-to-reproduce divergence. This is why OT implementations lean on a central server to bound the ordering, rather than attempting arbitrary peer-to-peer transformation.
+
+<KnowledgeCheck
+  question="In operational transformation, what does 'transforming' an operation actually do, and what role does the central server play?"
+  options={[
+    "It compresses the operation to save bandwidth",
+    "It rewrites the operation's parameters (typically its position) to account for concurrent operations the recipient already applied, so the edit lands where the author intended; the central server assigns a single total order, which bounds what each operation must be transformed against",
+    "It encrypts the operation for security",
+    "It merges the operation into a snapshot",
+  ]}
+  answer={1}
+  explanation="Transformation adjusts an operation against the concurrent operations it didn't see — e.g. shifting a delete's index because an earlier insert pushed text right — so the operation preserves its author's intent on the now-changed document. The server's job is to impose one total order on operations; with a known order, each operation only needs transforming against a well-defined set, which keeps the scheme tractable and lets all replicas converge."
+/>
 
 <h2 id="crdts">Conflict-Free Replicated Data Types</h2>
 
-This section explains CRDTs as an alternative to OT: commutative operations with unique identifiers that merge automatically without central coordination.
+CRDTs are the second family, and they attack the problem from the opposite direction: instead of transforming operations to fit a changing document, **make operations commutative so order never matters**. The trick for text is to stop identifying characters by position and start identifying them by a **unique, immutable id** with a total order built in. Each character gets an id that encodes where it sits *between its neighbors* (and a tiebreaker like a site id), so an insert says "add character `c` with id between id-of-`h`-start and id-of-`a`" rather than "insert at index 0." A delete references the **id** of the character to remove, not its index.
+
+Because every operation names stable ids rather than shifting indices, **applying them in any order yields the same document** — they commute. Two concurrent inserts at "the same place" get different ids (their site tiebreakers differ), so they don't collide; they just both land, in a deterministic order. There's no transform function and **no central authority required for correctness**: replicas can exchange operations peer-to-peer, in any order, even after a long offline stretch, and still converge by construction. That property — convergence without coordination — is why CRDTs shine for offline-first and decentralized editing.
+
+<Callout variant="warning" title="CRDTs trade transform-complexity for metadata overhead">
+CRDTs remove the subtle transform functions, but they aren't free. Every character carries a unique id (and ordering metadata), which is far larger than the character itself, and a deleted character usually can't just vanish — it becomes a **tombstone** that lingers so that concurrent operations still referencing it remain valid. Over a long-lived, heavily-edited document, ids and tombstones accumulate, so practical CRDTs need **garbage collection / compaction** to reclaim space. The trade is clear: OT keeps the data tiny but the algorithm subtle and server-bound; CRDTs keep the algorithm simple and coordination-free but pay in per-element metadata. Many modern editors choose a sequence CRDT precisely because coordination-free convergence is easier to reason about at scale.
+</Callout>
+
+<KnowledgeCheck
+  question="How do CRDTs make concurrent text edits converge without a central transform step?"
+  options={[
+    "They lock each character before editing",
+    "They give every character a unique, immutable id with a built-in total order and reference ids (not indices) in inserts/deletes, so operations commute — applying them in any order yields the same document — which means replicas converge with no transform function and no required central authority",
+    "They always pick the last writer's version",
+    "They send the whole document on every edit",
+  ]}
+  answer={1}
+  explanation="By identifying characters with stable ids rather than positions, a CRDT makes operations order-independent: an insert names where it goes relative to neighboring ids, and a delete names an id, so concurrent operations don't fight over shifting indices. Commutativity means any application order converges to the same state, enabling peer-to-peer and offline merges. The cost is per-element id and tombstone metadata, which must be compacted over time."
+/>
 
 <h2 id="realtime-sync">Real-Time Sync</h2>
 
-This section covers the WebSocket-based real-time sync protocol: optimistic local apply, server acknowledgment, sequence numbers, and the fan-out broadcast mechanism.
+With convergence handled by OT or CRDTs, the sync layer is what makes editing feel instant and stay live. Three mechanisms carry it. First, **optimistic local apply**: a keystroke is applied to the local replica immediately and only *then* sent, tagged with the version it was based on and a client sequence number, so the typist never waits a round trip. Second, **authoritative ordering and broadcast**: the operation reaches the document's collaboration server, which assigns the next canonical version, persists it, acks the originator (who reconciles its optimistic state with the confirmed order), and broadcasts the operation — transformed or merged — to every other editor. Third, **catch-up on reconnect**: networks blip, so the client tracks the last version it has, and when it reconnects it asks for everything **since** that version, replays the delta onto its replica, and resumes.
+
+Routing is what makes this scale. Because one document needs **one ordering authority**, all of its editors must land on the **same collaboration server** — so the WS gateway routes stickily by `doc_id`. That sharding-by-document is the key scaling move: a million documents spread across many servers, each server owning the ordering for its slice, and pub/sub bridging the case where a document's editors are connected to different gateway nodes. No global coordination is needed because no operation ever spans two documents.
+
+<KnowledgeCheck
+  question="Why must all editors of one document be routed to the same collaboration server, and how does a reconnecting client catch up?"
+  options={[
+    "To reduce bandwidth between servers",
+    "Because one document needs a single ordering authority to assign a canonical operation order (which is what makes convergence unambiguous), so the gateway routes stickily by doc_id; a reconnecting client sends the last version it saw and the server replays the operations since that version, then the client resumes live",
+    "Because websockets can only connect to one server ever",
+    "Because the snapshot lives on that server's disk",
+  ]}
+  answer={1}
+  explanation="Convergence depends on a single, unambiguous order for a document's operations, so its live session is owned by one server and the gateway pins all of that document's editors there (sharding by doc_id). Different documents live on different servers, so the system scales horizontally with no global coordination. Reconnection is a catch-up read: the client supplies its last known version and the server streams the missed operations from the log, which the client replays before going live again."
+/>
 
 <h2 id="presence-awareness">Presence & Awareness</h2>
 
-This section covers the presence and awareness layer: cursor positions, user lists, ephemeral state propagation, and why presence is kept separate from the durable op log.
+Presence — the live cursors, selections, and "who's here" avatars — is what makes collaboration feel human, and it has the *opposite* engineering profile from editing. It is **high-frequency** (a cursor can move many times a second), **ephemeral** (only the current position matters; history is meaningless), and **loss-tolerant** (a dropped cursor frame is invisible because the next one supersedes it). So it gets its own treatment: presence updates travel on a **separate, non-durable channel**, are fanned out best-effort, and are **never written to the op log**.
+
+Keeping presence off the durable path is a deliberate and important separation. If cursor moves went through the same ordered, persisted pipeline as edits, you'd multiply op-log volume by a huge factor for data that's worthless a half-second later — and you'd slow the one path that must be correct (edits) with a flood that's allowed to be wrong. Treating presence as disposable lets it be cheap and fast: store the latest position per user in memory, broadcast on change, expire it when the user disconnects, and let any loss self-heal on the next update. It's the same instinct as the Video Streaming tutorial keeping the approximate seat-map— here, awareness is approximate by design while the document is exact.
 
 <h2 id="persistence-history">Persistence & History</h2>
 
-This section covers op-log persistence, periodic snapshots, log compaction, and how the combination keeps storage bounded while enabling full document history.
+The durable heart of the system is the **op log**: the append-only, ordered sequence of every operation applied to a document. It's the source of truth in the strongest sense — the document *is* the replay of its log — and nothing is acknowledged to a client until its operation is safely appended, so an "saved" edit can never be lost. This log-as-truth model is also what makes history and undo almost free: the ordered operations already *are* a complete, replayable timeline, so "the document at 3pm" is just a replay up to that point, and undo is applying an inverse operation.
+
+But an append-only log that only grows is a replay-time and storage problem, which is why **snapshots and compaction** are mandatory rather than optional. Periodically the service materializes the document's current text into a **snapshot** at a known version; a client joining a long-lived document then loads the snapshot and replays only the operations *since* it, instead of ten billion operations from the dawn of the doc. **Compaction** prunes operations already captured by a snapshot (and, for CRDTs, garbage-collects tombstones), keeping both storage growth and load latency bounded. The capacity section's relentless ~1 TB/day is exactly the pressure this answers: the log grows forever, so you continuously fold its old prefix into snapshots and discard what they already cover.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section covers how to scale the collaboration service horizontally, shard by document id, manage the WebSocket gateway fleet, and evolve the architecture as load grows.
+Don't build the global, offline-first, peer-to-peer machine on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single server holds the doc in memory; broadcast edits over websockets", "Day one; a few small docs; prove the live-editing flow", "No durability or convergence guarantee; one server caps everything; a crash loses the doc"],
+    ["One ordering authority per doc + op log + snapshots", "Edits must survive crashes and converge; real concurrency", "Operating a durable log and snapshotting; sticky routing so a doc maps to one server"],
+    ["Shard sessions across servers + pub/sub fan-out + presence channel + reconnection catch-up", "Millions of docs and connections; collaborators on different nodes; flaky networks", "Connection-tier and pub/sub to run; ephemeral presence kept off the durable path"],
+    ["Multi-region / peer-to-peer CRDT + offline-first", "Global low latency, decentralization, or rich offline editing", "CRDT metadata/tombstone overhead and compaction; harder to reason about without a single authority"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the guarantees. You start with naive in-memory broadcast just to feel the flow, then make edits **durable and convergent** with a per-document ordering authority and an op log — the point where it becomes a real product. Scaling to millions of documents means **sharding sessions** across many servers with **pub/sub** bridging cross-node collaborators, a dedicated **presence** channel, and **reconnection catch-up** for the real world's flaky networks — the architecture this tutorial designs, and where most systems should live. Only a product that needs global low latency or genuine offline-first editing reaches for **CRDT-based peer-to-peer**, accepting its metadata overhead in exchange for coordination-free convergence. Most collaborative editors are happy at "server-authoritative OT-or-CRDT, sharded by document."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section covers failure scenarios: collaboration service crashes, op-log unavailability, network partitions, and client disconnects, along with the recovery and catch-up mechanisms.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. A collaborative editor's failures are unusual because the worst ones are **silent**: a divergence bug doesn't crash anything, it just leaves two people staring at different documents, so detection and the durable log are the heart of resilience.
+
+<FailureMatrix
+  rows={[
+    { failure: "Collaboration (session) server crash", impact: "A document's live session drops; in-flight unacked edits at risk", detection: "Health checks; session heartbeat loss", mitigation: "Acknowledge only after the op log append, so acked edits are durable; rehydrate the session on another server from snapshot + op log", recovery: "Clients reconnect, catch up from the log, resume; no acked edit lost" },
+    { failure: "Websocket disconnect (client)", impact: "That editor stops receiving/sending live", detection: "Socket close / missed heartbeat", mitigation: "Client buffers local optimistic edits; on reconnect, catch up via operations?since= and replay its buffered ops", recovery: "Client converges to the latest version and goes live again" },
+    { failure: "Op-log write failure", impact: "An operation can't be made durable", detection: "Append error / quorum failure", mitigation: "Do not ack the op; the client keeps it pending and retries; never broadcast an unpersisted op as canonical", recovery: "Append succeeds on retry; op is ordered and broadcast then" },
+    { failure: "Two servers think they own one doc (split session)", impact: "Two orderings → divergence, the cardinal sin", detection: "Ownership lease conflict; duplicate version assignment", mitigation: "Single-writer lease per document; fence the old owner on failover so only one assigns versions", recovery: "One owner wins; the other steps down; reconcile from the log" },
+    { failure: "Pub/sub fan-out lag", impact: "Collaborators on other nodes see edits late", detection: "Broadcast latency; subscriber lag", mitigation: "It only delays propagation, not correctness; the op log remains canonical so catch-up fills any gap", recovery: "Lag clears or clients catch up from the log; state still converges" },
+    { failure: "Snapshot / compaction failure", impact: "Replay grows; load times degrade", detection: "Snapshot age; replay length rising", mitigation: "Retry snapshotting; the op log is still complete, so correctness is unaffected — only performance", recovery: "Snapshot catches up; replay length and storage return to baseline" },
+    { failure: "Metadata DB outage", impact: "Can't open new docs or check permissions; live sessions continue", detection: "DB health/error rate", mitigation: "Replicated, HA DB; cache document metadata and ACLs; degrade new-session reads gracefully", recovery: "Promote a replica; new sessions and permission checks resume" },
+  ]}
+/>
+
+The theme: **the op log is the safety net, and divergence is the enemy.** Because every acknowledged edit is durable in the log and the log is canonical, most failures degrade to *delay* (catch up later) rather than *loss* — a crashed session rehydrates, a dropped client reconnects and replays, fan-out lag self-heals. The one failure to design hardest against is the **split session** (two ordering authorities for one document), because that's how silent divergence happens, and it's prevented by a single-writer lease per document with fencing on failover.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares OT versus CRDTs, examines the trade-offs of different consistency models, and surveys alternative architectures including peer-to-peer sync.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Apply edits optimistically on the local replica, route each document's editors to a single collaboration server that assigns a canonical operation order and reconciles concurrency with operational transformation (or a sequence CRDT), persist every operation in an append-only op log bounded by periodic snapshots and compaction, fan out over websockets plus pub/sub, and carry ephemeral presence on a separate non-durable channel."
+  rationale="Optimistic local apply gives instant typing, which is the product, and it's exactly what creates the concurrency that OT or CRDTs then make convergent and intention-preserving. A single ordering authority per document makes the order unambiguous and convergence tractable, while sharding by document scales it horizontally with no global coordination. The op log makes edits durable and turns history and undo into replay, and keeping presence off that log keeps the durable path cheap and fast."
+  alternatives="Last-write-wins — trivial but silently destroys concurrent edits, disqualified; document/paragraph locking — correct but kills real-time collaboration; pure peer-to-peer OT — no central order makes transforms intractable; a sequence CRDT instead of OT — coordination-free and offline-friendly but pays per-element id/tombstone overhead; full state sync instead of operations — simpler protocol but enormous bandwidth for large docs."
+  revisitWhen="The product needs genuine offline-first or decentralized editing (favor CRDTs), documents become large/rich enough that operation granularity or metadata overhead matters, concurrent-editor counts per doc spike (rethinking fan-out and ordering load), or a single authoritative region no longer meets latency/residency needs."
+/>
+
+Three axes capture the real tension:
+
+- **OT vs. CRDT.** OT keeps data compact and maps cleanly to a server-authoritative order, but its transform functions are subtle and bug-prone; CRDTs make convergence coordination-free and offline-friendly at the cost of per-element id and tombstone metadata. Default to whichever your team can reason about — many modern editors pick a sequence CRDT for its simpler mental model.
+- **Server-authoritative vs. peer-to-peer.** A central ordering authority makes convergence and persistence straightforward; peer-to-peer removes the central dependency but needs CRDTs and complicates durability and history. We default server-authoritative and reach for P2P only when decentralization is a hard requirement.
+- **Snapshot cadence.** Frequent snapshots keep replay short and joins fast but cost more write work and storage churn; infrequent snapshots are cheaper but lengthen replay and recovery. Tune it to document size and how long-lived and heavily-edited the docs are.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section synthesizes the key design decisions and talking points for delivering a strong collaborative document editor answer in an interview setting.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A collaborative document editor looks like broadcasting keystrokes, but the hard part is making concurrent edits converge without losing anyone's work. Every edit is applied to the local replica instantly — typing can't wait a round trip — which means replicas drift, so I need two guarantees: convergence, all replicas end identical, and intention preservation, no edit silently lost. Naive broadcast fails because operations carry positions and concurrent edits shift them, so an op lands at the wrong index and replicas diverge. The two fixes are operational transformation, where a central server assigns a total order and transforms each op against the ones it didn't see, and CRDTs, where every character gets a unique id so operations commute and merge in any order with no central transform — OT keeps data small but the algorithm subtle, CRDTs keep the algorithm simple but pay in id and tombstone metadata. Around that, the sync layer routes all of a document's editors to one ordering server, sharded by doc id, appends every op to a durable op log that's the source of truth, snapshots and compacts it to bound replay, and fans out over websockets and pub/sub. Presence — cursors — rides a separate ephemeral channel and never touches the log. The load is fan-out and millions of persistent connections, not bytes, and the enemy is silent divergence, which a single-writer-per-doc lease prevents."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why does naive broadcast lose consistency? What does OT's transform actually do? How do CRDTs converge without a central order, and what do they cost? Why optimistic local apply? Why one ordering server per document? How does a client catch up after disconnecting? Why keep presence off the op log? Why are snapshots and compaction necessary?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section provides knowledge check questions and answers to frequently asked interview questions about collaborative document editors.
+<KnowledgeCheck
+  question="What are the two correctness guarantees a collaborative editor must provide, and which naive approach violates each?"
+  options={[
+    "Low latency and high throughput; caching violates both",
+    "Convergence (all replicas end identical) and intention preservation (no edit silently lost) — last-write-wins violates intention preservation by overwriting concurrent edits, and naive in-order broadcast violates convergence because shifting positions make replicas diverge",
+    "Durability and availability; replication violates them",
+    "Encryption and compression; neither is violated",
+  ]}
+  answer={1}
+  explanation="The design exists to deliver convergence and intention preservation. Last-write-wins keeps replicas converging but destroys the loser's edit (fails intention preservation). Naive broadcast preserves each edit but applies position-based operations against changed documents, so replicas diverge (fails convergence). OT and CRDTs are the two families that deliver both at once."
+/>
+
+<KnowledgeCheck
+  question="Why is every edit applied to the local replica before the server confirms it?"
+  options={[
+    "To reduce server load",
+    "Because typing must feel instant — waiting a network round trip per keystroke is unusable — so edits are applied optimistically and reconciled with the server's canonical order afterward; this instant local apply is also exactly what creates the concurrency OT/CRDTs must resolve",
+    "Because the server can't order edits",
+    "To avoid using websockets",
+  ]}
+  answer={1}
+  explanation="Optimistic local apply makes editing feel immediate, which is the core product experience; a round trip per character would be intolerable. The client tags each op with its base version, sends it, and reconciles when the server acks with the canonical version. The flip side is that locally-applied, in-flight edits are what make replicas concurrent — the very problem convergence algorithms solve."
+/>
+
+<KnowledgeCheck
+  question="A server orders A's 'insert at 0' before B's 'delete at 2' on the document 'hat'. How does OT keep replicas convergent?"
+  options={[
+    "It discards B's delete as a conflict",
+    "It transforms B's delete against A's insert — since an insert of length 1 to the left shifts later indices right, the delete's position becomes 3 — so the intended character is removed everywhere and all replicas converge",
+    "It locks the document until both finish",
+    "It asks the users to resolve it",
+  ]}
+  answer={1}
+  explanation="Transformation rewrites B's operation to account for A's concurrent insert that B didn't see: the inserted character pushes every later index right by one, so 'delete at 2' becomes 'delete at 3', removing the character B actually intended. Applied consistently under the server's total order, both edits take effect as intended and every replica reaches the same final text."
+/>
+
+<KnowledgeCheck
+  question="What is the fundamental trick that makes CRDT operations commute, and what does it cost?"
+  options={[
+    "Sending the full document each time; it costs bandwidth",
+    "Identifying each element by a unique, immutable, totally-ordered id (referenced by inserts and deletes) instead of by position, so operations apply in any order to the same result — at the cost of per-element id metadata and tombstones for deletes, which need compaction",
+    "Locking each character; it costs latency",
+    "Using a central server; it costs a single point of failure",
+  ]}
+  answer={1}
+  explanation="By naming elements with stable ids rather than shifting indices, CRDTs make inserts and deletes order-independent, so replicas converge without a central transform and even offline or peer-to-peer. The price is metadata: every element carries an id and ordering info, and deletes leave tombstones so concurrent references stay valid — both of which accumulate and must be garbage-collected over a document's life."
+/>
+
+<KnowledgeCheck
+  question="Why does presence (cursors/selections) travel on a separate, non-durable channel instead of the op log?"
+  options={[
+    "Because cursors are encrypted differently",
+    "Because presence is high-frequency, ephemeral, and loss-tolerant — only the current position matters and a dropped frame self-heals on the next update — so persisting and ordering it would massively inflate the op log for worthless-in-a-moment data and slow the path that must be correct (edits)",
+    "Because presence must be stored forever",
+    "Because the op log can't hold cursor data",
+  ]}
+  answer={1}
+  explanation="Cursor data is the opposite of edits: it changes constantly, has no meaningful history, and tolerates loss because the next update supersedes it. Routing it through the durable, ordered op-log pipeline would multiply log volume for ephemeral data and burden the one path that must stay exact. So presence is kept in memory, broadcast best-effort, expired on disconnect, and never persisted."
+/>
+
+<KnowledgeCheck
+  question="Why are snapshots and compaction mandatory for the op log rather than optional optimizations?"
+  options={[
+    "They encrypt old operations",
+    "Because the append-only op log grows without bound (~1 TB/day here), so without periodic snapshots a joining client or recovering server would replay the entire history; snapshots let replay start from a recent version and compaction prunes superseded operations (and CRDT tombstones), bounding both load time and storage",
+    "Because the database requires them",
+    "Because they make edits converge",
+  ]}
+  answer={1}
+  explanation="The log is the source of truth and it only grows, so replaying from the beginning becomes infeasible for long-lived documents. A snapshot materializes the document at a version so clients replay only the operations since it, and compaction discards operations already captured by a snapshot (and garbage-collects tombstones), keeping join/recovery latency and storage in check. Correctness comes from the log; performance comes from snapshotting it."
+/>
+
+<Faq
+  items={[
+    { question: "What is the single hardest part of a collaborative document editor?", answer: "Conflict-free convergence: letting many people edit the same document concurrently — with edits applied instantly and locally — yet guaranteeing every replica ends up identical (convergence) and no one's edit is silently lost (intention preservation). Almost every design decision follows from delivering those two properties, which is why operational transformation and CRDTs exist." },
+    { question: "Why can't I just broadcast each keystroke and apply it everywhere?", answer: "Because operations carry positions and concurrent edits shift them. An operation like 'delete at index 2' was created against one document state; if a concurrent insert elsewhere moved the text, applying it literally hits the wrong character, and replicas diverge permanently. You need either OT (transform the operation against the ones it didn't see) or CRDTs (identify elements by stable ids so positions don't matter)." },
+    { question: "What is operational transformation in one paragraph?", answer: "Edits are operations, a central server assigns them a total order, and when an operation is delivered to a replica that already applied concurrent operations, it's transformed — its parameters (usually position) are rewritten to account for them — so it still achieves the author's intent. With one agreed order and correct transforms, all replicas converge. OT keeps data compact but the transform functions are subtle and best run server-authoritatively." },
+    { question: "What is a CRDT and how does it differ from OT?", answer: "A conflict-free replicated data type makes operations commutative so they merge in any order. For text, each character gets a unique, totally-ordered id, and inserts/deletes reference ids instead of indices, so applying operations in any order yields the same document — no transform and no central authority required. Versus OT, CRDTs are simpler to reason about and great for offline/peer-to-peer, but they pay in per-element id and tombstone metadata that must be compacted." },
+    { question: "Why apply edits locally before the server confirms them?", answer: "Because typing has to feel instant — a round trip per character is unusable. The client applies the edit to its local replica optimistically, tags it with the version it was based on, and sends it; when the server acks with the canonical version, the client reconciles. That instant local apply is the product, and it's also what creates the concurrency that OT or CRDTs resolve." },
+    { question: "Why must all editors of a document hit the same server?", answer: "Convergence needs a single, unambiguous order for a document's operations, so one server owns that document's live session and assigns versions. The websocket gateway routes stickily by document id, and because no operation spans two documents, different documents live on different servers — the system scales horizontally with no global coordination. Pub/sub bridges the case where a document's editors are connected to different gateway nodes." },
+    { question: "What happens when a user goes offline and comes back?", answer: "The client keeps editing locally and buffers its operations. On reconnect it tells the server the last version it saw; the server replays the operations since that version from the op log, the client applies that delta, then sends its buffered operations to be ordered and merged. It converges to the latest state and resumes live. Longer offline stretches are exactly where CRDTs' order-independent merging shines." },
+    { question: "Is the document stored as text or as operations?", answer: "The source of truth is the append-only op log — the ordered sequence of every operation — and the document is the replay of that log. Periodic snapshots materialize the text at a version so you don't replay from zero. Storing operations is what makes version history and undo nearly free (replay to a point; apply an inverse), and it's why nothing is acknowledged until the operation is durably logged." },
+    { question: "Why is presence handled separately from edits?", answer: "Cursors and selections are high-frequency, ephemeral, and loss-tolerant — only the current position matters and a dropped frame self-corrects on the next update. Persisting and ordering them through the op log would inflate it enormously for data that's worthless a moment later and would slow the edit path that must be exact. So presence rides a separate, in-memory, best-effort channel and is never written to the log." },
+    { question: "Why do snapshots and compaction matter so much?", answer: "The op log grows forever — billions of tiny operations a day — so without snapshots, opening a long-lived document would mean replaying its entire history. A snapshot lets replay start from a recent version, and compaction prunes operations already folded into a snapshot (and garbage-collects CRDT tombstones), keeping load latency and storage bounded. Correctness lives in the log; snapshots and compaction keep it performant." },
+    { question: "What's the worst failure mode, and how do you prevent it?", answer: "Silent divergence — two replicas permanently disagreeing — because nothing crashes; users just see different documents. The most dangerous cause is a split session where two servers both order one document's operations. You prevent it with a single-writer lease per document and fencing on failover, so exactly one authority assigns versions. Because acked edits are durable in the op log, other failures degrade to delay (catch up later), not loss." },
+    { question: "Why is the load described as fan-out and connections rather than bandwidth?", answer: "Operations are tiny — around 100 bytes — so raw data volume is small. The cost is that every operation is rebroadcast to each collaborator (millions of inbound ops become tens of millions of outbound messages per second) and the system holds millions of persistent websocket connections open at once. So you scale by sharding connections and document sessions across servers and by routing messages efficiently, not by adding bandwidth or CPU." },
+  ]}
+/>
