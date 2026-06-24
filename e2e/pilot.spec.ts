@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(19);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(18);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -94,4 +94,16 @@ test("theme toggle switches between light and dark", async ({ page }) => {
   await expect
     .poll(() => html.evaluate((el) => el.classList.contains("dark")))
     .toBe(!initiallyDark);
+});
+
+test("learner can open the collaborative doc editor tutorial", async ({ page }) => {
+  await page.goto("/learn/collaborative-doc-editor");
+  await expect(
+    page.getByRole("heading", { name: /design a collaborative document editor/i }),
+  ).toBeVisible();
+  await page.goto("/learn/collaborative-doc-editor#crdts");
+  await expect(page.locator("#crdts")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /collaborative (document )?editor architecture/i }).first(),
+  ).toBeVisible();
 });
