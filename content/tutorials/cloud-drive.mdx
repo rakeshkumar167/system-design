@@ -1,71 +1,390 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section sets the stage for the cloud drive design interview, clarifying scope and what the interviewer is looking for.
+A cloud drive is a service that stores a user's files durably in the cloud and keeps them in sync across every device they own — the desktop folder, the phone, the web. You drag a file into a folder on your laptop and moments later it appears on your phone; you edit it on your phone and the laptop catches up; you share it with a colleague and they see your changes too. Dropbox, Google Drive, and OneDrive are the canonical examples. The payoff is that your files live everywhere and survive any single device dying. The trap is to picture the whole thing as upload-a-file, download-a-file in front of a big blob store — a glorified FTP server. That model handles the easy 10% and collapses on the hard 90%.
+
+The hard part is not storing bytes; object storage already does that cheaply and durably. The hard part is **sync** and everything it forces. Files are huge and edited constantly, so re-uploading a whole file on every keystroke-save is ruinous — you must split files into **chunks** and move only the chunks that changed (**delta sync**). The same content appears over and over — the same attachment in a thousand inboxes, the same photo across versions — so you must store each unique chunk exactly once (**content-addressed deduplication**), or your storage bill is a multiple of what it should be. Many devices must converge on one truth, so you need a **sync protocol** with a cursor and change notifications, and a way to reconcile two devices that edited the same file offline (**conflicted copies**). And underneath it all sits the defining architectural decision: file *content* is enormous and immutable and belongs in **object storage**, while file *metadata* — the folder tree, versions, permissions, and the list of chunks that make up each file — is small, mutable, and transactional, and belongs in a **separate database**. The reframe to lead with: *it looks like upload/download over a blob store, but the hard part is keeping many devices in sync — split files into chunks so you move and store only what changed, and split the system into a tiny transactional metadata plane and a massive immutable block plane.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- How big are files, and how often are they edited? This decides whether chunking and delta sync are essential (they are, at scale) or premature.
+- How many devices per user, and how fast must a change propagate — seconds or minutes? That sizes the notification path versus plain polling.
+- Do we need to merge concurrent edits to the *same* file, or is "last writer wins with a conflicted copy" acceptable? (Real-time co-editing of one document is a different problem — see the Collaborative Document Editor.)
+- How important is deduplication and version history? These shape storage and the metadata model.
+- What's the durability bar? For people's only copy of their files, it's the highest in the system.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "sync, not storage" reframe · **5 min** requirements and the durability bar · **5 min** capacity (storage at exabyte scale, dedup savings, and delta-sync bandwidth fall out here) · **5 min** entity model (the file → version → block-list → block chain) and the API · **10 min** chunking, deduplication, and delta sync — the centerpiece · **10 min** the sync protocol (cursor + notifications), metadata/block split, sharing, and conflicts · **5 min** versioning, failure modes, and wrap-up. Say your assumptions out loud — the interviewer is grading whether you reach for chunking + dedup + the metadata/block split, not whether you can name a specific object store.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** chunking and content-addressed storage, deduplication, delta sync, the sync protocol (cursor + notifications), the metadata store and namespace, sharing and permissions, and versioning and history. **Out of scope:** real-time collaborative co-editing of a single document (that's the Collaborative Document Editor — here a file is the unit and concurrent edits become *conflicted copies*, not merged operations), full-text search of file contents, thumbnail/preview generation, end-to-end encryption and key management beyond a mention, the client UI, and billing — name them so the interviewer sees the boundary, then set them aside.
 
 <h2 id="requirements">Requirements</h2>
 
-This section captures the functional and non-functional requirements for a cloud drive system at Dropbox / Google Drive scale.
+Separate what the system must *do* from how *well* it must do it. For a cloud drive the functional list is broad — store, sync, share, version — but the non-functional list is dominated by one bar above all others: **durability**. This is, for many people, the only copy of their files.
+
+<RequirementsTable
+  functional={[
+    "Upload and download files, organized in a folder namespace",
+    "Sync changes automatically across all of a user's devices",
+    "Transfer only what changed on an edit (not whole files)",
+    "Share files and folders with other users, with permissions",
+    "Keep version history and restore previous versions",
+    "Deduplicate identical content to control storage cost",
+  ]}
+  nonFunctional={[
+    { goal: "Durability", target: "extremely high (e.g. 11 nines)" },
+    { goal: "Availability", target: "99.9%+ for reads/downloads" },
+    { goal: "Sync latency", target: "seconds (change → other devices)" },
+    { goal: "Scale", target: "100s of millions of users, exabytes" },
+    { goal: "Bandwidth efficiency", target: "upload only changed chunks" },
+    { goal: "Consistency", target: "read-your-writes per device; convergent across devices" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **durability is the top bar** — losing a user's file is unforgivable in a way that a brief outage is not — which is why content lives in replicated/erasure-coded object storage and why the design is paranoid about a commit referencing a block that doesn't exist. Second, **bandwidth efficiency is a functional requirement, not a nicety**: at this scale, re-uploading whole files would cost more in network than the storage itself, so chunking and delta sync are load-bearing. Third, **convergence across devices** — every device must eventually reach the same state, and a user must see their own writes immediately on the device that made them — which is the whole job of the sync protocol. Note what's *relaxed*: cross-device propagation is allowed to take a few seconds, and concurrent edits may produce a conflicted copy rather than a clever merge. That latitude is what keeps the system tractable.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the capacity math: storage scale, metadata QPS, and how delta sync cuts upload bandwidth.
+Estimates here pin down four things: how much raw data there is (it's enormous), how much **deduplication** claws back, how busy the **metadata** plane is, and how much **delta sync** saves on the wire. We size all of it from one set of assumptions.
+
+<CloudDriveCapacity
+  assumptions={{
+    totalUsers: 500000000,
+    avgStorageGbPerUser: 10,
+    dedupRatio: 0.3,
+    dailyActiveUsers: 50000000,
+    avgDailyEditsPerActiveUser: 100,
+    avgEditBytes: 4000000,
+    deltaSyncFraction: 0.1,
+  }}
+/>
+
+The takeaways. First, **raw storage is exabyte-scale**: 500M users at 10 GB each is ~**5 EB** of data. There is no database on earth you put that in — content *must* live in **object storage** (replicated or erasure-coded blob storage), addressed not by a row id but by the hash of its bytes. Second, **deduplication is real money**: storing each unique chunk exactly once removes ~30% here, taking 5 EB down to ~**3.5 EB** — a saving of 1.5 EB that costs nothing but a hash lookup. Third, **metadata is tiny but hot**: the namespace tree, versions, and chunk lists are kilobytes per file, but at ~**58,000 commits/sec** the metadata plane is a high-QPS transactional workload that needs its own sharded store — completely different hardware from the blobs. Fourth, and the headline of the wire: if every edit re-sent the whole file, upload bandwidth would be ~**231 GB/s**; sending only the **changed chunks** cuts it ~10× to ~**23 GB/s**. Dedup shrinks what you *store*; delta sync shrinks what you *move*. Together they're the difference between a viable product and an impossible one — which is why the next sections are about chunks, not servers.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core entities — File, FileVersion, Block, Namespace, and ShareACL — and explains the metadata/block split.
+The model has a distinctive shape: a thin, mutable **metadata** layer that points into a fat, immutable **block** layer. The single most important idea is that a file's *content* is never stored as one object — it's an ordered **list of block hashes**, and the blocks themselves are content-addressed and shared.
+
+<EntityModel
+  name="File"
+  description="A named entry in a user's namespace. Its content is not stored inline — the current version points to an ordered list of content-addressed blocks. Files, versions, and blocks are separate so that history is cheap and identical content is stored once."
+  fields={[
+    { name: "file_id", type: "uuid", notes: "stable identity across renames/moves" },
+    { name: "namespace_id", type: "uuid", notes: "the owning user or shared folder (shard key)" },
+    { name: "path", type: "string", notes: "folder + name within the namespace" },
+    { name: "current_version", type: "version_id", notes: "points at the latest FileVersion" },
+    { name: "size_bytes", type: "int", notes: "of the current version, for listings/quota" },
+    { name: "is_deleted", type: "bool", notes: "tombstone; content retained for restore" },
+  ]}
+  keys="A File is identified by file_id and lives in a namespace_id (which is the shard key — a user's files and their change journal stay co-located). current_version points at an immutable FileVersion, which is an ordered list of block hashes plus author/timestamp. Each Block is keyed by the hash of its bytes (content-addressed) and stored exactly once in object storage, no matter how many files, versions, or users reference it. A ShareACL grants a principal (user or group) a permission (viewer/editor/owner) on a File or folder, with inheritance down a subtree. Renames and moves change only the File row — no blocks move."
+/>
+
+Four entities complete the picture. A **FileVersion** is an immutable snapshot of a file: an ordered list of block hashes, plus who wrote it and when. Because it's just a list of hashes, creating a version is nearly free and history costs only the metadata. A **Block** is a chunk of file content, addressed by the cryptographic hash of its bytes; it is immutable and stored once, so the same block is reused across every file, version, and user that happens to contain identical bytes — this is what makes deduplication automatic. The **Namespace** is a user's (or a shared folder's) file tree and the unit of sharding and of the change journal. And a **ShareACL** records who may access what, with permission inheritance down a folder subtree. The whole design follows from one observation: separate the mutable pointers (metadata) from the immutable bytes (blocks), and both versioning and dedup come almost for free.
 
 <h2 id="api-design">API Design</h2>
 
-This section covers the two-phase write API (block dedup check + metadata commit) and the cursor-based delta query endpoint.
+The interface reflects the metadata/block split directly: you upload **content** by hash to the block plane, then **commit** a new version to the metadata plane, and you pull changes with a **cursor**. The defining move is the **two-phase write** — first make sure the server has the bytes, then atomically publish the version that references them — which is what lets dedup and conflict detection work.
+
+<ApiContract
+  method="POST"
+  path="/blocks"
+  summary="Upload content-addressed blocks. The client first asks which hashes are missing, then uploads only those — the heart of dedup and delta sync."
+  request={`POST /blocks/probe
+{ "hashes": ["b3:9f2a…", "b3:11c8…", "b3:77de…"] }
+
+→ { "missing": ["b3:77de…"] }      // server already has the other two
+
+POST /blocks
+Content-Type: application/octet-stream
+X-Block-Hash: b3:77de…
+<raw bytes of the one missing block>`}
+  response={`HTTP/1.1 201 Created
+{ "hash": "b3:77de…", "stored": true }`}
+  statusCodes={[
+    { code: "201", meaning: "Block stored (or already present — idempotent by hash)" },
+    { code: "409", meaning: "Hash does not match the uploaded bytes — rejected" },
+    { code: "413", meaning: "Block exceeds the max chunk size" },
+  ]}
+  notes="Blocks are immutable and keyed by content hash, so uploads are idempotent and safe to retry: re-uploading a block the server already has is a no-op. The probe step means the client transfers only the chunks the server has never seen — across all users — which is how a 'new' file that's really a copy uploads in milliseconds."
+/>
+
+<ApiContract
+  method="POST"
+  path="/files/{path}/commit"
+  summary="Atomically publish a new version of a file as an ordered list of block hashes, against a known base version (for conflict detection)."
+  request={`POST /files/work/report.docx/commit
+{
+  "blocks": ["b3:9f2a…", "b3:11c8…", "b3:77de…"],
+  "base_version": "v41",
+  "size_bytes": 12000000
+}`}
+  response={`HTTP/1.1 200 OK
+{ "version": "v42", "cursor": "ns7:000912" }`}
+  statusCodes={[
+    { code: "200", meaning: "Committed — new version created, namespace cursor advanced" },
+    { code: "409", meaning: "base_version is stale — another device committed first; client resolves as a conflicted copy" },
+    { code: "422", meaning: "A referenced block hash is missing — upload it first" },
+  ]}
+  notes="The commit is the only operation that mutates metadata, and it's transactional: it validates that every referenced block exists, checks base_version to detect concurrent edits, writes the new FileVersion, and advances the namespace cursor in one step. A 409 is normal — it's how the client learns to make a conflicted copy."
+/>
+
+<ApiContract
+  method="GET"
+  path="/delta"
+  summary="Pull every change in a namespace since the client's last cursor — the engine of cross-device sync."
+  request={`GET /delta?namespace=ns7&cursor=ns7:000900`}
+  response={`HTTP/1.1 200 OK
+{
+  "changes": [
+    { "path": "work/report.docx", "version": "v42", "blocks": ["b3:9f2a…","b3:11c8…","b3:77de…"], "op": "update" },
+    { "path": "photos/old.raw", "op": "delete" }
+  ],
+  "cursor": "ns7:000912"
+}`}
+  statusCodes={[
+    { code: "200", meaning: "Returns changes after the cursor and the new cursor to store" },
+    { code: "410", meaning: "Cursor too old (journal pruned) — client must do a full re-sync" },
+  ]}
+  notes="The client stores the returned cursor and passes it next time, so each device pulls only what it hasn't seen. Paired with a notification channel (next sections), the client calls /delta on a push instead of polling, making sync near-real-time. After /delta, the client downloads any block hashes it doesn't already have locally."
+/>
+
+The whole surface is: put blocks by hash, commit a version, pull a delta by cursor. Routing content by hash gives idempotent uploads and free dedup; committing against a base version gives conflict detection; pulling by cursor gives efficient, resumable sync. Everything heavy (the bytes) flows through the block plane; everything coordinating (versions, cursors, ACLs) flows through the metadata plane.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the high-level architecture showing the client, sync gateway, metadata service, block service, and notification path.
+The architecture splits cleanly into the two planes the entity model implied: a transactional **metadata** path and a massive immutable **block** path, with a **notification** service tying devices together.
+
+<CloudDriveArchitecture />
+
+- **Client (watcher + chunker).** The desktop/mobile app. It watches a local folder, splits changed files into content-defined chunks, hashes them, probes which are missing, uploads only those, and commits a new version. It also holds the device's sync **cursor**.
+- **Sync Gateway.** The entry point: authenticates the device, routes block traffic to the block service and metadata traffic to the metadata service, and terminates the notification channel.
+- **Metadata Service → Metadata DB.** Owns the namespace tree, file versions, chunk lists, ACLs, and the per-namespace change journal/cursor. The DB is sharded by namespace and transactional — small rows, high QPS.
+- **Block Service → Block Storage.** Owns the content-addressed blocks. Block storage is the exabyte-scale object store (replicated/erasure-coded for durability). Blocks are immutable and written once per unique hash.
+- **Notification Service.** When a commit lands, it fans a lightweight "namespace X changed" signal out to the user's other connected devices (long-poll/push), so they call `/delta` immediately instead of polling.
+
+The decisive boundary is **metadata is small, mutable, and transactional; content is enormous, immutable, and content-addressed** — and they live in different stores tuned for opposite workloads. A write is two-phase: blocks go to the block plane (deduplicated by hash, only new ones transferred), then a single transactional commit publishes the version in the metadata plane and advances the cursor; the notification service wakes the other devices, which pull the delta and fetch any new blocks. Every section that follows elaborates one piece: how files become chunks and dedup (chunking), how only changes move (delta sync), how devices converge (sync protocol), how the namespace scales (metadata store), and how sharing and versions layer on top.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section walks through the four key flows: file upload, delta sync, change notification fan-out, and conflict handling.
+Four flows cover the system: uploading a new file, syncing an edit, propagating a change to another device, and resolving a conflict. The first two are the write path; the last two are how "many devices" converges.
+
+**File upload.** The client chunks and hashes the file, probes which block hashes the server is missing, uploads only those blocks, then commits a version referencing the full ordered list. A file that's really a duplicate uploads almost instantly because every block already exists.
+
+<FileUploadSequence />
+
+**Delta sync.** An existing file is edited. The client re-chunks it, diffs the new chunk list against the last-synced one, finds that only a few blocks changed, uploads just those, and commits a new version that references the unchanged blocks by hash. A one-line edit to a large document moves a few kilobytes, not the whole file.
+
+<DeltaSyncSequence />
+
+**Change notification.** A commit on one device must reach the others. The metadata service raises a change event; the notification service fans it out to the user's connected devices; each device pulls the metadata delta since its cursor, downloads any new blocks, and applies the change locally — convergence in seconds, without constant polling.
+
+<ChangeNotificationSequence />
+
+**Conflict.** Two devices edit the same file offline from the same base version. The first commit wins and becomes the new version; the second arrives with a stale base version, the metadata service detects it, and the second edit is preserved as a **conflicted copy** ("report (Device-B's conflicted copy).docx"). No edit is lost, and no clever merge is attempted — that's the deliberate boundary versus a collaborative editor.
+
+<ConflictSequence />
 
 <h2 id="chunking-dedup">Chunking & Deduplication</h2>
 
-This section explains content-defined chunking, content-addressed storage, and how deduplication removes duplicate blocks across users.
+This is the centerpiece, and the reason a cloud drive is more than a folder uploaded to a blob store. Instead of storing a file as one object, the client splits it into **chunks** (typically a few MB each), hashes each chunk, and stores blocks **addressed by that hash**. Two consequences follow immediately. **Deduplication:** if two files — or two versions, or two users — contain an identical chunk, its hash is identical, so it's stored exactly **once**; the same attachment in a thousand accounts costs one copy. **Cheap versioning and delta sync:** a file version is just a list of hashes, so an edit that touches one chunk reuses every other chunk by reference.
+
+The subtlety is *where* to cut the chunks. **Fixed-size chunking** (every 4 MB) is simple but brittle: insert a single byte at the front of a file and every subsequent boundary shifts, so every chunk's content — and hash — changes, defeating dedup entirely. **Content-defined chunking (CDC)** fixes this by choosing boundaries based on the *content* itself: a rolling hash over a sliding window declares a boundary wherever the hash hits a pattern, so a boundary "sticks" to the surrounding bytes. Insert a byte and only the one chunk around the insertion changes; every other boundary — and hash — is unchanged. CDC is what makes delta sync actually deliver: it keeps the unchanged 99% of a file addressable by the same hashes after an edit.
+
+<Callout variant="info" title="Why content-addressing makes dedup and integrity automatic">
+Addressing a block by the hash of its bytes gives three properties for free. **Dedup:** identical content has one address, so it's stored once — globally, across all users. **Idempotent uploads:** writing a block that already exists is a no-op, so retries are safe and a "new" duplicate file uploads in milliseconds (the probe finds every block present). **Integrity:** the address *is* a checksum — on download the client re-hashes and verifies the bytes, catching any corruption or tampering. The cost is a layer of indirection (a file is a list of hashes, not a contiguous object) and the need to garbage-collect blocks no version references anymore. For a system storing exabytes of often-duplicate data, that trade is overwhelmingly worth it.
+</Callout>
+
+<KnowledgeCheck
+  question="Why do cloud drives use content-defined chunking (CDC) instead of fixed-size chunks, and what does chunking enable?"
+  options={[
+    "CDC compresses the data, fixed-size does not",
+    "With fixed-size chunks, inserting one byte shifts every later boundary so every chunk's hash changes — defeating dedup and delta sync; CDC picks boundaries from the content (a rolling hash), so an edit changes only the chunk around it. Chunking + content-addressing then makes identical chunks store once (dedup) and lets an edit reuse unchanged chunks by hash (delta sync, cheap versions)",
+    "CDC encrypts each chunk with a different key",
+    "Fixed-size chunks cannot be deduplicated at all under any circumstances",
+  ]}
+  answer={1}
+  explanation="The point of chunking is to address content by hash so identical chunks are stored once and edits move only what changed. Fixed-size boundaries break under insertion: a one-byte insert re-aligns every following chunk, changing all their hashes, so nothing dedups and a whole file re-uploads. Content-defined chunking anchors boundaries to the surrounding bytes via a rolling hash, so only the chunk at the edit changes and everything else keeps its hash — which is exactly what dedup and delta sync rely on."
+/>
 
 <h2 id="delta-sync">Delta Sync</h2>
 
-This section explains how clients diff chunk lists and transfer only changed blocks, cutting upload bandwidth by approximately 10×.
+Delta sync is the direct payoff of chunking: when a file changes, transfer only the chunks that changed, not the whole file. The client re-chunks the edited file, computes each chunk's hash, and diffs the new hash list against the version it last synced. The chunks whose hashes are new are the only bytes that travel; the rest are referenced by hash in the new version. Editing one paragraph of a 50 MB document uploads a few kilobytes; the new `FileVersion` simply lists the one changed block hash alongside the dozens of unchanged ones.
+
+This is where the capacity math pays off: it's the ~10× cut from ~231 GB/s of naive whole-file upload to ~23 GB/s. And it's bidirectional — a device receiving a change downloads only the chunks it doesn't already have locally, because it, too, addresses content by hash and already holds the unchanged blocks from the previous version. Delta sync is not an optimization bolted on at the end; it's the reason the system can afford to sync constantly. It depends entirely on content-defined chunking keeping the unchanged chunks' hashes stable across an edit — which is why the previous section is its foundation.
+
+<KnowledgeCheck
+  question="How does delta sync transfer only the changed part of an edited file, and what does it depend on?"
+  options={[
+    "It diffs the raw bytes line by line and sends a patch",
+    "The client re-chunks the file and compares the new list of chunk hashes against the last-synced list; only chunks with new hashes are uploaded, and the new version references the unchanged chunks by hash. It depends on content-defined chunking keeping unchanged chunks' hashes stable across the edit",
+    "It compresses the whole file and sends it again, just smaller",
+    "It sends the whole file but resumes if interrupted",
+  ]}
+  answer={1}
+  explanation="Delta sync works at the chunk level, not the byte or whole-file level. After an edit, the client hashes the new chunks and finds which hashes are new relative to the previous version; only those blocks are sent, and the rest are reused by reference. This only works if unchanged regions still produce the same chunk hashes — which content-defined chunking guarantees by anchoring boundaries to content, so a small edit doesn't re-hash the entire file."
+/>
 
 <h2 id="sync-protocol">Sync Protocol & Notifications</h2>
 
-This section covers the cursor-based change journal, the notification channel that wakes devices, and how devices converge to a consistent state.
+Sync is how every device converges on one truth, and the mechanism is a per-namespace **change journal** with a monotonic **cursor**. Each commit appends an entry to the namespace's journal and advances the cursor; a device remembers the last cursor it processed and calls `GET /delta?cursor=…` to receive exactly the changes it hasn't seen, then stores the new cursor. This makes sync **incremental and resumable**: a device that's been offline for a week pulls the accumulated delta and catches up; a device that just synced pulls nothing. It also makes the client logic simple — there's no diffing of full trees, just "apply everything after my cursor."
+
+Polling that endpoint on a timer would work but trades latency against load: poll every 30 seconds and changes lag; poll every second and you hammer the metadata service with mostly-empty responses. So a **notification channel** sits alongside it: each device holds a long-poll or push connection, and when a commit lands the **notification service** sends a lightweight "namespace ns7 changed past cursor C" signal to that user's *other* devices, which immediately call `/delta`. The notification carries no file data — it's just a nudge to pull — so it's cheap to fan out and the metadata path stays the single source of truth. If the notification channel drops, the client falls back to periodic polling, so correctness never depends on a delivered push, only latency does.
+
+<KnowledgeCheck
+  question="Why pair a per-namespace cursor/journal with a notification channel instead of just polling for changes?"
+  options={[
+    "Notifications replace the need for any server-side change tracking",
+    "The cursor/journal lets each device pull exactly the changes after its last position (incremental, resumable), and the notification channel triggers that pull near-instantly so devices converge in seconds without constant empty polling; if a notification is missed, the client falls back to polling, so notifications affect only latency, not correctness",
+    "Polling is impossible over HTTP, so notifications are required",
+    "Notifications carry the full file contents so the cursor is unnecessary",
+  ]}
+  answer={1}
+  explanation="The journal + cursor is the correctness mechanism: it gives each device an exact, resumable position so it pulls only unseen changes and can catch up after being offline. Notifications are a latency optimization layered on top — a content-free nudge to call /delta immediately rather than waiting for the next poll. Because the client can always fall back to polling the cursor, a dropped notification only delays convergence; it never loses or corrupts a change."
+/>
 
 <h2 id="metadata-store">Metadata Store & Namespace</h2>
 
-This section describes the sharded transactional metadata store, the namespace tree, and why metadata demands a separate store from block content.
+The metadata plane is small in bytes but is the system's transactional heart: it holds the folder tree, every file's version history and chunk list, the ACLs, and each namespace's change journal — and it serves the ~58,000 commits/sec from the capacity model plus far more reads (listings, delta pulls). It needs to be a **sharded, transactional** store, and the natural shard key is the **namespace** (a user or a shared folder). Sharding by namespace keeps a user's entire tree, their versions, and their change journal **co-located on one shard**, so a commit — which validates blocks, writes a version, and advances the cursor — is a local transaction, and a `/delta` pull reads one shard's journal. Cross-namespace operations are rare; the common case stays single-shard and fast.
+
+Two operations show why this plane is separate from the blocks. **Listing a folder** is a pure metadata read — it never touches block storage — so browsing your drive is fast even though the content is exabytes away. **Moving or renaming a file or a whole folder** is a *metadata-only* operation: it rewrites path pointers in the tree and **moves zero blocks**, because blocks are addressed by content, not location. A user dragging a 10 GB folder to a new parent triggers a tiny metadata update, not a 10 GB copy. This is the quiet superpower of the metadata/block split: the expensive-looking operations (move, rename, version, share) are cheap because they only shuffle pointers, while the genuinely large thing — the bytes — sits immutable and untouched in object storage.
+
+<KnowledgeCheck
+  question="Why shard the metadata store by namespace (user/shared folder), and why are moves and renames cheap?"
+  options={[
+    "Sharding by namespace lets files be stored without any blocks",
+    "Co-locating a namespace's tree, versions, and change journal on one shard makes a commit and a delta-pull single-shard local transactions (the common case stays fast); and because blocks are content-addressed, a move/rename only rewrites path pointers in the metadata tree and moves zero block bytes",
+    "It allows storing each file on a different continent automatically",
+    "Because namespaces are small enough to fit entirely in the block store",
+  ]}
+  answer={1}
+  explanation="The namespace is the unit of locality: a user's commits, version writes, and cursor advances all touch their own tree and journal, so keeping them on one shard makes the hot path a local transaction and avoids cross-shard coordination. And since content is addressed by hash rather than by a storage path, renaming or moving a file or folder changes only the metadata pointers — the blocks never move — so an operation that looks expensive is actually tiny."
+/>
 
 <h2 id="sharing-permissions">Sharing & Permissions</h2>
 
-This section covers ACL design, shared folder semantics, link sharing, and how permission checks integrate with the sync and read paths.
+Sharing is where the namespace stops being a simple per-user tree. When Alice shares a folder with Bob, that folder must appear in Bob's drive too — pointing at the *same* underlying files, versions, and blocks — without copying anything. The clean way to model this is to make a shared folder its **own namespace** (a "mount") that can be attached into multiple users' trees: Alice and Bob both have a pointer to namespace `ns-shared`, and edits in it are journaled once and synced to everyone mounted on it. Because content is content-addressed, no bytes are duplicated when a file is shared; only an ACL and a mount point are added.
+
+Permissions are expressed as **ACLs** on a file or folder — `viewer`, `editor`, `owner` — and they **inherit** down a subtree: granting Bob `editor` on a folder gives him edit rights on everything beneath it unless a deeper entry overrides. On every access the system resolves the **effective permission** by walking from the item up to the nearest governing ACL, then authorizes the operation: a read resolves to viewer-or-above before serving block hashes; a commit requires editor-or-above. The hard parts are the usual ones for hierarchical authorization — keeping inheritance fast (cache the resolved permission per subtree), handling revocation promptly (a removed share must stop future reads), and avoiding the trap of treating sharing as a copy. Modeling a share as a mounted namespace plus an ACL keeps it a metadata operation: instant, storage-free, and consistent for every participant because they're all reading the one journal.
 
 <h2 id="versioning-history">Versioning & History</h2>
 
-This section explains the immutable FileVersion model (ordered block-hash list), version retention policy, and how history traversal works.
+Versioning falls out of the model almost for free. Because every commit creates an **immutable `FileVersion`** that is just an ordered list of block hashes, keeping history costs only the metadata of each version — the blocks are shared across versions, so an edited file's old and new versions overlap on every unchanged chunk. Restoring a previous version is therefore trivial and cheap: point `current_version` back at an older `FileVersion`; all its blocks still exist (as long as they're referenced), so nothing needs to be re-downloaded or reconstructed. The same machinery gives you point-in-time recovery, "see who changed this and when," and undo.
+
+The cost to manage is **retention and garbage collection**. Infinite history is infinite metadata and pins blocks forever, so versions are pruned by policy (keep 30 days, or the last N versions, or longer for paid tiers). Deletes are **tombstones** — the file is marked deleted and moved to trash, content retained for a recovery window — so an accidental delete is undoable; only after the window expires is the version eligible for removal. Reclaiming the underlying blocks requires **reference-counted or mark-and-sweep garbage collection**: a block can be deleted only once *no* version in *any* namespace references its hash — which, with global dedup, means a block one user "deletes" may stay alive because another user's file still contains it. GC must run carefully against live commits so it never collects a block a brand-new version just referenced. Versioning is cheap to offer and the real engineering is in safely letting go.
+
+<KnowledgeCheck
+  question="Why are version history and restore nearly free in this design, and what is the main cost to manage?"
+  options={[
+    "Because each version is a full compressed copy of the file",
+    "Because a version is just an immutable ordered list of block hashes, so versions share all unchanged blocks and restore is a metadata pointer change; the cost is retention/garbage collection — blocks can be reclaimed only when no version in any namespace references them, complicated by global dedup and tombstoned deletes",
+    "Because old versions are recomputed on demand from a diff log",
+    "Because history is stored on the client, not the server",
+  ]}
+  answer={1}
+  explanation="Versions are lists of block hashes over a shared, immutable block store, so consecutive versions overlap on every unchanged chunk and creating or restoring one only manipulates metadata — no bytes are copied. The difficulty is on the way out: with global dedup a block stays alive as long as any version anywhere references it, deletes are tombstones with a recovery window, and garbage collection must reference-count or mark-and-sweep without ever reclaiming a block a live commit just used."
+/>
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section covers sharding the metadata store, tiering block storage, adding a CDN for read acceleration, and the path from single-region to global.
+Don't build the geo-replicated, globally-deduplicated drive on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single app server + local disk/one bucket", "Prototype; a few users; whole-file upload", "No dedup or delta; storage and bandwidth blow up; no real durability"],
+    ["Object store for blocks + separate metadata DB", "Data outgrows a disk; need durability and fast listings", "Operating two stores; the two-phase write; content-addressing the blocks"],
+    ["Add chunking, dedup, delta sync + notification sync", "Bandwidth and storage costs dominate; multi-device users", "Chunker/CDC on the client; a probe step; a journal/cursor + push channel to run"],
+    ["Shard metadata by namespace; geo-replicate blocks", "100s of millions of users; global latency; durability across regions", "Cross-region replication and conflict handling; GC across shards; harder consistency"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the cost you're buying down. A single server proves the product but has no durability and re-sends whole files. Splitting into an **object store for blocks and a database for metadata** is the foundational move — it's where durability and fast metadata operations come from. Adding **chunking, dedup, delta sync, and notification-driven sync** is where the economics and the user experience actually arrive, and is where most of the design lives — it's the recommended center of gravity. Only a planet-scale product needs **namespace-sharded metadata and geo-replicated blocks**, and it pays for it in cross-region consistency and the genuine difficulty of garbage-collecting deduplicated blocks across shards and regions. Most cloud drives are well-served by "object store + sharded metadata DB, with chunk-level dedup and delta sync."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section enumerates the key failure modes — block upload partial failure, metadata store unavailability, notification lag — and the mitigations for each.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. A cloud drive's failures are dominated by one rule: **never lose a byte, and never let metadata point at a byte that isn't there.** The two planes fail differently, and the dangerous bugs live at the seam between them.
+
+<FailureMatrix
+  rows={[
+    { failure: "Block storage loses/corrupts a block", impact: "A version can't be reconstructed — data loss, the cardinal sin", detection: "Re-hash on read mismatches; durability scrubber", mitigation: "Replicate or erasure-code blocks across AZs; periodic integrity scrub; content-hash verification on every read", recovery: "Rebuild from another replica/parity; alert if unrecoverable" },
+    { failure: "Half-committed upload (blocks up, commit failed)", impact: "Orphaned blocks; no visible version (safe but wasteful)", detection: "Blocks with no referencing version after a TTL", mitigation: "Two-phase write commits metadata last and atomically; uploads are idempotent and retryable by hash", recovery: "Client retries the commit; GC sweeps orphaned blocks later" },
+    { failure: "Commit references a missing block", impact: "Version would be unreadable", detection: "Commit-time validation that every hash exists", mitigation: "Reject the commit (422) until the block is uploaded; never publish a dangling version", recovery: "Client uploads the missing block and re-commits" },
+    { failure: "Concurrent offline edits (conflict)", impact: "Risk of a lost update", detection: "Stale base_version at commit (409)", mitigation: "Keep the first commit; preserve the loser as a conflicted copy; never silently overwrite", recovery: "User reconciles the two copies manually" },
+    { failure: "Metadata DB shard outage", impact: "That namespace can't commit or list", detection: "Shard health checks; commit error rate", mitigation: "Replicated shards with failover; reads from replicas; client queues commits locally and retries", recovery: "Failover to replica; queued commits drain on recovery" },
+    { failure: "Notification channel down", impact: "Changes propagate slowly, not lost", detection: "Heartbeat on the push connection", mitigation: "Client falls back to periodic /delta polling; cursor guarantees nothing is missed", recovery: "Reconnect resumes push; no data action needed" },
+    { failure: "Garbage collector reclaims a referenced block", impact: "Silent data loss if mis-counted", detection: "Reference-count audits; pre-delete recheck", mitigation: "Conservative GC: recheck references against live commits before delete; grace period; never collect recently-referenced hashes", recovery: "Restore from replica if still available; tighten GC safety margin" },
+  ]}
+/>
+
+The theme: **the block plane must never lose or corrupt content, and the metadata plane must never publish a version that points at content the block plane doesn't have.** Durability is bought with replication/erasure coding and integrity scrubbing; the two-phase write (blocks first, atomic commit last, with block-existence validation) keeps the seam safe — a crash leaves harmless orphaned blocks, never a dangling version. Conflicts degrade to a preserved conflicted copy rather than a lost update, the notification channel is allowed to fail because the cursor makes it non-authoritative, and the most subtle danger — GC over a deduplicated store — is handled by conservative reference counting that errs toward keeping a block. Losing a file is the one failure with no acceptable mitigation, so every design choice bends toward never doing it.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares key design decisions: content-defined vs. fixed-size chunking, OT/CRDT for text vs. conflicted-copy for binary, and sync-pull vs. push models.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Split the system into a transactional metadata plane (namespace tree, immutable FileVersions as ordered block-hash lists, ACLs, per-namespace change journal/cursor) and a content-addressed block plane in exabyte-scale object storage; chunk files with content-defined chunking and deduplicate blocks globally; sync edits with delta sync (upload only changed chunks) and converge devices via a cursor + a notification channel; resolve concurrent offline edits as conflicted copies; and offer near-free versioning from the immutable block-list model."
+  rationale="The metadata/block split lets each plane be tuned for opposite workloads — tiny transactional rows vs. huge immutable blobs — and makes moves, renames, shares, and versions cheap metadata operations. Content-defined chunking plus content-addressing make dedup and delta sync automatic, cutting storage ~30% and upload bandwidth ~10× — the difference between viable and impossible at exabyte scale. A cursor/journal gives correct, resumable convergence; notifications make it fast without making it fragile. Conflicted copies keep the system simple and lossless where true merge isn't required."
+  alternatives="Store each file as one blob — simple but no dedup, no delta sync, ruinous bandwidth, disqualified at scale; fixed-size chunking — simpler than CDC but breaks dedup on insertion; poll-only sync — works but trades latency for load and empty requests; operational/CRDT merge of concurrent edits — needed for live co-editing but far more complex than conflicted copies for a file-granular drive; per-user (not global) dedup — simpler GC but forgoes the largest dedup savings; one combined store for metadata and blocks — simpler to operate but can't scale the two opposite workloads independently."
+  revisitWhen="Files become tiny and numerous (chunking overhead may dominate — consider packing small files), workloads demand real-time co-editing (move to OT/CRDT for those document types), regulatory/residency rules force regional isolation (constrains global dedup and geo-replication), or dedup's GC cost across shards outweighs its savings (consider scoping dedup per namespace)."
+/>
+
+Three axes capture the real tension:
+
+- **Content-defined vs. fixed chunking.** Fixed is trivial but loses dedup the instant bytes are inserted; CDC costs a rolling-hash pass but keeps unchanged chunks stable across edits, which is what makes delta sync real. For a sync product, CDC is non-negotiable.
+- **Conflicted copies vs. operational merge.** Merging concurrent edits (OT/CRDT) is magical for a shared document but heavy, and it assumes a mergeable data type. A general file drive holds opaque bytes (a video, a binary), so a conflicted copy — lossless and simple — is the right default; reserve true merge for the editor problem.
+- **Global vs. per-user dedup.** Global dedup maximizes savings (one copy of a viral attachment for the whole platform) but complicates garbage collection and raises privacy questions; per-user dedup is simpler and isolates GC but stores popular content many times. Most start global within a trust/region boundary and scope it where compliance demands.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section distills the 60-second interview answer covering the metadata/block split, dedup, delta sync, and the cursor + notification sync protocol.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A cloud drive looks like upload/download over a blob store, but the hard part is sync across many devices. The defining decision is to split the system into two planes: a small, transactional metadata store — the folder tree, immutable file versions, ACLs, and a per-namespace change journal — and a massive, immutable, content-addressed block store in object storage for the actual bytes. Files are chunked with content-defined chunking and each unique chunk is hashed and stored once, which gives global deduplication; at 500 million users and 10 GB each that's 5 exabytes of raw data cut to about 3.5 with dedup. Writes are two-phase: the client probes which chunk hashes the server is missing, uploads only those, then commits a new version — an ordered list of block hashes — against a known base version. Editing a big file uploads only the changed chunks, so delta sync cuts upload bandwidth roughly tenfold. Devices converge with a cursor: each pulls the metadata delta since its last position and downloads any new blocks, and a notification channel triggers that pull in seconds instead of polling — but the cursor is authoritative, so a dropped notification only adds latency. Concurrent offline edits are detected by the stale base version and preserved as conflicted copies, not merged. Versioning is nearly free because a version is just a block-hash list, so old and new versions share unchanged chunks; the real work is garbage-collecting blocks no version references anymore. The cardinal rule throughout is durability: never lose a byte, and never let a commit publish a version that points at a block the store doesn't have."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why split metadata from blocks? Why content-defined chunking over fixed-size? How does dedup actually work and where's the GC risk? How does delta sync know what changed? How do devices stay in sync, and what does the cursor guarantee? What happens on a conflict — and why not merge? How is sharing modeled without copying? How is versioning so cheap?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section tests understanding with knowledge checks and answers the most common interview follow-up questions about cloud drive design.
+<KnowledgeCheck
+  question="What is the single most important architectural decision in a cloud drive design?"
+  options={[
+    "Choosing the right database vendor for everything",
+    "Splitting the system into a small transactional metadata plane (namespace tree, immutable versions, ACLs, change journal) and a massive immutable content-addressed block plane in object storage — so each is tuned for opposite workloads and moves/renames/shares/versions become cheap metadata operations",
+    "Putting every file through a CDN",
+    "Storing each file as a single encrypted blob",
+  ]}
+  answer={1}
+  explanation="The metadata/block split is the spine of the design. Metadata is tiny, mutable, and transactional; content is enormous, immutable, and best addressed by hash. Separating them lets each scale on its own terms and makes the expensive-looking operations — move, rename, share, version — cheap, because they only manipulate pointers while the bytes sit untouched in object storage."
+/>
+
+<KnowledgeCheck
+  question="A user shares a 10 GB folder with three colleagues. How much data is copied, and why?"
+  options={[
+    "30 GB — one copy per colleague",
+    "Essentially none — sharing is modeled as a mounted namespace plus ACL entries, and because blocks are content-addressed, all participants reference the same files, versions, and blocks; only metadata (a mount point and permissions) is added",
+    "10 GB — one shared copy is made",
+    "It depends on the colleagues' upload speed",
+  ]}
+  answer={1}
+  explanation="Sharing must not copy content. Treating a shared folder as its own namespace that can be mounted into multiple users' trees, combined with content-addressed blocks, means everyone reads the same underlying data through the same change journal. The only thing created is metadata: a mount and ACL entries, with permissions inheriting down the subtree."
+/>
+
+<Faq
+  items={[
+    { question: "What is a cloud drive and what makes it hard?", answer: "It's a service that stores your files durably in the cloud and keeps them synced across all your devices, with sharing and version history. The hard part isn't storing bytes — object storage does that — it's sync: moving only what changed (delta sync), storing identical content once (dedup), converging many devices on one truth (a cursor + notifications), and splitting a tiny transactional metadata plane from a massive immutable block plane." },
+    { question: "Why split metadata from file content?", answer: "Because they have opposite characteristics. Metadata — the folder tree, file versions, chunk lists, ACLs — is small, mutable, and transactional, and runs at high QPS; content is enormous, immutable, and write-once. Putting metadata in a sharded transactional database and content in content-addressed object storage lets each scale independently and makes moves, renames, shares, and version restores cheap metadata-only operations that move no bytes." },
+    { question: "How does deduplication work?", answer: "Files are split into chunks, each chunk is hashed, and blocks are stored addressed by that hash. Identical content produces an identical hash, so it's stored exactly once no matter how many files, versions, or users contain it — the same email attachment across a thousand accounts costs one copy. Uploads are idempotent (writing an existing block is a no-op) and the hash doubles as an integrity check on read." },
+    { question: "What is content-defined chunking and why not fixed-size chunks?", answer: "Content-defined chunking (CDC) chooses chunk boundaries based on the content itself via a rolling hash, so a boundary sticks to its surrounding bytes. With fixed-size chunks, inserting one byte shifts every later boundary and changes every chunk's hash, destroying dedup and forcing a full re-upload. CDC means an edit changes only the chunk around it, keeping every other chunk's hash stable — which is what makes dedup and delta sync actually work." },
+    { question: "How does delta sync transfer only the changes?", answer: "On an edit, the client re-chunks the file, hashes the chunks, and diffs the new hash list against the last-synced version. Only chunks with new hashes are uploaded; the new file version references the unchanged chunks by hash. Editing one paragraph of a large document moves a few kilobytes, not the whole file. It depends on content-defined chunking keeping unchanged chunks' hashes stable." },
+    { question: "How do a user's devices stay in sync?", answer: "Each namespace has a change journal and a monotonic cursor. A device remembers the last cursor it processed and calls GET /delta?cursor= to get exactly the changes it hasn't seen, then downloads any new blocks and stores the new cursor. This is incremental and resumable — an offline device catches up by pulling the accumulated delta. A notification channel nudges devices to pull immediately so convergence happens in seconds." },
+    { question: "Why have notifications if the cursor already works?", answer: "The cursor/journal is the correctness mechanism; notifications are a latency optimization. Polling the cursor on a timer is correct but trades lag against load. A push/long-poll channel sends a content-free 'this namespace changed' nudge so devices call /delta right away. If a notification is missed, the client falls back to polling, so notifications affect only how fast changes propagate, never whether they're seen." },
+    { question: "What happens when two devices edit the same file offline?", answer: "Each commit carries the base version it was made against. The first to reach the server wins and becomes the new version; the second arrives with a stale base version, the metadata service detects the conflict (a 409), and the second edit is preserved as a conflicted copy (e.g. 'report (Device-B's conflicted copy).docx'). No edit is lost, and no automatic merge is attempted — that's the deliberate boundary versus a collaborative editor." },
+    { question: "Why not merge concurrent edits like Google Docs?", answer: "Real-time merging needs operational transformation or CRDTs and assumes a mergeable, structured data type — it's the Collaborative Document Editor problem. A general file drive stores opaque bytes (videos, binaries, arbitrary formats) that can't be meaningfully merged, so a lossless conflicted copy is the right, simple default. You'd reserve true merge for specific document types layered on top." },
+    { question: "How is version history so cheap to keep?", answer: "A version is just an immutable ordered list of block hashes over a shared block store, so consecutive versions overlap on every unchanged chunk — keeping history costs only the small per-version metadata, not another copy of the file. Restoring a version is a pointer change back to an older FileVersion whose blocks still exist. The real cost is retention and garbage collection, not storing the versions." },
+    { question: "When can a block actually be deleted?", answer: "Only when no version in any namespace references its hash. With global deduplication a block one user 'deletes' may still be alive because another user's file contains the same content, so reclamation uses reference counting or mark-and-sweep garbage collection. Deletes are tombstones with a recovery window first, and GC must recheck references against live commits before removing anything, erring toward keeping a block to avoid data loss." },
+    { question: "How is durability guaranteed?", answer: "Content lives in object storage replicated or erasure-coded across availability zones, with periodic integrity scrubbing and content-hash verification on every read to catch corruption. The two-phase write keeps the metadata/block seam safe: blocks are uploaded first and a commit is validated to reference only existing blocks, so a crash leaves harmless orphaned blocks rather than a version pointing at missing content. Losing a file is the one failure with no acceptable mitigation, so every choice bends toward never doing it." },
+    { question: "When is a cloud drive the wrong tool?", answer: "When you actually need real-time multi-user co-editing of one document (use a collaborative editor with OT/CRDTs), when files are enormous and streamed rather than synced (a video platform's pipeline fits better), or when the dataset is small and single-device, where the chunking, dedup, and sync machinery is complexity you don't need. A cloud drive shines for durable, shareable, multi-device file storage where moving only changed chunks and storing duplicates once are the dominant concerns." },
+  ]}
+/>
