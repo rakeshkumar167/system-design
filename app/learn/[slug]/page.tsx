@@ -9,6 +9,7 @@ import PastebinContent from "@/content/tutorials/pastebin.mdx";
 import NotificationServiceContent from "@/content/tutorials/notification-service.mdx";
 import TicketBookingContent from "@/content/tutorials/ticket-booking.mdx";
 import VideoStreamingContent from "@/content/tutorials/video-streaming.mdx";
+import CollaborativeDocEditorContent from "@/content/tutorials/collaborative-doc-editor.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -18,6 +19,7 @@ const content: Record<string, ComponentType> = {
   "notification-service": NotificationServiceContent,
   "ticket-booking": TicketBookingContent,
   "video-streaming": VideoStreamingContent,
+  "collaborative-doc-editor": CollaborativeDocEditorContent,
 };
 
 export function generateStaticParams() {

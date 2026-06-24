@@ -222,7 +222,7 @@ export const problems: readonly Problem[] = [
       "Enable real-time multi-user editing with conflict-free convergence via OT or CRDTs.",
     difficulty: "Advanced",
     concepts: ["CRDT / OT", "Real-time sync", "Conflict-free merge", "Presence"],
-    status: "coming-soon",
+    status: "available",
     sequence: 22,
   },
   {

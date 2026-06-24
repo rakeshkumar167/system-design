@@ -180,6 +180,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "collaborative-doc-editor": {
+    slug: "collaborative-doc-editor",
+    title: "Design a Collaborative Document Editor",
+    description:
+      "An interview-grade walkthrough of a real-time collaborative document editor: concurrent editing without lost updates, operational transformation versus CRDTs, the real-time websocket sync protocol with optimistic local apply, presence and awareness, op-log persistence and history, scaling, and failure modes.",
+    difficulty: "Advanced",
+    readingMinutes: 36,
+    concepts: ["CRDT / OT", "Real-time sync", "Conflict-free merge", "Presence"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "concurrent-editing", label: "The Concurrent-Editing Problem", depth: "advanced" },
+      { id: "operational-transformation", label: "Operational Transformation", depth: "advanced" },
+      { id: "crdts", label: "Conflict-Free Replicated Data Types", depth: "advanced" },
+      { id: "realtime-sync", label: "Real-Time Sync", depth: "advanced" },
+      { id: "presence-awareness", label: "Presence & Awareness", depth: "advanced" },
+      { id: "persistence-history", label: "Persistence & History", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

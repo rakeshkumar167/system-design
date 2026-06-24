@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section introduces the collaborative document editor problem and sets the stage for the interview discussion.
+
+<h2 id="requirements">Requirements</h2>
+
+This section covers the functional and non-functional requirements for a real-time collaborative document editor.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the capacity math: concurrent editors, operations per second, fan-out load, and op-log storage growth.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core entities: Document, Operation, Snapshot, and Presence, along with their relationships and storage implications.
+
+<h2 id="api-design">API Design</h2>
+
+This section covers the REST and WebSocket APIs for creating documents, connecting to editing sessions, and catching up on missed operations.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the high-level architecture: editor clients, WebSocket gateway, collaboration service, op log, snapshot store, pub/sub, presence service, and metadata database.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section walks through the four key operational flows: edit broadcast, conflict resolution, presence updates, and reconnect/catch-up sync.
+
+<h2 id="concurrent-editing">The Concurrent-Editing Problem</h2>
+
+This section explains why naive approaches like last-write-wins and distributed locks fail for concurrent editing, and defines the core invariants of convergence and intention preservation.
+
+<h2 id="operational-transformation">Operational Transformation</h2>
+
+This section explains how operational transformation works: representing edits as operations, assigning server-side ordering, and transforming concurrent operations so all replicas converge to the same result.
+
+<h2 id="crdts">Conflict-Free Replicated Data Types</h2>
+
+This section explains CRDTs as an alternative to OT: commutative operations with unique identifiers that merge automatically without central coordination.
+
+<h2 id="realtime-sync">Real-Time Sync</h2>
+
+This section covers the WebSocket-based real-time sync protocol: optimistic local apply, server acknowledgment, sequence numbers, and the fan-out broadcast mechanism.
+
+<h2 id="presence-awareness">Presence & Awareness</h2>
+
+This section covers the presence and awareness layer: cursor positions, user lists, ephemeral state propagation, and why presence is kept separate from the durable op log.
+
+<h2 id="persistence-history">Persistence & History</h2>
+
+This section covers op-log persistence, periodic snapshots, log compaction, and how the combination keeps storage bounded while enabling full document history.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section covers how to scale the collaboration service horizontally, shard by document id, manage the WebSocket gateway fleet, and evolve the architecture as load grows.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section covers failure scenarios: collaboration service crashes, op-log unavailability, network partitions, and client disconnects, along with the recovery and catch-up mechanisms.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares OT versus CRDTs, examines the trade-offs of different consistency models, and surveys alternative architectures including peer-to-peer sync.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section synthesizes the key design decisions and talking points for delivering a strong collaborative document editor answer in an interview setting.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section provides knowledge check questions and answers to frequently asked interview questions about collaborative document editors.
