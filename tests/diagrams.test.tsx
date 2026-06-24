@@ -1,6 +1,13 @@
 import { render, screen } from "@testing-library/react";
 import { describe, it, expect } from "vitest";
 import { VideoStreamingArchitecture } from "@/components/diagrams/video-streaming-architecture";
+import { CollaborativeDocEditorArchitecture } from "@/components/diagrams/collaborative-doc-editor-architecture";
+import {
+  EditBroadcastSequence,
+  ConflictResolutionSequence,
+  PresenceSequence,
+  ReconnectSyncSequence,
+} from "@/components/diagrams/collab-editor-flows";
 import {
   UploadIngestSequence,
   TranscodePipelineSequence,
@@ -170,5 +177,28 @@ describe("streaming flow sequences", () => {
     expect(screen.getByRole("img", { name: /playback|adaptive|stream/i })).toBeInTheDocument();
     render(<CdnDeliverySequence />);
     expect(screen.getByRole("img", { name: /cdn|delivery|cache/i })).toBeInTheDocument();
+  });
+});
+
+describe("CollaborativeDocEditorArchitecture", () => {
+  it("exposes the collaborative editor architecture to non-visual readers", () => {
+    render(<CollaborativeDocEditorArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /collaborative (document )?editor architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/converge/i)).toBeInTheDocument();
+  });
+});
+
+describe("collaborative editor flow sequences", () => {
+  it("renders the edit, conflict, presence, and reconnect sequences", () => {
+    render(<EditBroadcastSequence />);
+    expect(screen.getByRole("img", { name: /edit|broadcast/i })).toBeInTheDocument();
+    render(<ConflictResolutionSequence />);
+    expect(screen.getByRole("img", { name: /conflict|transform|converge/i })).toBeInTheDocument();
+    render(<PresenceSequence />);
+    expect(screen.getByRole("img", { name: /presence|cursor/i })).toBeInTheDocument();
+    render(<ReconnectSyncSequence />);
+    expect(screen.getByRole("img", { name: /reconnect|sync|catch/i })).toBeInTheDocument();
   });
 });

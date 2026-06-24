@@ -59,6 +59,13 @@ import {
   AbrPlaybackSequence,
   CdnDeliverySequence,
 } from "@/components/diagrams/streaming-flows";
+import { CollaborativeDocEditorArchitecture } from "@/components/diagrams/collaborative-doc-editor-architecture";
+import {
+  EditBroadcastSequence,
+  ConflictResolutionSequence,
+  PresenceSequence,
+  ReconnectSyncSequence,
+} from "@/components/diagrams/collab-editor-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -115,6 +122,11 @@ const teachingComponents = {
   TranscodePipelineSequence,
   AbrPlaybackSequence,
   CdnDeliverySequence,
+  CollaborativeDocEditorArchitecture,
+  EditBroadcastSequence,
+  ConflictResolutionSequence,
+  PresenceSequence,
+  ReconnectSyncSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
