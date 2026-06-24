@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(18);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(17);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -105,5 +105,17 @@ test("learner can open the collaborative doc editor tutorial", async ({ page }) 
   await expect(page.locator("#crdts")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /collaborative (document )?editor architecture/i }).first(),
+  ).toBeVisible();
+});
+
+test("learner can open the distributed cache tutorial", async ({ page }) => {
+  await page.goto("/learn/distributed-cache");
+  await expect(
+    page.getByRole("heading", { name: /design a distributed cache/i }),
+  ).toBeVisible();
+  await page.goto("/learn/distributed-cache#consistent-hashing");
+  await expect(page.locator("#consistent-hashing")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /distributed cache architecture/i }).first(),
   ).toBeVisible();
 });
