@@ -1,71 +1,418 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section sets the stage for the video streaming platform interview, clarifying scope, stakeholders, and the asymmetric read/write nature of the system.
+A video streaming platform takes a file a creator uploads, turns it into something that plays smoothly on any screen and any network on Earth, and serves it to millions of people at once. A user picks a video and it starts in a second or two and never stutters; behind that simple experience are two systems with opposite personalities bolted together. The trap is to treat this as upload-and-playback CRUD — store the file, hand it back on request. The real problem is that **the ingest side and the delivery side could not be more different**, and the whole design is about building each correctly and connecting them through a seam.
+
+On ingest, a single uploaded file is useless as-is: a phone can't smoothly play a 4K source over a weak connection, and a TV shouldn't be served a tiny low-res copy. So the platform **transcodes** every upload into a ladder of bitrates and resolutions, chops each into small segments, and writes a manifest — a slow, compute-heavy, *asynchronous* batch job that can take minutes per video. On delivery, those segments are read back at enormous scale and tight latency: peak egress is tens of terabits per second, which no origin can serve, so a **CDN** carries essentially all of it and the game becomes cache hit ratio. The reframe to lead with: *it looks like upload and playback, but the hard part is an asymmetric pipeline — an expensive async transcode fan-out feeding a CDN-dominated read path — plus adaptive bitrate streaming as the protocol that lets a client glide between qualities without rebuffering.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- Video-on-demand (uploaded, then watched later) or live streaming? They share the delivery half but ingest is completely different — pin this first.
+- How fast must playback start, and how much rebuffering is acceptable? (Startup latency and rebuffer ratio are the playback SLOs.)
+- What's the catalogue and audience scale — thousands of creators, or a billion-hour-a-day platform?
+- How skewed is popularity? A few viral titles plus a long cold tail changes the caching story.
+- What devices and networks must we serve? (That decides how many rungs the bitrate ladder needs.)
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the asymmetric-pipeline reframe · **5 min** requirements and the playback SLOs · **5 min** capacity (the storage explosion and the egress number fall out here) · **5 min** entity model and the upload/status API · **10 min** the transcoding pipeline and adaptive bitrate streaming — the centerpiece · **10 min** CDN delivery, storage/cost, and failure modes · **5 min** security/DRM and wrap-up. Say your assumptions out loud — the interviewer is grading whether you recognize that transcoding is an async fan-out and delivery is a CDN/caching problem, and whether you can explain how ABR keeps playback smooth, not whether you know a codec's flags.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** resumable upload and ingestion, the asynchronous transcoding pipeline (the rendition ladder, segmentation, parallelism), adaptive bitrate streaming (HLS/DASH manifests and segments), CDN delivery and caching, storage growth and cost, scaling, failure modes, and security/DRM. **Out of scope:** live and low-latency streaming (we design VOD and mention live as an evolution), recommendation and ranking, video codec internals, the player UI, social features, and ads — name them so the interviewer sees the boundary, then set them aside.
 
 <h2 id="requirements">Requirements</h2>
 
-This section captures the functional and non-functional requirements that bound the design, distinguishing upload and playback SLAs.
+Separate what the system must *do* from how *well* it must do it. For streaming, the non-functional list is dominated not by a correctness invariant but by an **experience** target — playback must start fast and never stutter — and by a brutal **scale** reality on delivery bandwidth.
+
+<RequirementsTable
+  functional={[
+    "Upload a video (resumably, over flaky networks)",
+    "Transcode each upload into multiple bitrates and resolutions",
+    "Stream adaptively to any device, switching quality to match bandwidth",
+    "Seek and resume playback at any point",
+    "Expose processing status (transcoding → ready / failed)",
+    "Serve a global catalogue at low latency",
+  ]}
+  nonFunctional={[
+    { goal: "Playback startup (p95)", target: "< 2 s" },
+    { goal: "Rebuffer ratio", target: "< 0.5% of watch time" },
+    { goal: "Delivery", target: "global, CDN-served" },
+    { goal: "Source durability", target: "11 nines (object storage)" },
+    { goal: "Ingest throughput", target: "keeps pace with uploads (no growing backlog)" },
+    { goal: "Availability (playback)", target: "99.95%" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **smooth playback** — fast startup and a near-zero rebuffer ratio — is the product; it's why playback is adaptive (the client drops to a lower rendition rather than freeze) and why segments are small (so quality can change every few seconds). Second, **delivery is global and CDN-served**: at tens of Tbps of peak egress, you physically cannot serve from an origin, so the CDN and its cache hit ratio are first-class requirements, not an afterthought. Third, **ingest must keep pace**: transcoding is expensive and asynchronous, and if the fleet can't drain the upload queue, a backlog grows without bound and videos take hours to go live — so throughput, autoscaling, and graceful shedding matter on the ingest side the way latency matters on the delivery side.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the storage, bandwidth, and compute numbers that reveal why transcoding and CDN delivery are the dominant cost and scaling concerns.
+Estimates here tell the asymmetric-pipeline story in numbers: ingest is steady, storage explodes because one source becomes many renditions, and delivery bandwidth is so large it's only tractable as a CDN problem. We size all of it from one set of assumptions.
+
+<VideoStreamingCapacity
+  assumptions={{
+    uploadsPerDay: 500000,
+    avgVideoMinutes: 10,
+    renditionCount: 5,
+    mbPerMinutePerRendition: 12,
+    peakConcurrentStreams: 5000000,
+    streamBitrateMbps: 5,
+    cdnHitRatio: 0.95,
+  }}
+/>
+
+The takeaways. First, **ingest is steady but real**: ~83,000 hours of source video arrive per day, and the transcode fleet has to chew through every hour of it (several times over, once per rung of the ladder) or a backlog forms — ingest capacity is sized against this, not against a spike. Second, **storage multiplies**: one source becomes a *ladder* of renditions, so a 10-minute upload lands as ~0.6 GB across five renditions, and the platform adds ~**300 TB every day** — storage grows relentlessly and forever, which is why tiering and garbage-collecting failed transcodes matter. Third, and most important, **delivery is a CDN problem**: peak egress is **25 Tbps**, a number no origin can serve; with a 95% CDN cache hit ratio the origin sees only ~**1.25 Tbps**, the missed 5%. That last ratio is the whole delivery game — push the hit ratio from 95% to 98% and you've nearly halved origin load. Cheap, replicable renditions and a cache-dominated read path are exactly the inverse of Ticket Booking's precious, strongly-consistent write.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core data entities — Video, Rendition, Segment, and Manifest — and how they relate to one another in the data store.
+The model centers on the **Video** as the unit a creator uploads and a viewer plays, with its `status` tracking the upload's journey through the async pipeline. The crucial idea is that the uploaded source is the durable record, and everything the player actually streams — renditions, segments, manifests — is *derived* from it and can be regenerated.
+
+<EntityModel
+  name="Video"
+  description="One row per uploaded title — the thing a creator owns and a viewer plays. Its status reflects where it is in the asynchronous pipeline, and its source_key points at the durable original that every rendition is derived from."
+  fields={[
+    { name: "id", type: "string (PK)", notes: "stable video id, e.g. 'vid_8c2'" },
+    { name: "uploader_id", type: "string", notes: "the creator who owns it" },
+    { name: "title", type: "string", notes: "human title / metadata" },
+    { name: "status", type: "enum", notes: "uploaded | transcoding | ready | failed" },
+    { name: "duration_s", type: "int", notes: "source length in seconds" },
+    { name: "source_key", type: "string", notes: "object-storage key of the durable original" },
+    { name: "manifest_key", type: "string | null", notes: "master manifest, set only when ready" },
+    { name: "created_at", type: "timestamp", notes: "upload time" },
+  ]}
+  keys="The primary key is the video id; videos are listed by (uploader_id, created_at). status drives the UI and gates playback — a video is only playable when it reaches 'ready', i.e. its full manifest exists. The source_key is the system of record; renditions and segments are derived artifacts and could be rebuilt by re-running transcode."
+/>
+
+Three derived entities complete the picture. A **Rendition** is one rung of the ladder for a video (video_id, resolution, bitrate, codec, and the key of its media playlist) — a 240p, 480p, 720p, 1080p, and 4K copy might all exist. A **Segment** is a few-second chunk of one rendition's media, stored as an immutable object — these are the files the player actually downloads, and their immutability is what makes them cache forever. The **manifest** ties it together: a *master* manifest lists the renditions and their bandwidths, and each rendition has a *media* manifest (an ordered list of its segment URLs). Keeping the source separate from these derived artifacts is what lets you re-transcode (a new codec, an extra rung) without ever asking the creator to re-upload.
 
 <h2 id="api-design">API Design</h2>
 
-This section presents the minimal API surface: the resumable upload initiation endpoint, the video status endpoint, and the CDN-served manifest and segment paths.
+The write path is deliberately thin: the API creates a video record and hands back a place to upload bytes, then gets out of the byte path entirely. The heavy work happens asynchronously, so the defining response on create is **202 Accepted** — "we took it, come back for status" — not a synchronous result.
+
+<ApiContract
+  method="POST"
+  path="/v1/videos"
+  summary="Register a new video and get a resumable upload URL. Returns immediately; transcoding happens asynchronously."
+  request={`POST /v1/videos
+
+{
+  "title": "Trail run, Marin",
+  "uploader_id": "u_42",
+  "duration_s": 600
+}`}
+  response={`HTTP/1.1 202 Accepted
+
+{
+  "video_id": "vid_8c2",
+  "upload_url": "https://uploads.example.com/vid_8c2?token=…",
+  "status": "uploaded"
+}`}
+  statusCodes={[
+    { code: "202", meaning: "Video registered; PUT the file to upload_url, then poll status" },
+    { code: "400", meaning: "Malformed request" },
+    { code: "401", meaning: "Not authenticated" },
+    { code: "413", meaning: "Declared size exceeds the per-upload limit" },
+  ]}
+  notes="The client uploads bytes directly to object storage via the presigned upload_url — resumably, in chunks — so the API never sits in the byte path. When the upload finalizes, a transcode job is enqueued and status moves uploaded → transcoding. The endpoint returns 202 because the video is not yet playable; the work is asynchronous."
+/>
+
+<ApiContract
+  method="GET"
+  path="/v1/videos/{id}"
+  summary="Fetch a video's processing status and, once ready, the playback manifest URL."
+  request={`GET /v1/videos/vid_8c2`}
+  response={`HTTP/1.1 200 OK
+
+{
+  "video_id": "vid_8c2",
+  "status": "ready",
+  "manifest_url": "https://cdn.example.com/vid_8c2/master.m3u8"
+}`}
+  statusCodes={[
+    { code: "200", meaning: "Returns status; manifest_url present only when status is 'ready'" },
+    { code: "404", meaning: "Unknown video" },
+  ]}
+  notes="Clients poll (or subscribe via webhook) until status is 'ready', then start playback from manifest_url. A 'failed' status means transcoding could not complete (corrupt source, unsupported format) and surfaces an actionable error."
+/>
+
+The **playback path is not an API call at all** in the hot sense — it's a sequence of plain HTTP GETs for the manifest and then the segments, served by the **CDN**, not your application servers. The player fetches `master.m3u8`, picks a rendition, and streams its segments (`seg_001.ts`, `seg_002.ts`, …) straight from the nearest edge. Keeping playback as cacheable static-file reads is exactly what lets a CDN absorb 25 Tbps; the moment playback required dynamic origin calls, the design would collapse under its own egress.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section walks through the high-level component map, tracing the upload path into object storage, the async transcoding pipeline, and the CDN-mediated playback path.
+The architecture is two pipelines that meet at object storage: an **ingest** side that turns a source into cacheable artifacts, and a **delivery** side that serves those artifacts at scale through a CDN.
+
+<VideoStreamingArchitecture />
+
+- **Upload service.** Stateless front door for ingest. It creates the video record, issues a presigned URL so the client uploads bytes **directly to object storage**, and — when the upload finalizes — enqueues a transcode job. It never carries the video bytes itself.
+- **Raw storage (object store).** The durable home of original uploads — the system of record, at eleven-nines durability. Every rendition is derived from here, so a source can be re-transcoded any time.
+- **Transcode queue + workers.** The asynchronous fan-out. A job per video is queued; a fleet of workers pulls jobs, transcodes the source into the rendition ladder, segments each rendition, writes the artifacts, and marks the video ready. The queue decouples a spiky, unbounded upload rate from a fixed, autoscaled compute fleet.
+- **Segment storage.** Where the derived artifacts live — the segments and manifests the player streams. This is the **origin** the CDN pulls from on a cache miss.
+- **CDN.** The delivery workhorse. Edge caches serve segments to viewers from the nearest point of presence; the origin (segment storage) is touched only on a miss. This is where the 25 Tbps actually lives.
+- **Metadata DB.** Holds the video records, status, and manifest keys — small, queryable state separate from the large media blobs.
+
+The decisive boundary is **the async seam at object storage**. The upload side writes a source and walks away; the transcode side picks it up minutes later, on its own schedule, and produces immutable artifacts; the delivery side reads those artifacts through a cache without ever knowing how they were made. Each half scales on its own axis — ingest on compute, delivery on cache/bandwidth — and neither can stall the other. Every section that follows elaborates one half of that seam.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section traces the four key flows in sequence: upload and ingest, transcoding pipeline fan-out, adaptive bitrate playback, and CDN delivery with cache hit and miss paths.
+Four flows cover the system: uploading and ingesting a video, transcoding it, playing it back adaptively, and serving a segment through the CDN. The first two are the ingest half; the last two are the delivery half.
+
+**Upload & ingest.** The client registers the video, then uploads bytes directly to object storage in resumable chunks. When the upload finalizes, a transcode job is enqueued and the API has already returned — the user sees "processing."
+
+<UploadIngestSequence />
+
+**Transcoding pipeline.** A worker pulls the job, reads the source, transcodes it into the rendition ladder, segments each rendition into immutable chunks, writes the segments and manifests, and only then flips the video to `ready`. The work is idempotent, so a crashed job can simply be retried.
+
+<TranscodePipelineSequence />
+
+**Adaptive playback.** The player fetches the master manifest, picks a starting rendition, and downloads segments one after another. It measures the throughput of each segment and, for the next one, steps up or down the ladder to match the bandwidth it's actually getting — quality adapts continuously without the stream ever stopping.
+
+<AbrPlaybackSequence />
+
+**CDN delivery.** A segment request hits the nearest edge. On a cache hit it's served locally in milliseconds; on a miss the edge fetches it once from the origin, caches it, and serves it — so the first viewer of a cold segment pays the origin round-trip and everyone after rides the cache.
+
+<CdnDeliverySequence />
 
 <h2 id="upload-ingestion">Upload & Ingestion</h2>
 
-This section explains how resumable, chunked uploads land directly in raw object storage via presigned URLs, why the API returns immediately with a transcoding status, and how the source file is the durable system of record.
+Ingestion starts with a deceptively hard problem: getting a large file off a creator's flaky connection and into durable storage. Source videos are big and uploads are long, so a single dropped connection must not mean starting over. The answer is **resumable, chunked upload** — the file is split into parts, each uploaded independently, and the client can retry just the failed part and resume where it left off. The platform issues a **presigned URL** so the bytes flow **directly from client to object storage**, never through the application servers; the API's job is to mint that URL and, later, to react to the completed upload.
+
+This direct-to-storage path matters for the same reason the playback path bypasses the API: video bytes are enormous, and routing them through your servers would turn every upload into a bandwidth and memory problem. By handing the client a storage URL, the upload service stays small and stateless while object storage — built exactly for durable, resumable, large-object writes — does the heavy lifting.
+
+<Callout variant="info" title="The source is the system of record">
+Once the upload finalizes, that original file is the one piece of data you cannot regenerate — everything else (renditions, segments, manifests) is *derived* from it by transcoding. So it's stored durably (eleven nines) and treated as immutable. This is what makes the rest of the pipeline safe to be lossy and retryable: if a transcode job fails, corrupts an artifact, or you want to add a new rendition or adopt a better codec next year, you just re-run transcode against the untouched source. Keep the precious thing in one durable place and derive everything else.
+</Callout>
+
+When the upload completes, the service transitions the video `uploaded → transcoding` and enqueues a transcode job. That hand-off — a durable source plus a queued job — *is* the seam between the two halves of the system. The upload side's work is done; the transcode side will pick it up asynchronously. Nothing about ingest blocks on transcoding, and nothing about transcoding blocks the user's upload from completing.
 
 <h2 id="transcoding-pipeline">Transcoding Pipeline</h2>
 
-This section details the asynchronous fan-out from one source file into a rendition ladder of multiple bitrates and resolutions, each segmented and written to segment storage, with the video marked ready only when the manifest is complete.
+This is the centerpiece of the ingest half: how one uploaded file becomes something streamable everywhere. Transcoding is **compute-heavy and slow** — minutes of CPU (or GPU) per video, sometimes longer than the video's own runtime — so it absolutely cannot happen inline with the upload request. It is an **asynchronous job**: the upload enqueues work, a fleet of workers drains the queue, and the queue is what decouples a spiky, unbounded arrival rate from a fixed, autoscaled compute fleet. If uploads surge, the queue grows and workers scale out; the user never waits on a worker being free.
+
+Each job is a **fan-out**. From one source, the worker produces a **rendition ladder** — the same content at several resolutions and bitrates (say 240p, 480p, 720p, 1080p, 4K) — so a phone on cellular and a TV on fiber can each be served an appropriate copy. Then it **segments** every rendition into small, independent chunks of a few seconds each and writes a manifest listing them. That fan-out is exactly why storage multiplied in the capacity section: one source in, a ladder of segmented renditions out.
+
+Segmentation is what makes the chunks both **parallelizable** and **streamable**. Because segments are independent, the work can be split across many workers — different renditions, even different time ranges, transcoded concurrently — so a long video doesn't mean a long wall-clock wait. And because the player will later download those same small segments one at a time, the same chunking that speeds up transcode is what enables adaptive playback downstream.
+
+<Callout variant="warning" title="A video is 'ready' only when its manifest is complete">
+Transcode jobs fail and retry — a worker crashes mid-segment, a node is preempted, a transient error hits. The rule that keeps this safe is **atomic publish**: a video flips to `ready` only when its *entire* manifest — every rendition, every segment — exists in storage. Until then it stays `transcoding` and is unplayable. This prevents the nightmare of a half-transcoded video that plays for thirty seconds and then dead-ends at a missing segment. Make the work **idempotent** — writing segment N is keyed by (video, rendition, N), so re-running a failed job overwrites the same objects and converges rather than duplicating — and a crashed job is simply retried from the queue with no cleanup.
+</Callout>
+
+<KnowledgeCheck
+  question="Why must transcoding run as an asynchronous job off a queue rather than inline with the upload request?"
+  options={[
+    "Because object storage can't be written synchronously",
+    "Because transcoding is compute-heavy and slow (minutes of CPU per video, often longer than the video itself), so doing it inline would block the request for minutes; a queue decouples a spiky, unbounded upload rate from a fixed, autoscaled worker fleet and lets each scale independently",
+    "Because the CDN requires it",
+    "Because users prefer to wait on the upload request",
+  ]}
+  answer={1}
+  explanation="A single transcode can take minutes — sometimes longer than the source's runtime — and produces a whole ladder of renditions. Running it inline would hold the HTTP request open for minutes and couple upload throughput to transcode capacity. Enqueuing the job instead lets the upload return immediately (202), lets workers drain the queue at their own pace, and lets the worker fleet autoscale against backlog while uploads scale against bandwidth — the two halves never block each other."
+/>
 
 <h2 id="adaptive-bitrate-streaming">Adaptive Bitrate Streaming</h2>
 
-This section explains how the client fetches a master manifest, picks an initial rendition, measures throughput segment by segment, and switches renditions on the fly to avoid rebuffering.
+Adaptive bitrate streaming (ABR) is the protocol that makes playback smooth over an unreliable, ever-changing network. The core idea is that **the client, not the server, chooses quality** — and it re-chooses constantly. Because every rendition was pre-segmented into small chunks, the player can download segment 1 at 1080p, notice the network got worse, and fetch segment 2 at 480p, then climb back up — switching rung by rung without the stream ever stopping. Standards like **HLS** and **DASH** encode this as a **master manifest** that advertises each rendition and its bandwidth, plus a **media manifest** per rendition listing its segment URLs.
+
+Client-driven adaptation wins because only the client can see what's actually happening on the last mile. It measures the throughput of each segment download and watches its own buffer; when throughput drops or the buffer runs low, it steps down to a lower bitrate to keep playing, and when there's headroom it steps up for better quality. A server pushing a fixed bitrate is blind to the phone that just walked into an elevator — it would either stall (too high) or look bad forever (too low). ABR turns a freeze into a momentary quality dip, which is exactly the rebuffer-ratio target from the requirements.
+
+<KnowledgeCheck
+  question="In adaptive bitrate streaming, why does the client pick the rendition for each segment instead of the server pushing a fixed quality?"
+  options={[
+    "To reduce the number of renditions that must be stored",
+    "Because only the client can observe the real, moment-to-moment last-mile conditions — its measured throughput and buffer level — so it can step down a rung to avoid a rebuffer and step up when there's headroom; a server pushing a fixed bitrate is blind to the changing network and would either stall or look bad",
+    "Because the CDN cannot serve different bitrates",
+    "Because manifests are generated on the server",
+  ]}
+  answer={1}
+  explanation="ABR pre-encodes several renditions and segments them, then lets the player choose per segment from the manifest. The client is the only party that can measure actual download throughput and its own buffer occupancy, so it's best placed to react — dropping to a lower bitrate to keep playing when the network degrades and climbing back up when it recovers. This converts what would be a freeze under a fixed bitrate into a brief, recoverable quality change, protecting the rebuffer-ratio SLO."
+/>
+
+There's a startup-versus-quality lever too: starting on a lower rung makes playback begin almost instantly (small first segment, quick first frame) at the cost of initial sharpness, while a larger first segment looks better but delays the start. Most players start conservatively and ramp up — fast start, then quality — which directly serves the sub-two-second startup target.
 
 <h2 id="cdn-delivery">CDN Delivery</h2>
 
-This section covers how immutable segments cache indefinitely at CDN edge nodes, why the cache hit ratio is the dominant delivery lever, and how origin fetch (cache miss) is bounded by that ratio.
+Delivery is, fundamentally, a **caching** problem. The capacity math said it plainly: 25 Tbps of peak egress is impossible to serve from an origin, so a CDN fans the load out to hundreds of edge points of presence near viewers, and the single most important number in the whole delivery half is the **cache hit ratio**. At 95%, the origin sees only the missed 5% (~1.25 Tbps); nudging the hit ratio higher cuts origin load and cost almost linearly. Everything about delivery is in service of keeping that ratio high.
+
+Two properties make video unusually cache-friendly. First, **segments are immutable**: once `seg_042.ts` is written it never changes, so it can be cached forever with no invalidation worries — the hardest part of caching simply doesn't apply. Second, **popularity is extremely skewed**: a handful of viral titles draw a huge share of views while a long tail is watched rarely. So a small, hot working set lives permanently in edge cache and serves the bulk of traffic, while the cold tail rides occasional cache misses to the origin — and that's fine, because the tail is, by definition, low-volume.
+
+<KnowledgeCheck
+  question="Why is cache hit ratio the dominant lever for a streaming platform's delivery, and what makes video segments especially cacheable?"
+  options={[
+    "Because the origin is faster than the edge",
+    "Because peak egress (tens of Tbps) is far too large to serve from an origin, so the CDN must absorb nearly all of it — at a 95% hit ratio the origin sees only the 5% miss fraction; and segments are immutable (never change once written) and popularity is highly skewed, so a small hot set caches forever and serves most traffic",
+    "Because manifests must be regenerated frequently",
+    "Because DRM requires caching",
+  ]}
+  answer={1}
+  explanation="Delivery bandwidth dwarfs anything an origin can serve, so the design only works if the CDN serves the overwhelming majority of bytes; the hit ratio decides how much leaks through to the origin, and improving it cuts origin load and cost almost linearly. Video is ideal for this: immutable segments cache indefinitely with no invalidation, and skewed popularity means a small hot working set satisfies most requests while the rarely-watched long tail absorbs the misses."
+/>
+
+Two more mechanisms tighten it. An **origin shield** — a mid-tier cache between the edges and the origin — collapses misses: when fifty edges all miss the same cold segment, they hit the shield, which fetches from origin **once** and serves the other forty-nine, so the origin never sees a stampede. And for predictable spikes (a big premiere), you **prewarm** the edges by pushing the new title's segments out ahead of demand, so the launch is a cache hit from the first second instead of a thundering herd of misses.
 
 <h2 id="storage-and-cost">Storage & Cost</h2>
 
-This section examines the storage explosion caused by the rendition ladder, tiering strategies for hot versus cold content, and approaches to contain cost through garbage collection of failed transcodes.
+Storage is the quiet cost that compounds. Because every upload fans out into a rendition ladder, stored bytes multiply by the rung count, and the platform adds hundreds of terabytes a day that never get smaller — the capacity section's 300 TB/day grows forever. Two levers keep this sane. First, **tiering**: recent and popular content lives on fast, more expensive storage near the CDN, while the cold tail is migrated to cheap archival tiers — rarely watched, rarely fetched, so high retrieval latency is acceptable. Second, **garbage collection**: failed and abandoned transcodes, orphaned segments from re-encodes, and renditions nobody streams are swept up, because at this scale waste is measured in petabytes.
+
+The deeper point is that for streaming, the **egress bill, not the storage bill, usually dominates** — moving bytes to viewers costs more than keeping them. That reframes the CDN and the cache hit ratio as *cost* decisions, not just latency decisions: every percentage point of hit ratio is bytes you don't pay to serve from origin, and every unnecessary rendition is storage *and* potential egress you're paying for. This is why the rendition ladder is a deliberate trade — enough rungs to serve every device and network well, but not so many that you multiply storage and cost for renditions almost nobody picks.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section traces the evolution from a single transcoder to an elastic fleet, the role of a distributed job queue, and how read scaling is largely delegated to the CDN layer.
+Don't build the global, multi-CDN machine on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single service: upload, transcode, and serve from one box", "Day one; a handful of videos; prove the flow", "Transcoding blocks the box; no global reach; falls over at any real scale"],
+    ["Object storage + async transcode workers + a CDN", "Real uploads and viewers; playback must be smooth and global", "Operating a queue, a worker fleet, and a CDN; eventual consistency between upload and 'ready'"],
+    ["Autoscaled transcode fleet + multi-rendition ABR + origin shield", "Backlogs form under load; varied devices/networks; origin sees miss stampedes", "Autoscaling and shielding to run; more renditions multiply storage and transcode cost"],
+    ["Multi-region storage + multi-CDN + live streaming", "Global audience and residency; CDN redundancy; live events", "Cross-region replication and routing; multi-CDN steering; live ingest is a separate, harder pipeline"],
+  ]}
+  recommendedRow={1}
+/>
+
+The progression tracks the two halves separately. You first split ingest from delivery by introducing **object storage, async transcode workers, and a CDN** — the architecture this tutorial designs, and where most systems should live. As load climbs, the ingest half gains an **autoscaled fleet** that grows against queue backlog, the delivery half gains an **origin shield** so miss stampedes never reach the origin, and ABR gains more rungs to cover more devices. Only a truly global product needs **multi-region storage and multi-CDN** redundancy — and **live streaming**, while it shares the delivery half, is a distinct ingest pipeline (real-time segmenting, sub-second latency, no second chances) best treated as its own project rather than a knob on this one.
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section catalogues the key failure scenarios — upload interruption, transcode worker crash, manifest corruption, CDN origin unavailability — and the mitigations for each.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. A streaming platform's failures split cleanly along the seam: ingest failures delay videos going live (annoying, recoverable, invisible to viewers of existing content), while delivery failures interrupt playback for people watching right now.
+
+<FailureMatrix
+  rows={[
+    { failure: "Transcode worker crashes mid-job", impact: "One video's transcode stalls; it stays 'transcoding'", detection: "Job lease expiry; stuck-job age", mitigation: "Idempotent, keyed segment writes; the queue redelivers the job to another worker", recovery: "Retry converges on the same artifacts; video reaches 'ready'" },
+    { failure: "Poison / corrupt upload", impact: "A job fails repeatedly and could block the queue", detection: "Per-job retry count exceeds a threshold", mitigation: "Cap retries, route to a dead-letter queue, mark the video 'failed' with an actionable error", recovery: "Creator re-uploads; the queue keeps draining healthy jobs" },
+    { failure: "Transcode backlog grows", impact: "Videos take hours to go live; the queue lengthens", detection: "Queue depth and oldest-job age rising", mitigation: "Autoscale the worker fleet against backlog; shed/deprioritize low-priority jobs", recovery: "Fleet drains the queue; backlog returns to baseline" },
+    { failure: "Origin (segment storage) outage", impact: "Cache misses can't be filled; cached content still plays", detection: "Origin error rate; edge fill failures", mitigation: "High-durability replicated storage; the CDN keeps serving the hot cached set; an origin shield limits exposure", recovery: "Restore origin; cold-segment misses succeed again" },
+    { failure: "CDN edge / PoP outage", impact: "Viewers near that PoP get higher latency or errors", detection: "Per-PoP error rate and latency; synthetic probes", mitigation: "Anycast/DNS reroutes to a healthy PoP; multi-CDN steering as a fallback", recovery: "Traffic shifts; the failed PoP rejoins when healthy" },
+    { failure: "Partial / incomplete transcode published", impact: "Playback dead-ends at a missing segment — the worst viewer experience", detection: "Manifest completeness check before publish", mitigation: "Atomic publish: flip to 'ready' only when the whole manifest exists", recovery: "Never published incomplete; the job retries to completion first" },
+    { failure: "Metadata DB outage", impact: "Can't read status or resolve manifests for new sessions; in-flight playback continues", detection: "DB health and error rate", mitigation: "Replicated, highly-available DB; cache manifest URLs; degrade status reads gracefully", recovery: "Promote a replica; status and new sessions resume" },
+  ]}
+/>
+
+The theme: **the source and the immutable segments are your safety net.** Because the durable source can be re-transcoded and segments are immutable and cached, most failures degrade gracefully — a transcode retries, a cached video keeps playing through an origin blip, a PoP reroutes — rather than losing data or corrupting playback. The two failures to design hardest against are the **incomplete publish** (guarded by atomic, manifest-complete publishing) and the **growing backlog** (guarded by autoscaling and shedding), because those are the ones that silently break the experience.
 
 <h2 id="security-drm">Security & DRM</h2>
 
-This section addresses access control on upload, signed URL tokens for playback, DRM key delivery for premium content, and abuse-prevention measures at the ingest layer.
+A streaming platform serves valuable content over open HTTP, which invites theft of both the content and the bandwidth. Defenses stack along the delivery path.
+
+- **Signed, expiring URLs.** Segment and manifest URLs are signed with a short-lived token tied to the user/session, so a link can't be shared or scraped to pull the whole library — an expired token is rejected at the edge. This is the baseline, and it leans on the same fast token checks as the Rate Limiter's path.
+- **DRM for premium content.** For licensed or paid content, segments are **encrypted** and the player must obtain a decryption key from a **license server** that enforces entitlements (who, what device, how long). DRM (Widevine/FairPlay/PlayReady) raises the cost of piracy from "save the file" to "break the crypto," which is the right bar for high-value catalogues.
+- **Hotlink protection and geo-blocking.** Edge rules reject requests with the wrong referrer/origin (so other sites can't embed and leech your bandwidth) and enforce geographic licensing (a title available in one region is blocked in another).
+- **Abuse and scraping.** Rate-limit manifest and segment requests per token, and watch for patterns that look like bulk ripping rather than human viewing.
+
+<Callout variant="info" title="Tokens at the edge, keys at a license server">
+The clean split is that **access** is enforced cheaply and everywhere — signed-URL token checks run at the CDN edge, so an unauthorized request never even reaches the origin — while **decryption** is enforced centrally by a license server that hands out keys only to entitled, authenticated players. Access control keeps bandwidth from being stolen; DRM keeps the bytes themselves useless without a key. Most platforms run signed URLs for everything and add DRM only for the premium tier, because DRM adds real player and operational complexity.
+</Callout>
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares the chosen design against alternatives: live streaming versus VOD pipelines, self-hosted transcoding versus managed encoding services, and monolithic versus microservices delivery.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Upload resumable chunks directly to object storage; transcode asynchronously off a queue into a segmented adaptive-bitrate ladder, publishing a video as 'ready' only when its full manifest exists; serve playback as immutable segments through a CDN where cache hit ratio is the dominant lever; and tier storage while protecting content with signed URLs and DRM."
+  rationale="The async queue decouples spiky, unbounded uploads from a fixed, autoscaled transcode fleet, so neither blocks the other. Segmenting into a rendition ladder is what enables both parallel transcode and client-driven ABR, which keeps playback smooth by turning network dips into quality dips. Immutable segments plus skewed popularity make delivery a near-perfect caching problem, so a CDN absorbs the 25 Tbps and the origin sees only misses. Keeping the source as the durable record makes every derived artifact safe to lose and regenerate."
+  alternatives="Synchronous/inline transcode — simpler but blocks the request for minutes and couples upload to compute; just-in-time transcoding (encode on first request) — saves storage on the cold tail but adds playback latency and origin compute; server-driven bitrate — simpler client but blind to the last mile, so it stalls or under-delivers; serving from origin without a CDN — impossible at this egress; a single CDN — simpler but a single point of failure versus multi-CDN."
+  revisitWhen="The product adds live or low-latency streaming (a different ingest pipeline), the catalogue's popularity curve flattens (changing the caching and just-in-time calculus), egress or storage costs dominate enough to retune the rendition ladder, or global residency requirements force multi-region storage."
+/>
+
+Three axes capture the real tension:
+
+- **How many renditions.** More rungs serve more devices and networks well but multiply storage, transcode cost, and potential egress; fewer rungs are cheaper but leave some viewers over- or under-served. The ladder is tuned to the audience, not maxed out.
+- **Eager vs. just-in-time transcode.** Transcoding every rendition up front gives instant playback at the cost of storing renditions nobody may watch; transcoding on first request saves storage on the cold tail but adds latency to that first view. Most platforms transcode the common rungs eagerly and consider JIT only for the rare ones.
+- **HLS vs. DASH (and single vs. multi-CDN).** The streaming protocols are similar in spirit; the real operational lever is CDN strategy — a single CDN is simpler but a single point of failure, while multi-CDN adds steering complexity for redundancy and cost arbitrage.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section distills the three to five decisions an interviewer expects a candidate to articulate clearly: async transcoding, the rendition ladder, ABR manifests, CDN-dominated delivery, and the cache hit ratio lever.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A video streaming platform is really two systems joined at object storage. On ingest, the client uploads resumable chunks straight to object storage, and that upload enqueues an asynchronous transcode job — transcoding is minutes of CPU, so it can never run inline. A worker fan-outs the source into a bitrate ladder, segments each rendition into small immutable chunks, writes a manifest, and marks the video ready only when the whole manifest exists, so playback never dead-ends on a missing segment. On delivery, playback is adaptive bitrate: the player downloads a manifest and picks a rendition per segment based on its measured bandwidth, dropping a rung to avoid a rebuffer and climbing back up — client-driven because only the client sees the last mile. Delivery is fundamentally a CDN/caching problem: peak egress is tens of Tbps, impossible from an origin, so a CDN serves it and the cache hit ratio is the dominant lever — immutable segments and skewed popularity make video almost perfectly cacheable, and an origin shield collapses misses. Storage explodes because one source becomes many renditions, so I tier hot vs cold and garbage-collect failed transcodes, and I protect content with signed URLs at the edge plus DRM for premium. The whole thing is async fan-out on ingest, cache-dominated reads on delivery."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why must transcoding be asynchronous? What is the rendition ladder and why segment? How does adaptive bitrate keep playback smooth, and why client-driven? Why is delivery a CDN problem, and what makes segments so cacheable? What's an origin shield? How do you keep a half-transcoded video from playing? How does storage grow and how do you control cost? How do signed URLs and DRM differ?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section provides review questions and answers covering the distinguishing concepts of the design — transcoding pipelines, adaptive bitrate streaming, CDN caching, and storage trade-offs.
+<KnowledgeCheck
+  question="What is the 'rendition ladder' and why segment each rendition?"
+  options={[
+    "A list of CDN edges ordered by distance",
+    "The set of bitrate/resolution copies a source is transcoded into (e.g. 240p–4K); each is chopped into small immutable segments so transcode can be parallelized and, downstream, the player can switch quality per segment for adaptive playback",
+    "A queue of pending transcode jobs",
+    "The sequence of DRM keys for a video",
+  ]}
+  answer={1}
+  explanation="A single source can't serve every device and network, so transcoding produces a ladder of renditions at different bitrates/resolutions. Segmenting each into independent few-second chunks does double duty: the chunks can be transcoded in parallel across workers, and the same chunks let the player download segment-by-segment and switch rungs mid-stream — the foundation of adaptive bitrate streaming."
+/>
+
+<KnowledgeCheck
+  question="Why does the client upload bytes directly to object storage via a presigned URL instead of through the application servers?"
+  options={[
+    "To bypass authentication",
+    "Because video files are huge; routing them through the app servers would make every upload a bandwidth and memory burden, so the API just mints a presigned URL and object storage handles the durable, resumable large-object write directly",
+    "Because object storage can't be written by servers",
+    "To avoid transcoding",
+  ]}
+  answer={1}
+  explanation="Source videos are large and uploads are long, so putting application servers in the byte path would force them to absorb enormous bandwidth and buffering. A presigned URL lets the client write straight to object storage — which is built for durable, resumable, large-object writes — keeping the upload service small and stateless. The same principle keeps playback off the API by serving segments from the CDN."
+/>
+
+<KnowledgeCheck
+  question="Why is a video flipped to 'ready' only when its entire manifest exists, and how is the transcode job made safe to retry?"
+  options={[
+    "To save storage on incomplete videos",
+    "So playback never dead-ends on a missing segment — atomic publish gates 'ready' on a complete manifest; and segment writes are idempotent and keyed by (video, rendition, segment) so a crashed job re-run overwrites the same objects and converges instead of duplicating",
+    "Because the CDN can't cache partial videos",
+    "Because the metadata DB requires it",
+  ]}
+  answer={1}
+  explanation="A half-transcoded video that plays then hits a missing segment is the worst viewer experience, so the video stays 'transcoding' and unplayable until its whole manifest — every rendition and segment — is present. Keying each segment write by (video, rendition, index) makes the work idempotent, so the queue can safely redeliver a failed job and the retry converges on the same artifacts with no cleanup or duplication."
+/>
+
+<KnowledgeCheck
+  question="Peak delivery egress is ~25 Tbps. Why does this make delivery fundamentally a CDN problem?"
+  options={[
+    "Because origins are slower than edges",
+    "Because no origin can serve tens of Tbps, so a CDN must absorb nearly all of it across many edge PoPs; the cache hit ratio then decides how little leaks to the origin (a 95% ratio leaves only ~5%), making hit ratio the single most important delivery and cost lever",
+    "Because CDNs are cheaper per gigabyte stored",
+    "Because manifests must be served from the edge",
+  ]}
+  answer={1}
+  explanation="The egress is far beyond any origin's capacity, so the only workable design serves the overwhelming majority of bytes from CDN edge caches near viewers. The origin handles just the miss fraction, so raising the cache hit ratio cuts origin load and egress cost almost linearly. Immutable segments and skewed popularity are what make such a high hit ratio achievable."
+/>
+
+<KnowledgeCheck
+  question="What does an origin shield do, and what problem does it solve?"
+  options={[
+    "It encrypts segments for DRM",
+    "It's a mid-tier cache between the edge PoPs and the origin: when many edges miss the same cold segment at once, they hit the shield, which fetches from the origin exactly once and serves the rest — collapsing a miss stampede so the origin never gets hammered",
+    "It signs URLs at the edge",
+    "It load-balances transcode workers",
+  ]}
+  answer={1}
+  explanation="Without a shield, a cold-but-suddenly-popular segment can be missed by dozens of edges simultaneously, each fetching from the origin — a stampede. An origin shield is an intermediate cache that absorbs those concurrent misses, fetching the segment from the origin a single time and fanning it out to the edges, which protects the origin and smooths cache fills."
+/>
+
+<KnowledgeCheck
+  question="Why is adaptive bitrate switching client-driven, and what does it protect?"
+  options={[
+    "To reduce server CPU",
+    "Because only the client can measure real last-mile throughput and its own buffer, so it picks the rendition per segment — dropping a rung when the network degrades to avoid a freeze and climbing back when there's headroom — which protects the rebuffer-ratio and startup SLOs",
+    "Because the server can't read manifests",
+    "Because DRM keys are client-side",
+  ]}
+  answer={1}
+  explanation="The last mile is invisible to the server but measurable by the client, which watches per-segment throughput and buffer occupancy. By choosing each segment's rendition itself, the player converts a network dip into a brief quality drop instead of a rebuffer, and starts low for a fast first frame then ramps up — directly serving the smooth-playback requirements."
+/>
+
+<Faq
+  items={[
+    { question: "What is the single biggest insight in designing a video platform?", answer: "That it's two systems with opposite characteristics joined at object storage: ingest is a slow, compute-heavy, asynchronous transcode fan-out, and delivery is a high-volume, low-latency, cache-dominated read path. Almost every design decision follows from treating those halves separately and connecting them through a durable source plus a queue." },
+    { question: "Why can't transcoding happen during the upload request?", answer: "Because it's expensive and slow — minutes of CPU per video, often longer than the video's own runtime, and it fans one source into a whole ladder of renditions. Doing it inline would hold the request open for minutes and tie upload throughput to transcode capacity. Instead the upload enqueues a job and returns 202; an autoscaled worker fleet drains the queue independently." },
+    { question: "What exactly is the rendition ladder?", answer: "The set of copies a source is transcoded into at different resolutions and bitrates — say 240p, 480p, 720p, 1080p, and 4K. It exists so a phone on cellular and a TV on fiber can each be served an appropriate quality, and it's the reason storage multiplies: one upload becomes several stored renditions, each segmented." },
+    { question: "Why segment the video into small chunks?", answer: "Two reasons. On ingest, independent segments let the transcode work be parallelized across workers so long videos don't mean long waits. On delivery, the player downloads segments one at a time, which lets it switch rendition per segment (adaptive bitrate) and lets the CDN cache each immutable chunk forever. Segmentation is what ties the two halves together." },
+    { question: "How does adaptive bitrate streaming keep playback smooth?", answer: "The player downloads a manifest listing renditions and their bitrates, then picks a rendition per segment based on its measured download throughput and buffer level. When the network degrades it steps down a rung to keep playing rather than freezing; when there's headroom it steps up. It's client-driven because only the client can see the real last-mile conditions." },
+    { question: "Why is delivery considered a CDN problem rather than a server problem?", answer: "Because peak egress is tens of terabits per second — far beyond what any origin can serve. A CDN spreads that load across hundreds of edge PoPs near viewers, and the origin only handles cache misses. The cache hit ratio becomes the dominant lever: at 95% the origin sees just 5% of the bytes, so improving the ratio cuts both load and cost almost linearly." },
+    { question: "What makes video segments so cacheable?", answer: "Two things. Segments are immutable — once written they never change — so they can be cached indefinitely with no invalidation, removing the hardest part of caching. And popularity is highly skewed: a few hot titles draw most views, so a small working set lives permanently in edge cache and serves the bulk of traffic while the cold tail rides occasional misses." },
+    { question: "What is an origin shield and why add one?", answer: "It's a mid-tier cache sitting between the edge PoPs and the origin. When many edges miss the same cold segment simultaneously, they hit the shield, which fetches from the origin exactly once and serves all of them — collapsing what would be a stampede of origin requests into a single fetch. It protects the origin and is especially valuable for big launches." },
+    { question: "How do you stop a half-transcoded video from playing?", answer: "Atomic publish: a video is flipped to 'ready' only when its entire manifest — every rendition and every segment — exists in storage. Until then it stays 'transcoding' and is unplayable. Combined with idempotent, keyed segment writes, a crashed transcode job can be safely retried to completion before the video is ever published." },
+    { question: "How does storage grow, and how do you control the cost?", answer: "Every upload fans out into a rendition ladder, so stored bytes multiply by the rung count and grow by hundreds of terabytes a day that never shrink. You control it by tiering — hot/recent content on fast storage, the cold tail on cheap archival — and by garbage-collecting failed transcodes and orphaned segments. Note that for streaming, egress usually costs more than storage, which is another reason the CDN hit ratio matters to the bill." },
+    { question: "What's the difference between signed URLs and DRM?", answer: "Signed, expiring URLs control access cheaply at the CDN edge — an unauthorized or expired request never reaches the origin, which stops link-sharing and bandwidth leeching. DRM goes further by encrypting the segments so the bytes are useless without a key from a license server that enforces entitlements. Most platforms use signed URLs everywhere and add DRM only for premium content because it adds real complexity." },
+    { question: "How is live streaming different from this VOD design?", answer: "They share the delivery half — segments, manifests, ABR, CDN — but the ingest half is entirely different. Live has to segment and publish in real time with sub-second-to-seconds latency and no second chances to re-transcode, so it's a distinct, harder pipeline. It's best treated as its own project rather than a feature toggle on the VOD system." },
+  ]}
+/>
