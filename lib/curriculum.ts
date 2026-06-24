@@ -112,7 +112,7 @@ export const problems: readonly Problem[] = [
       "Ingest, transcode, and stream adaptive-bitrate video to a global audience over a CDN.",
     difficulty: "Advanced",
     concepts: ["Transcoding", "Adaptive bitrate", "CDN", "Object storage"],
-    status: "coming-soon",
+    status: "available",
     sequence: 11,
   },
   {

@@ -151,6 +151,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "video-streaming": {
+    slug: "video-streaming",
+    title: "Design a Video Streaming Platform",
+    description:
+      "An interview-grade walkthrough of a video-on-demand platform: resumable upload and ingestion, the asynchronous transcoding pipeline (the rendition ladder and segmentation), adaptive bitrate streaming, CDN-dominated delivery and caching, storage and cost, scaling, failure modes, and security/DRM.",
+    difficulty: "Advanced",
+    readingMinutes: 36,
+    concepts: ["Transcoding", "Adaptive bitrate", "CDN", "Object storage"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "upload-ingestion", label: "Upload & Ingestion", depth: "advanced" },
+      { id: "transcoding-pipeline", label: "Transcoding Pipeline", depth: "advanced" },
+      { id: "adaptive-bitrate-streaming", label: "Adaptive Bitrate Streaming", depth: "advanced" },
+      { id: "cdn-delivery", label: "CDN Delivery", depth: "advanced" },
+      { id: "storage-and-cost", label: "Storage & Cost", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "security-drm", label: "Security & DRM", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

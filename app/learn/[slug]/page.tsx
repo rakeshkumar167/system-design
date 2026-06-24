@@ -8,6 +8,7 @@ import RateLimiterContent from "@/content/tutorials/rate-limiter.mdx";
 import PastebinContent from "@/content/tutorials/pastebin.mdx";
 import NotificationServiceContent from "@/content/tutorials/notification-service.mdx";
 import TicketBookingContent from "@/content/tutorials/ticket-booking.mdx";
+import VideoStreamingContent from "@/content/tutorials/video-streaming.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -16,6 +17,7 @@ const content: Record<string, ComponentType> = {
   "pastebin": PastebinContent,
   "notification-service": NotificationServiceContent,
   "ticket-booking": TicketBookingContent,
+  "video-streaming": VideoStreamingContent,
 };
 
 export function generateStaticParams() {

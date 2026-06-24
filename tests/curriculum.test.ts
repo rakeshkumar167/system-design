@@ -7,13 +7,14 @@ describe("curriculum", () => {
     expect(new Set(problems.map((p) => p.slug)).size).toBe(25);
   });
 
-  it("exposes URL Shortener, Rate Limiter, Pastebin, Notification Service, and Ticket Booking as available", () => {
+  it("exposes URL Shortener, Rate Limiter, Pastebin, Notification Service, Video Streaming, and Ticket Booking as available", () => {
     expect(
       problems.filter((p) => p.status === "available").map((p) => p.slug),
-    ).toEqual(["url-shortener", "rate-limiter", "pastebin", "notification-service", "ticket-booking"]);
+    ).toEqual(["url-shortener", "rate-limiter", "pastebin", "notification-service", "video-streaming", "ticket-booking"]);
     expect(getProblem("rate-limiter")?.title).toBe("Rate Limiter");
     expect(getProblem("pastebin")?.title).toBe("Pastebin");
     expect(getProblem("notification-service")?.title).toBe("Notification Service");
+    expect(getProblem("video-streaming")?.title).toBe("Video Streaming Platform");
     expect(getProblem("ticket-booking")?.title).toBe("Ticket Booking System");
   });
 

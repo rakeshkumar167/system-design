@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section sets the stage for the video streaming platform interview, clarifying scope, stakeholders, and the asymmetric read/write nature of the system.
+
+<h2 id="requirements">Requirements</h2>
+
+This section captures the functional and non-functional requirements that bound the design, distinguishing upload and playback SLAs.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the storage, bandwidth, and compute numbers that reveal why transcoding and CDN delivery are the dominant cost and scaling concerns.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core data entities — Video, Rendition, Segment, and Manifest — and how they relate to one another in the data store.
+
+<h2 id="api-design">API Design</h2>
+
+This section presents the minimal API surface: the resumable upload initiation endpoint, the video status endpoint, and the CDN-served manifest and segment paths.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section walks through the high-level component map, tracing the upload path into object storage, the async transcoding pipeline, and the CDN-mediated playback path.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section traces the four key flows in sequence: upload and ingest, transcoding pipeline fan-out, adaptive bitrate playback, and CDN delivery with cache hit and miss paths.
+
+<h2 id="upload-ingestion">Upload & Ingestion</h2>
+
+This section explains how resumable, chunked uploads land directly in raw object storage via presigned URLs, why the API returns immediately with a transcoding status, and how the source file is the durable system of record.
+
+<h2 id="transcoding-pipeline">Transcoding Pipeline</h2>
+
+This section details the asynchronous fan-out from one source file into a rendition ladder of multiple bitrates and resolutions, each segmented and written to segment storage, with the video marked ready only when the manifest is complete.
+
+<h2 id="adaptive-bitrate-streaming">Adaptive Bitrate Streaming</h2>
+
+This section explains how the client fetches a master manifest, picks an initial rendition, measures throughput segment by segment, and switches renditions on the fly to avoid rebuffering.
+
+<h2 id="cdn-delivery">CDN Delivery</h2>
+
+This section covers how immutable segments cache indefinitely at CDN edge nodes, why the cache hit ratio is the dominant delivery lever, and how origin fetch (cache miss) is bounded by that ratio.
+
+<h2 id="storage-and-cost">Storage & Cost</h2>
+
+This section examines the storage explosion caused by the rendition ladder, tiering strategies for hot versus cold content, and approaches to contain cost through garbage collection of failed transcodes.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section traces the evolution from a single transcoder to an elastic fleet, the role of a distributed job queue, and how read scaling is largely delegated to the CDN layer.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section catalogues the key failure scenarios — upload interruption, transcode worker crash, manifest corruption, CDN origin unavailability — and the mitigations for each.
+
+<h2 id="security-drm">Security & DRM</h2>
+
+This section addresses access control on upload, signed URL tokens for playback, DRM key delivery for premium content, and abuse-prevention measures at the ingest layer.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares the chosen design against alternatives: live streaming versus VOD pipelines, self-hosted transcoding versus managed encoding services, and monolithic versus microservices delivery.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section distills the three to five decisions an interviewer expects a candidate to articulate clearly: async transcoding, the rendition ladder, ABR manifests, CDN-dominated delivery, and the cache hit ratio lever.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section provides review questions and answers covering the distinguishing concepts of the design — transcoding pipelines, adaptive bitrate streaming, CDN caching, and storage trade-offs.
