@@ -1,7 +1,7 @@
 import type { Problem } from "./types";
 
 /**
- * The 30-problem system design curriculum, in recommended reading order.
+ * The 33-problem system design curriculum, in recommended reading order.
  * Authored tutorials are `available`; the rest are `coming-soon`.
  */
 export const problems: readonly Problem[] = [
@@ -304,6 +304,36 @@ export const problems: readonly Problem[] = [
     concepts: ["At-least-once execution", "Leasing", "Time-based triggers", "Idempotency"],
     status: "coming-soon",
     sequence: 30,
+  },
+  {
+    slug: "stock-exchange",
+    title: "Stock Exchange",
+    summary:
+      "Match buy and sell orders fairly and deterministically under microsecond latency budgets.",
+    difficulty: "Advanced",
+    concepts: ["Matching engine", "Order book", "Deterministic sequencing", "Low latency"],
+    status: "coming-soon",
+    sequence: 31,
+  },
+  {
+    slug: "leaderboard",
+    title: "Leaderboard",
+    summary:
+      "Rank millions of players in real time with fast top-K queries and per-user rank lookups.",
+    difficulty: "Intermediate",
+    concepts: ["Sorted sets", "Ranking", "Sharding", "Real-time updates"],
+    status: "coming-soon",
+    sequence: 32,
+  },
+  {
+    slug: "content-delivery-network",
+    title: "Content Delivery Network",
+    summary:
+      "Serve static content from the edge with caching, invalidation, and origin offload at global scale.",
+    difficulty: "Advanced",
+    concepts: ["Edge caching", "Cache invalidation", "Origin shield", "Geo-routing"],
+    status: "coming-soon",
+    sequence: 33,
   },
 ];
 
