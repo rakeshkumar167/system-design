@@ -1,5 +1,12 @@
 import { render, screen } from "@testing-library/react";
 import { describe, it, expect } from "vitest";
+import { VideoStreamingArchitecture } from "@/components/diagrams/video-streaming-architecture";
+import {
+  UploadIngestSequence,
+  TranscodePipelineSequence,
+  AbrPlaybackSequence,
+  CdnDeliverySequence,
+} from "@/components/diagrams/streaming-flows";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import { ScaleEvolution } from "@/components/diagrams/scale-evolution";
 
@@ -140,5 +147,28 @@ describe("booking flow sequences", () => {
     expect(screen.getByRole("img", { name: /confirm|payment/i })).toBeInTheDocument();
     render(<HoldExpirySequence />);
     expect(screen.getByRole("img", { name: /expir/i })).toBeInTheDocument();
+  });
+});
+
+describe("VideoStreamingArchitecture", () => {
+  it("exposes the video streaming architecture to non-visual readers", () => {
+    render(<VideoStreamingArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /video streaming architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/adaptive bitrate/i)).toBeInTheDocument();
+  });
+});
+
+describe("streaming flow sequences", () => {
+  it("renders the upload, transcode, playback, and CDN sequences", () => {
+    render(<UploadIngestSequence />);
+    expect(screen.getByRole("img", { name: /upload|ingest/i })).toBeInTheDocument();
+    render(<TranscodePipelineSequence />);
+    expect(screen.getByRole("img", { name: /transcod/i })).toBeInTheDocument();
+    render(<AbrPlaybackSequence />);
+    expect(screen.getByRole("img", { name: /playback|adaptive|stream/i })).toBeInTheDocument();
+    render(<CdnDeliverySequence />);
+    expect(screen.getByRole("img", { name: /cdn|delivery|cache/i })).toBeInTheDocument();
   });
 });

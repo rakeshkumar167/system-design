@@ -51,6 +51,13 @@ import {
   ConfirmPaymentSequence,
   HoldExpirySequence,
 } from "@/components/diagrams/booking-flows";
+import { VideoStreamingArchitecture } from "@/components/diagrams/video-streaming-architecture";
+import {
+  UploadIngestSequence,
+  TranscodePipelineSequence,
+  AbrPlaybackSequence,
+  CdnDeliverySequence,
+} from "@/components/diagrams/streaming-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -101,6 +108,11 @@ const teachingComponents = {
   ContentionSequence,
   ConfirmPaymentSequence,
   HoldExpirySequence,
+  VideoStreamingArchitecture,
+  UploadIngestSequence,
+  TranscodePipelineSequence,
+  AbrPlaybackSequence,
+  CdnDeliverySequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
