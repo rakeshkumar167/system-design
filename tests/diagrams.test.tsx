@@ -263,3 +263,34 @@ describe("cloud drive flow sequences", () => {
     expect(screen.getByRole("img", { name: /conflict/i })).toBeInTheDocument();
   });
 });
+
+import { PaymentSystemArchitecture } from "@/components/diagrams/payment-system-architecture";
+import {
+  AuthCaptureSequence,
+  IdempotentRetrySequence,
+  ReconciliationSequence,
+  RefundSequence,
+} from "@/components/diagrams/payment-flows";
+
+describe("PaymentSystemArchitecture", () => {
+  it("exposes the payment system architecture to non-visual readers", () => {
+    render(<PaymentSystemArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /payment system architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/source of truth/i)).toBeInTheDocument();
+  });
+});
+
+describe("payment flow sequences", () => {
+  it("renders the auth-capture, idempotent-retry, reconciliation, and refund sequences", () => {
+    render(<AuthCaptureSequence />);
+    expect(screen.getByRole("img", { name: /authoriz/i })).toBeInTheDocument();
+    render(<IdempotentRetrySequence />);
+    expect(screen.getByRole("img", { name: /idempoten|retry/i })).toBeInTheDocument();
+    render(<ReconciliationSequence />);
+    expect(screen.getByRole("img", { name: /reconcil/i })).toBeInTheDocument();
+    render(<RefundSequence />);
+    expect(screen.getByRole("img", { name: /refund/i })).toBeInTheDocument();
+  });
+});

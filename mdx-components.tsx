@@ -83,6 +83,13 @@ import {
   ChangeNotificationSequence,
   ConflictSequence,
 } from "@/components/diagrams/cloud-drive-flows";
+import { PaymentSystemArchitecture } from "@/components/diagrams/payment-system-architecture";
+import {
+  AuthCaptureSequence,
+  IdempotentRetrySequence,
+  ReconciliationSequence,
+  RefundSequence,
+} from "@/components/diagrams/payment-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -157,6 +164,11 @@ const teachingComponents = {
   DeltaSyncSequence,
   ChangeNotificationSequence,
   ConflictSequence,
+  PaymentSystemArchitecture,
+  AuthCaptureSequence,
+  IdempotentRetrySequence,
+  ReconciliationSequence,
+  RefundSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
