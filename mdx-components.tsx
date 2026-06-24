@@ -15,6 +15,7 @@ import { PastebinCapacity } from "@/components/learning/pastebin-capacity";
 import { NotificationCapacity } from "@/components/learning/notification-capacity";
 import { TicketBookingCapacity } from "@/components/learning/ticket-booking-capacity";
 import { VideoStreamingCapacity } from "@/components/learning/video-streaming-capacity";
+import { CollaborativeDocEditorCapacity } from "@/components/learning/collaborative-doc-editor-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -82,6 +83,7 @@ const teachingComponents = {
   NotificationCapacity,
   TicketBookingCapacity,
   VideoStreamingCapacity,
+  CollaborativeDocEditorCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
