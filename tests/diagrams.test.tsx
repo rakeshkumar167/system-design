@@ -232,3 +232,34 @@ describe("cache flow sequences", () => {
     expect(screen.getByRole("img", { name: /stampede|herd|coalesc/i })).toBeInTheDocument();
   });
 });
+
+import { CloudDriveArchitecture } from "@/components/diagrams/cloud-drive-architecture";
+import {
+  FileUploadSequence,
+  DeltaSyncSequence,
+  ChangeNotificationSequence,
+  ConflictSequence,
+} from "@/components/diagrams/cloud-drive-flows";
+
+describe("CloudDriveArchitecture", () => {
+  it("exposes the cloud drive architecture to non-visual readers", () => {
+    render(<CloudDriveArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /cloud drive architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/content-addressed/i)).toBeInTheDocument();
+  });
+});
+
+describe("cloud drive flow sequences", () => {
+  it("renders the upload, delta-sync, notification, and conflict sequences", () => {
+    render(<FileUploadSequence />);
+    expect(screen.getByRole("img", { name: /upload/i })).toBeInTheDocument();
+    render(<DeltaSyncSequence />);
+    expect(screen.getByRole("img", { name: /delta/i })).toBeInTheDocument();
+    render(<ChangeNotificationSequence />);
+    expect(screen.getByRole("img", { name: /notif|push|fan/i })).toBeInTheDocument();
+    render(<ConflictSequence />);
+    expect(screen.getByRole("img", { name: /conflict/i })).toBeInTheDocument();
+  });
+});

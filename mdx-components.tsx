@@ -75,6 +75,13 @@ import {
   NodeRebalanceSequence,
   StampedeSequence,
 } from "@/components/diagrams/cache-flows";
+import { CloudDriveArchitecture } from "@/components/diagrams/cloud-drive-architecture";
+import {
+  FileUploadSequence,
+  DeltaSyncSequence,
+  ChangeNotificationSequence,
+  ConflictSequence,
+} from "@/components/diagrams/cloud-drive-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -143,6 +150,11 @@ const teachingComponents = {
   CacheMissSequence,
   NodeRebalanceSequence,
   StampedeSequence,
+  CloudDriveArchitecture,
+  FileUploadSequence,
+  DeltaSyncSequence,
+  ChangeNotificationSequence,
+  ConflictSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
