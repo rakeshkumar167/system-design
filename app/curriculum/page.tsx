@@ -4,8 +4,7 @@ import { CurriculumBrowser } from "@/components/curriculum/curriculum-browser";
 
 export const metadata: Metadata = {
   title: "Curriculum",
-  description:
-    "The complete 25-problem system design curriculum, from foundational warm-ups to advanced distributed systems.",
+  description: `The complete ${problems.length}-problem system design curriculum, from foundational warm-ups to advanced distributed systems.`,
 };
 
 export default function CurriculumPage() {
@@ -14,7 +13,7 @@ export default function CurriculumPage() {
       <header className="max-w-2xl">
         <p className="text-sm font-medium text-accent">Curriculum</p>
         <h1 className="mt-2 text-3xl font-semibold tracking-tight sm:text-4xl">
-          25 system design problems
+          {problems.length} system design problems
         </h1>
         <p className="mt-4 text-lg text-ink-muted">
           A progression from focused, single-concept warm-ups to full

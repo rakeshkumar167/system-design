@@ -1,8 +1,8 @@
 import type { Problem } from "./types";
 
 /**
- * The 25-problem system design curriculum, in recommended reading order.
- * Only the URL Shortener pilot is `available`; the rest are `coming-soon`.
+ * The 30-problem system design curriculum, in recommended reading order.
+ * Authored tutorials are `available`; the rest are `coming-soon`.
  */
 export const problems: readonly Problem[] = [
   {
@@ -116,12 +116,12 @@ export const problems: readonly Problem[] = [
     sequence: 11,
   },
   {
-    slug: "file-storage-sync",
-    title: "File Storage and Sync",
+    slug: "object-storage",
+    title: "Object Storage",
     summary:
-      "Sync files across devices with chunking, deduplication, and conflict resolution.",
+      "Store and serve exabytes of immutable blobs durably with erasure coding and multipart uploads.",
     difficulty: "Advanced",
-    concepts: ["Chunking", "Deduplication", "Sync protocol", "Conflict resolution"],
+    concepts: ["Erasure coding", "Durability", "Multipart upload", "Metadata indexing"],
     status: "coming-soon",
     sequence: 12,
   },
@@ -254,6 +254,56 @@ export const problems: readonly Problem[] = [
     concepts: ["Targeting", "Real-time bidding", "Budget pacing", "Low latency"],
     status: "coming-soon",
     sequence: 25,
+  },
+  {
+    slug: "distributed-key-value-store",
+    title: "Distributed Key-Value Store",
+    summary:
+      "Build a horizontally scalable, replicated key-value store with tunable consistency and quorums.",
+    difficulty: "Advanced",
+    concepts: ["Consistent hashing", "Quorum replication", "Vector clocks", "LSM storage"],
+    status: "coming-soon",
+    sequence: 26,
+  },
+  {
+    slug: "unique-id-generator",
+    title: "Unique ID Generator",
+    summary:
+      "Generate globally unique, roughly time-ordered IDs at massive scale without coordination.",
+    difficulty: "Intermediate",
+    concepts: ["Snowflake IDs", "Clock skew", "Monotonicity", "Partitioning"],
+    status: "coming-soon",
+    sequence: 27,
+  },
+  {
+    slug: "proximity-service",
+    title: "Proximity Service",
+    summary:
+      "Find nearby places or people fast with geospatial indexing over a constantly changing dataset.",
+    difficulty: "Advanced",
+    concepts: ["Geohashing", "Quadtree / S2", "Spatial indexing", "Read-heavy scaling"],
+    status: "coming-soon",
+    sequence: 28,
+  },
+  {
+    slug: "digital-wallet",
+    title: "Digital Wallet",
+    summary:
+      "Hold balances and move money between wallets exactly once with distributed transactions.",
+    difficulty: "Advanced",
+    concepts: ["Distributed transactions", "Idempotency", "Balance ledger", "Reservation"],
+    status: "coming-soon",
+    sequence: 29,
+  },
+  {
+    slug: "distributed-job-scheduler",
+    title: "Distributed Job Scheduler",
+    summary:
+      "Schedule and run millions of jobs reliably with at-least-once execution and leader leasing.",
+    difficulty: "Advanced",
+    concepts: ["At-least-once execution", "Leasing", "Time-based triggers", "Idempotency"],
+    status: "coming-soon",
+    sequence: 30,
   },
 ];
 

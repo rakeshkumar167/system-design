@@ -28,13 +28,13 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(15);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(20);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
     page.getByRole("heading", { name: "Payment System" }),
   ).toBeVisible();
-  await expect(page.getByText(/showing 1 of 25/i)).toBeVisible();
+  await expect(page.getByText(/showing 1 of 30/i)).toBeVisible();
 });
 
 test("learner can open the pastebin tutorial", async ({ page }) => {

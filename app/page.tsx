@@ -107,7 +107,7 @@ export default function HomePage() {
             href="/curriculum"
             className="hidden shrink-0 items-center gap-1.5 text-sm font-medium text-accent hover:text-accent-ink sm:inline-flex"
           >
-            All 25 problems
+            All {problems.length} problems
             <ArrowRight size={15} aria-hidden />
           </Link>
         </div>

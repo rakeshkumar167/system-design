@@ -2,9 +2,9 @@ import { describe, it, expect } from "vitest";
 import { getProblem, problems } from "@/lib/curriculum";
 
 describe("curriculum", () => {
-  it("contains the approved 25 unique problems", () => {
-    expect(problems).toHaveLength(25);
-    expect(new Set(problems.map((p) => p.slug)).size).toBe(25);
+  it("contains the approved 30 unique problems", () => {
+    expect(problems).toHaveLength(30);
+    expect(new Set(problems.map((p) => p.slug)).size).toBe(30);
   });
 
   it("exposes URL Shortener, Rate Limiter, Pastebin, Notification Service, Distributed Cache, Video Streaming, Ticket Booking, Payment System, Collaborative Doc Editor, and Cloud Drive as available", () => {
@@ -22,9 +22,9 @@ describe("curriculum", () => {
     expect(getProblem("cloud-drive")?.title).toBe("Cloud Drive");
   });
 
-  it("numbers problems sequentially from 1 to 25", () => {
+  it("numbers problems sequentially from 1 to 30", () => {
     expect(problems.map((p) => p.sequence)).toEqual(
-      Array.from({ length: 25 }, (_, i) => i + 1),
+      Array.from({ length: 30 }, (_, i) => i + 1),
     );
   });
 
