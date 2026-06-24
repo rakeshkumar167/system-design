@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 test("learner can discover and read the pilot tutorial", async ({ page }) => {
   await page.goto("/");
   await expect(
-    page.getByRole("heading", { name: /master system design/i }),
+    page.getByRole("heading", { name: /learn system design/i }),
   ).toBeVisible();
 
   await page.getByRole("link", { name: /start url shortener/i }).first().click();
@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(20);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(19);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -71,6 +71,18 @@ test("learner can open the ticket booking tutorial", async ({ page }) => {
   await expect(page.locator("#concurrency-control")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /ticket booking architecture/i }).first(),
+  ).toBeVisible();
+});
+
+test("learner can open the video streaming tutorial", async ({ page }) => {
+  await page.goto("/learn/video-streaming");
+  await expect(
+    page.getByRole("heading", { name: /design a video streaming platform/i }),
+  ).toBeVisible();
+  await page.goto("/learn/video-streaming#transcoding-pipeline");
+  await expect(page.locator("#transcoding-pipeline")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /video streaming architecture/i }).first(),
   ).toBeVisible();
 });
 
