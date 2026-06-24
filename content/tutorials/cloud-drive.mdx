@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section sets the stage for the cloud drive design interview, clarifying scope and what the interviewer is looking for.
+
+<h2 id="requirements">Requirements</h2>
+
+This section captures the functional and non-functional requirements for a cloud drive system at Dropbox / Google Drive scale.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the capacity math: storage scale, metadata QPS, and how delta sync cuts upload bandwidth.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core entities — File, FileVersion, Block, Namespace, and ShareACL — and explains the metadata/block split.
+
+<h2 id="api-design">API Design</h2>
+
+This section covers the two-phase write API (block dedup check + metadata commit) and the cursor-based delta query endpoint.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the high-level architecture showing the client, sync gateway, metadata service, block service, and notification path.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section walks through the four key flows: file upload, delta sync, change notification fan-out, and conflict handling.
+
+<h2 id="chunking-dedup">Chunking & Deduplication</h2>
+
+This section explains content-defined chunking, content-addressed storage, and how deduplication removes duplicate blocks across users.
+
+<h2 id="delta-sync">Delta Sync</h2>
+
+This section explains how clients diff chunk lists and transfer only changed blocks, cutting upload bandwidth by approximately 10×.
+
+<h2 id="sync-protocol">Sync Protocol & Notifications</h2>
+
+This section covers the cursor-based change journal, the notification channel that wakes devices, and how devices converge to a consistent state.
+
+<h2 id="metadata-store">Metadata Store & Namespace</h2>
+
+This section describes the sharded transactional metadata store, the namespace tree, and why metadata demands a separate store from block content.
+
+<h2 id="sharing-permissions">Sharing & Permissions</h2>
+
+This section covers ACL design, shared folder semantics, link sharing, and how permission checks integrate with the sync and read paths.
+
+<h2 id="versioning-history">Versioning & History</h2>
+
+This section explains the immutable FileVersion model (ordered block-hash list), version retention policy, and how history traversal works.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section covers sharding the metadata store, tiering block storage, adding a CDN for read acceleration, and the path from single-region to global.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section enumerates the key failure modes — block upload partial failure, metadata store unavailability, notification lag — and the mitigations for each.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares key design decisions: content-defined vs. fixed-size chunking, OT/CRDT for text vs. conflicted-copy for binary, and sync-pull vs. push models.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section distills the 60-second interview answer covering the metadata/block split, dedup, delta sync, and the cursor + notification sync protocol.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section tests understanding with knowledge checks and answers the most common interview follow-up questions about cloud drive design.

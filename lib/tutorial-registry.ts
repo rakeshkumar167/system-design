@@ -238,6 +238,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "cloud-drive": {
+    slug: "cloud-drive",
+    title: "Design a Cloud Drive",
+    description:
+      "An interview-grade walkthrough of a cloud drive (Dropbox / Google Drive style): the metadata/block split, chunking and content-addressed deduplication, delta sync, the cursor + notification sync protocol, the metadata store and namespace, sharing and permissions, versioning and history, scaling, and failure modes.",
+    difficulty: "Advanced",
+    readingMinutes: 36,
+    concepts: ["Object storage", "Deduplication", "Delta sync", "Metadata"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "chunking-dedup", label: "Chunking & Deduplication", depth: "advanced" },
+      { id: "delta-sync", label: "Delta Sync", depth: "advanced" },
+      { id: "sync-protocol", label: "Sync Protocol & Notifications", depth: "advanced" },
+      { id: "metadata-store", label: "Metadata Store & Namespace", depth: "advanced" },
+      { id: "sharing-permissions", label: "Sharing & Permissions", depth: "advanced" },
+      { id: "versioning-history", label: "Versioning & History", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

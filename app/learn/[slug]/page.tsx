@@ -11,6 +11,7 @@ import TicketBookingContent from "@/content/tutorials/ticket-booking.mdx";
 import VideoStreamingContent from "@/content/tutorials/video-streaming.mdx";
 import DistributedCacheContent from "@/content/tutorials/distributed-cache.mdx";
 import CollaborativeDocEditorContent from "@/content/tutorials/collaborative-doc-editor.mdx";
+import CloudDriveContent from "@/content/tutorials/cloud-drive.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -22,6 +23,7 @@ const content: Record<string, ComponentType> = {
   "ticket-booking": TicketBookingContent,
   "video-streaming": VideoStreamingContent,
   "collaborative-doc-editor": CollaborativeDocEditorContent,
+  "cloud-drive": CloudDriveContent,
 };
 
 export function generateStaticParams() {

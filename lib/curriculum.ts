@@ -232,7 +232,7 @@ export const problems: readonly Problem[] = [
       "Provide durable, shareable file storage with versioning, permissions, and previews.",
     difficulty: "Advanced",
     concepts: ["Object storage", "Versioning", "Sharing & ACLs", "Metadata"],
-    status: "coming-soon",
+    status: "available",
     sequence: 23,
   },
   {
