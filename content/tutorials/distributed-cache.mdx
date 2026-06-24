@@ -1,71 +1,422 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section frames the distributed cache problem the way an interviewer expects — clarifying scope, bounding the design space, and setting expectations for what we will and will not cover.
+A distributed cache is a fleet of in-memory nodes that sits in front of a slower backing store and answers reads in well under a millisecond. An application asks for a key; if the cache has it, the request never touches the database; if it doesn't, the app loads it from the store and remembers it for next time. The payoff is enormous — a high hit ratio turns a flood of reads into a trickle the database can actually serve, at a fraction of the latency — which is why a cache sits in front of nearly every large read-heavy system. The trap is to picture a single big hash map behind a socket. The moment one machine can't hold the data or serve the load, you need *many* nodes, and that one word — **distributed** — is where all the difficulty lives.
+
+The hard part is not get/set; it's everything that "many nodes" forces. Keys must spread evenly across nodes, and crucially, when a node is added or dies, only a *small slice* of keys should move — because in a cache, a moved key is a **miss**, and moving all of them at once is a stampede on the database. That rules out the obvious `hash(key) % N` and demands **consistent hashing**. Memory is bounded and deliberately smaller than the dataset, so the cache must **evict**, and *which* items it keeps determines the hit ratio that justifies its existence. And two failure modes haunt every production cache: a single **hot key** that melts one node, and a popular key expiring into a **stampede** of concurrent misses. The reframe to lead with: *it looks like a networked hash map, but the hard part is distributing it — partition keys so churn moves few of them, evict the right items, and survive hot keys and stampedes — all while staying a lossy layer in front of the real source of truth.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What's the read/write mix and the QPS? Caches exist for read-heavy workloads; the numbers set the node count.
+- How big is the hot working set versus the full dataset? That decides how much you can cache and your hit ratio.
+- How stale can a read be? A cache is usually allowed to lag the store slightly — that latitude buys a lot of simplicity.
+- What's the consequence of a miss — a slow query, or a catastrophic one? It changes how hard you defend against stampedes.
+- Is this a look-aside cache the app manages, or a read-through cache that loads on its own?
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "distributed makes it hard" reframe · **5 min** requirements and the hit-ratio goal · **5 min** capacity (working set, node count, and store offload fall out here) · **5 min** entity model and the get/set API · **10 min** consistent hashing and eviction — the centerpiece · **10 min** replication, hot keys, and stampede defenses · **5 min** write policies, failure modes, and wrap-up. Say your assumptions out loud — the interviewer is grading whether you know why `hash % N` is fatal under churn and can defend against hot keys and stampedes, not whether you can name every eviction policy.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** consistent hashing and virtual nodes, eviction policies, replication and tunable consistency, hot-key mitigation, cache stampede protection, and write policies/invalidation. **Out of scope:** the backing store's own design, durable cache persistence, transactions and scripting, secondary indexes and rich queries, the wire protocol details, and security/auth — name them so the interviewer sees the boundary, then set them aside. This problem also revisits the caching touched on in the URL Shortener and Pastebin tutorials, but from the inside: here the cache *is* the system.
 
 <h2 id="requirements">Requirements</h2>
 
-This section captures the functional and non-functional requirements that drive every design decision that follows.
+Separate what the system must *do* from how *well* it must do it. For a cache the non-functional list is unusually dominant — the whole point of the system is a set of performance properties — and it's anchored by one number that justifies the cache's existence: the **hit ratio**.
+
+<RequirementsTable
+  functional={[
+    "Get, set, and delete a value by key",
+    "Expire entries by TTL",
+    "Evict entries under memory pressure",
+    "Scale out by adding nodes (minimal key movement)",
+    "Replicate entries for availability and read scale",
+    "Load from the backing store on a miss (read-through / cache-aside)",
+  ]}
+  nonFunctional={[
+    { goal: "Read latency (p99)", target: "< 1 ms (in-memory)" },
+    { goal: "Throughput", target: "very high (tens of M reads/sec)" },
+    { goal: "Hit ratio", target: "high (e.g. 95%+)" },
+    { goal: "Key movement on membership change", target: "minimal (≈ 1/N of keys)" },
+    { goal: "Consistency", target: "tunable; slightly stale acceptable" },
+    { goal: "Availability", target: "99.95% (degrade to store on miss)" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **a high hit ratio** is the cache's reason to exist — it's what turns a database-melting read load into a manageable one — and it's set by how much you can hold (memory) and how well you evict (policy). Second, **minimal key movement on membership change**: because a relocated key is a guaranteed miss, adding or losing a node must disturb only a small fraction of the keyspace, which is precisely what consistent hashing delivers and `hash % N` destroys. Third, **tunable, slightly-stale consistency**: a cache is allowed to lag the source of truth a little, and embracing that — rather than fighting for strict consistency — is what keeps it fast and simple. The cache is a lossy accelerator, not the system of record.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the numbers — dataset size, working set, node count, and the hit-ratio math that justifies the whole investment.
+Estimates here pin down three things: how much you *can't* cache (so eviction matters), how many nodes you need (from memory), and how much the hit ratio shields the backing store. We size all of it from one set of assumptions.
+
+<DistributedCacheCapacity
+  assumptions={{
+    totalItems: 10000000000,
+    avgItemBytes: 1000,
+    cacheableFraction: 0.2,
+    memoryPerNodeGb: 64,
+    peakReadsPerSecond: 50000000,
+    hitRatio: 0.95,
+  }}
+/>
+
+The takeaways. First, the cache holds a **fraction**, not the whole: the dataset is ~10 TB but the hot working set we keep is ~2 TB — so the cache is *deliberately* smaller than the data, and **eviction quality is what decides the hit ratio**. Cache everything and you've just built an expensive copy of the database; cache the right 20% and you serve 95% of reads. Second, **node count comes from memory**: holding a 2 TB working set at 64 GB per node needs ~**32 nodes**, and the keyspace is partitioned across them — which is exactly why consistent hashing matters. Third, and most important, **the hit ratio is the whole economic argument**: 50M reads/sec at a 95% hit ratio means only ~**2.5M/sec** reach the slow backing store — a 20× reduction — while each cache node fields ~**1.5M reads/sec** from memory. Push the hit ratio from 95% to 97.5% and you *halve* the load on the database again. A cache's capacity story is "hold the right fraction, and a couple of points of hit ratio is the difference between calm and catastrophe."
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core entities: the cache entry, the hash ring, the node, the replica set, and the backing store as source of truth.
+The model is deliberately tiny — a cache is a key/value map — but the metadata around each entry is what makes eviction and expiry work. The center is the **CacheEntry**, and the most important conceptual point is what's *not* in the model: durability. The cache is lossy, derived state; the backing store is the source of truth.
+
+<EntityModel
+  name="CacheEntry"
+  description="One entry per cached key — the unit stored, looked up, expired, and evicted. Beyond the value, it carries just enough metadata to expire on time and to decide what to drop when memory is full."
+  fields={[
+    { name: "key", type: "string (hash key)", notes: "what the consistent-hash ring maps to a node" },
+    { name: "value", type: "bytes", notes: "the cached payload (opaque to the cache)" },
+    { name: "size_bytes", type: "int", notes: "for memory accounting and eviction" },
+    { name: "expires_at", type: "timestamp | null", notes: "TTL; entry is invalid past this" },
+    { name: "last_accessed", type: "timestamp", notes: "drives LRU eviction" },
+    { name: "version", type: "int", notes: "for replication / optimistic invalidation" },
+  ]}
+  keys="The key is hashed onto a ring to choose the owning node (and its replicas); see Consistent Hashing. expires_at gives TTL expiry; last_accessed (or an access counter) drives LRU/LFU eviction. Crucially, a CacheEntry is disposable: it can be evicted or lost on a node crash with no data loss, because the authoritative copy lives in the backing store and is reloaded on the next miss."
+/>
+
+Three concepts complete the picture. The **hash ring** is the logical structure that maps every key to a node (and, with virtual nodes, spreads keys evenly); a **node** owns an arc of the ring. A **replica set** holds copies of a node's entries on other nodes, for availability and read scale. And the **backing store** — a database or object store — is the source of truth the cache accelerates: every entry in the cache is a derived copy that can be regenerated, which is exactly what lets the cache be lossy, evictable, and fast.
 
 <h2 id="api-design">API Design</h2>
 
-This section specifies the client-facing API — get, set, and delete — and explains how the client library handles consistent-hash routing transparently.
+The interface is the simplest in the curriculum — three verbs on a key — and that simplicity is the point: a cache trades rich semantics for speed. The defining behavior isn't in the request shape but in the response to a `GET`: **hit or miss**, where a miss is a normal, expected outcome the caller handles by loading from the store.
+
+<ApiContract
+  method="GET"
+  path="/cache/{key}"
+  summary="Look up a value by key. A miss is normal — the caller loads from the backing store and populates the cache."
+  request={`GET /cache/user:42:profile`}
+  response={`HTTP/1.1 200 OK            // hit
+{ "value": "…", "ttl_remaining": 240 }
+
+HTTP/1.1 404 Not Found     // miss
+{ "miss": true }`}
+  statusCodes={[
+    { code: "200", meaning: "Hit — value returned from memory in well under a millisecond" },
+    { code: "404", meaning: "Miss — not cached (or expired); caller reads through to the store" },
+  ]}
+  notes="A real cache uses a compact binary protocol, not HTTP, and a client library that hashes the key to the owning node so the request goes there directly. A miss is not an error — it's the expected path that triggers a read-through and a populate so the next read hits."
+/>
+
+<ApiContract
+  method="PUT"
+  path="/cache/{key}"
+  summary="Store a value, optionally with a TTL. Used to populate after a miss or to update on a write."
+  request={`PUT /cache/user:42:profile
+
+{ "value": "…", "ttl_seconds": 300 }`}
+  response={`HTTP/1.1 204 No Content`}
+  statusCodes={[
+    { code: "204", meaning: "Stored (may evict another entry if memory is full)" },
+    { code: "413", meaning: "Value exceeds the per-item size limit" },
+  ]}
+  notes="A TTL bounds staleness and is the simplest invalidation mechanism. Setting a value may trigger eviction of a colder entry if the node is at its memory limit. DELETE /cache/{key} explicitly invalidates an entry — used by write paths to keep the cache consistent with the store."
+/>
+
+The whole API is get / set / delete by key, and the routing — *which node* a key lives on — is handled by the client library or a proxy using the consistent-hash ring, transparently to the caller. Keeping the surface this thin is deliberate: every feature you add to a cache is latency you can't afford on a sub-millisecond path.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the overall architecture: client, cache router, sharded cache nodes, replicas, backing store, and the membership service that keeps the ring current.
+The architecture partitions keys across in-memory nodes, replicates each node for safety, and falls back to the backing store on a miss — with a membership service watching for node churn.
+
+<DistributedCacheArchitecture />
+
+- **Client (with cache library).** The application. Its cache client hashes a key onto the ring and sends the request straight to the owning node — so there's no central bottleneck on the hot path.
+- **Cache router / consistent-hash ring.** The logic (in the client library or a thin proxy) that maps every key to its node and replicas. This is where minimal-movement-under-churn lives.
+- **Cache nodes (shards).** The in-memory key/value stores, each owning an arc of the ring. They serve hits in sub-millisecond time, enforce TTLs, and evict under memory pressure.
+- **Replicas.** Copies of a node's data on other nodes, for availability (a node can die without losing the shard's service) and read scale (reads can fan out to replicas).
+- **Backing store.** The database behind the cache — the source of truth. On a miss, the value is read from here and populated into the cache; the cache exists to keep traffic *off* it.
+- **Membership / gossip.** Tracks which nodes are alive via heartbeats/gossip, so the ring can be updated when a node joins or fails and routing stays correct.
+
+The decisive boundary is **the cache is a fast, lossy front for a durable store**. Keys are spread by the ring so load is even and churn is cheap; replicas keep a shard available when a node dies; and a miss simply degrades to a (slower) read-through rather than an error. Every section that follows elaborates one piece: how the ring moves few keys (consistent hashing), how a bounded node decides what to keep (eviction), how replicas stay consistent enough (replication), and how the two signature failures — hot keys and stampedes — are tamed.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section traces four key flows — cache hit, cache miss with read-through, node rebalance after failure, and cache stampede with request coalescing.
+Four flows cover the system: a hit, a miss that reads through and populates, a node leaving the ring, and a stampede being collapsed. The first two are the everyday path; the last two are where "distributed" earns its keep.
+
+**Cache hit.** The client hashes the key, sends the GET to the owning node, and the node returns the value from memory — one network hop, sub-millisecond, the database never involved. This is the path that should happen ~95% of the time.
+
+<CacheHitSequence />
+
+**Cache miss.** The key isn't cached (or expired). The node reports a miss, the value is loaded from the backing store, written back into the cache with a TTL, and returned — so the *next* read for that key is a hit.
+
+<CacheMissSequence />
+
+**Node rebalance.** A node fails (or joins). The membership service detects it and the ring reassigns only *that node's* arc of keys to its successor; every other node's keys stay exactly where they were. The relocated keys simply miss once and reload. This minimal movement is the entire reason for consistent hashing.
+
+<NodeRebalanceSequence />
+
+**Stampede.** A popular key expires and thousands of requests miss it at the same instant. Instead of all of them hammering the backing store, the node **coalesces** them into a single load (single-flight): one request fetches and populates, the rest wait and share the result.
+
+<StampedeSequence />
 
 <h2 id="consistent-hashing">Consistent Hashing</h2>
 
-This section explains the hash-ring approach and why virtual nodes minimize key movement when nodes join or leave.
+This is the centerpiece, and the reason a distributed cache is more than a sharded hash map. The naive way to spread keys across `N` nodes is `node = hash(key) % N`. It distributes evenly — and it is catastrophic under churn. The instant `N` changes (a node added or removed), the modulus changes for **almost every key**, so nearly the entire keyspace remaps to a different node at once. In a database that's an expensive reshuffle; in a *cache* it's far worse, because every remapped key is now a **miss** — so a single node failure converts into a near-total cache wipe and a thundering herd onto the backing store at the worst possible moment. Membership changes must be cheap, and `% N` makes them maximally expensive.
+
+**Consistent hashing** fixes this by hashing both keys and nodes onto the same circular space — a **ring**. A key is owned by the first node found walking clockwise from the key's position. Now adding or removing a node only affects the **arc between that node and its predecessor**: when a node leaves, just its keys fall to the next node clockwise; when one joins, it takes over only the slice of keys in its new arc. Everyone else is undisturbed. Instead of remapping ~100% of keys, a membership change moves only about **1/N** of them — the minimal possible disruption, and exactly the property the requirements demanded.
+
+<Callout variant="info" title="Virtual nodes make the ring even and smooth">
+A plain ring has two problems: with few nodes, keys land unevenly (some nodes get a much bigger arc), and when a node dies, its *entire* arc dumps onto a single successor — an instant hotspot. **Virtual nodes** solve both: each physical node is placed on the ring at many positions (say a few hundred), so the keyspace is sliced into many small arcs spread across all nodes. Load evens out by the law of large numbers, and when a node fails, its many small arcs redistribute across *many* successors instead of crushing one. Virtual nodes also make heterogeneous hardware easy — a bigger node simply gets more virtual positions. This is how real systems (Dynamo, Cassandra, Memcached/Redis clients) actually deploy consistent hashing.
+</Callout>
+
+<KnowledgeCheck
+  question="Why is `node = hash(key) % N` a poor way to partition keys across cache nodes, and what replaces it?"
+  options={[
+    "It's too slow to compute the modulus",
+    "When N changes (a node is added or removed), the modulus changes for almost every key, so nearly the entire keyspace remaps at once — and in a cache every remapped key becomes a miss, causing a near-total cache wipe and a herd onto the store; consistent hashing (a ring + virtual nodes) replaces it, moving only ~1/N of keys on a membership change",
+    "It can only support a prime number of nodes",
+    "It doesn't distribute keys evenly enough",
+  ]}
+  answer={1}
+  explanation="The fatal flaw of modulo sharding is churn, not distribution: changing N reshuffles essentially all keys, and in a cache that means a mass of simultaneous misses hammering the backing store right when a node just failed. Consistent hashing maps keys and nodes onto a ring so a membership change disturbs only the affected node's arc (~1/N of keys), and virtual nodes keep load even and spread a failed node's keys across many successors."
+/>
 
 <h2 id="eviction-policies">Eviction Policies</h2>
 
-This section compares LRU, LFU, and TTL-based eviction and explains when each is the right choice for a bounded in-memory cache.
+Because the cache is deliberately smaller than the dataset, every node eventually fills up, and a `set` into a full node must **evict** something to make room. The eviction policy — which entry to drop — directly determines the hit ratio, so it's not a detail; it's the lever that decides whether the cache is worth its memory. The goal is to keep the items most likely to be requested again and discard the ones that won't be.
 
-<h2 id="replication-consistency">Replication &amp; Consistency</h2>
+The common policies trade simplicity against accuracy. **LRU (least recently used)** evicts the entry untouched for the longest, betting that recently-used items will be used again — a strong default for most workloads, and cheap to approximate. **LFU (least frequently used)** evicts the entry with the fewest accesses, which better protects items that are popular over the long haul but slow to react when popularity shifts. **TTL/expiry** removes entries after a fixed lifetime regardless of use — the simplest way to bound staleness — and is usually layered *underneath* LRU/LFU as a correctness mechanism rather than a capacity one. **Random** eviction is crude but nearly free and surprisingly competitive at scale.
 
-This section covers how writes propagate to replicas, the tunable consistency knobs (synchronous vs. asynchronous replication), and the staleness trade-off.
+<KnowledgeCheck
+  question="Why does a cache need an eviction policy at all, and what does the choice of policy determine?"
+  options={[
+    "To free memory leaks in the cache process",
+    "Because the cache is intentionally smaller than the dataset, so a full node must drop an entry to admit a new one; the policy (LRU, LFU, TTL, random) decides which entries survive, which directly sets the hit ratio — the whole economic value of the cache",
+    "Because keys expire and must be deleted manually",
+    "To keep replicas in sync",
+  ]}
+  answer={1}
+  explanation="A cache holds only the hot fraction of the data, so memory fills and admitting a new entry requires evicting an existing one. Which entry you drop is exactly what determines whether future reads hit or miss, so the eviction policy is the primary lever on the hit ratio. LRU (recency) is a strong, cheap default; LFU favors long-term popularity; TTL bounds staleness; and at scale these are often sampled/approximate to stay fast."
+/>
 
-<h2 id="hot-keys">Hot Keys &amp; Hotspots</h2>
+At very high throughput, exact LRU (a precisely ordered list updated on every access) is too much bookkeeping, so production caches use **approximations** — sampling a handful of entries and evicting the coldest of the sample, or coarse "recently used" bits — which get nearly the hit ratio of true LRU at a fraction of the cost. The lesson: pick the policy that matches your access pattern, and approximate it to keep the hot path fast.
 
-This section explains why a single popular key can saturate one shard and how near-cache replication and load-aware routing mitigate the hotspot.
+<h2 id="replication-consistency">Replication & Consistency</h2>
+
+Replication copies each node's entries onto one or more other nodes, and it buys two things. **Availability:** if a node dies, a replica already holds its shard, so the keys stay served instead of becoming a wall of misses against the backing store. **Read scale:** popular keys can be read from any replica, spreading hot-key load across machines. The cost is keeping the copies consistent enough — and "enough" is the operative word, because a cache has latitude a database doesn't.
+
+The central choice is **synchronous vs. asynchronous** replication. Synchronous (write to the replica before acknowledging) keeps replicas perfectly in step but adds latency to every write and stalls if a replica is slow. Asynchronous (acknowledge immediately, copy in the background) keeps writes fast but means a replica can briefly serve a slightly stale value. For a cache, **async is usually right**: the cache is *already* an approximate, slightly-stale view of the source of truth, so a replica being a few milliseconds behind is well within the staleness the system already tolerates. This is the heart of **tunable consistency** — you dial freshness against latency and scale per workload, and most caches happily sit on the relaxed end.
+
+<KnowledgeCheck
+  question="Why is asynchronous replication usually acceptable for a distributed cache when it might not be for the primary database?"
+  options={[
+    "Because caches never lose data",
+    "Because a cache is already an approximate, slightly-stale view of the backing store (the source of truth), so a replica lagging by milliseconds is within the staleness the system already tolerates — and async replication keeps writes fast and avoids stalling on a slow replica",
+    "Because caches don't support synchronous replication",
+    "Because the cache is the source of truth",
+  ]}
+  answer={1}
+  explanation="The database is authoritative, so its replication consistency can be a correctness concern; the cache is explicitly a lossy, derived, slightly-stale accelerator in front of it. Given the system already accepts cache staleness, an async replica that's a few milliseconds behind adds no meaningful incorrectness, while keeping writes low-latency and resilient to a slow replica. That's tunable consistency: relax freshness where the workload allows to gain speed and scale."
+/>
+
+<h2 id="hot-keys">Hot Keys & Hotspots</h2>
+
+Consistent hashing spreads keys evenly, but it can't spread *one* key — and a single wildly popular key (a celebrity's profile, a viral post, a global config value) routes all its traffic to one node, which can saturate that node's CPU or network while the rest of the cluster sits idle. This **hot key** problem is a hotspot that even sweet partitioning can't fix, because the unit of distribution is the key, and you can't shard below a single key by hashing alone.
+
+The mitigations stack. **Replicate the hot key** across several nodes and read from any of them, spreading its load — the most direct fix. **Client-side (near) caching** keeps the hottest keys in the application process itself, so most reads never even reach the cache cluster; the trade is a little extra staleness from the local copy. **Key splitting** turns one hot key into several (`config` → `config:0..9`) so the load fans across nodes, where the value tolerates it. And **request coalescing** (next section) keeps a hot key's *misses* from amplifying. The detection side matters too: track per-key request rates so a hot key is spotted and promoted to one of these defenses before it melts a node.
+
+<KnowledgeCheck
+  question="Consistent hashing distributes keys evenly, so why can a single hot key still overwhelm one node, and how do you mitigate it?"
+  options={[
+    "It can't — consistent hashing prevents all hotspots",
+    "Because the unit of distribution is the key, so all traffic for one popular key lands on its single owning node regardless of how evenly keys are spread; mitigate by replicating the hot key across nodes, caching it client-side (near cache), splitting the key, and coalescing its misses",
+    "Because the hash function is broken for popular keys",
+    "By increasing the TTL on the hot key",
+  ]}
+  answer={1}
+  explanation="Even distribution is about spreading many keys across nodes; it does nothing for a single key whose traffic all routes to one node. That node can saturate while others idle. Because you can't shard below one key by hashing, you spread its load another way: replicate it to multiple nodes and read any, keep it in a client-side near cache so most reads skip the cluster, split it into sub-keys, and coalesce concurrent misses so a re-population doesn't dogpile."
+/>
 
 <h2 id="cache-stampede">Cache Stampede</h2>
 
-This section describes the thundering-herd failure when a hot key expires simultaneously for many callers, and how request coalescing (single-flight) with TTL jitter prevents it.
+A **cache stampede** (or dogpile / thundering herd) is the cache's most famous failure, and it strikes precisely when a key is *popular*. A heavily-read key expires or is evicted; in the next instant, thousands of concurrent requests all look for it, all miss, and all rush to the backing store to recompute the same value at the same time. The store, sized for the *cached* read rate of that key (≈ zero, since the cache was absorbing it), is suddenly hit by its full uncached load in a spike — and may buckle, which slows every request, which lengthens the window, which makes it worse. One expiry can cascade into an outage.
 
-<h2 id="write-policies">Write Policies &amp; Invalidation</h2>
+The defenses tame the herd at the moment of the miss:
 
-This section compares write-through, write-back, and write-around policies alongside cache invalidation strategies, and explains which guarantees each offers.
+- **Request coalescing / single-flight.** When many requests miss the same key at once, let exactly **one** of them load from the store while the others wait for its result. The store sees a single load instead of thousands — the most important defense, and the one shown in the stampede flow.
+- **TTL jitter.** If many related keys are set with the same TTL, they all expire together and stampede in lockstep. Adding a small random offset to each TTL **spreads expiries over time** so misses arrive as a trickle, not a wall.
+- **Early / asynchronous recompute.** Refresh a hot key *before* it expires (in the background, while still serving the old value), so it never goes cold under load.
+- **Locks / leases.** A miss grabs a short lease to recompute; others briefly serve stale or wait, ensuring only the lease-holder hits the store.
 
-<h2 id="scalability-evolution">Scalability &amp; Evolution</h2>
+<Callout variant="warning" title="Popularity is what makes a stampede dangerous">
+The cruel irony of a stampede is that it scales with success: the more a key is read, the bigger the herd when it expires, and the harder the backing store is hit by a load it was being shielded from. So the keys you most need the cache for are exactly the ones that can take the database down when they expire. That's why a serious cache design treats stampede protection — coalescing plus TTL jitter — as mandatory for hot keys, not optional. It's the same single-flight idea the URL Shortener tutorial used to collapse concurrent cache-miss loads; here it's load-bearing.
+</Callout>
 
-This section maps out how the cluster grows from a handful of nodes to hundreds, covering resharding, tiered caches, and multi-region deployments.
+<h2 id="write-policies">Write Policies & Invalidation</h2>
 
-<h2 id="resiliency-failure-modes">Resiliency &amp; Failure Modes</h2>
+So far reads dominate, but writes raise the hardest question in caching: when the underlying data changes, how do you keep the cache from serving a stale copy? The answer is a **write policy**, and the four common ones trade freshness, latency, and complexity differently.
 
-This section catalogs the failure modes — node crash, network partition, replica lag, and stampede — and the mitigations that keep the system serving traffic.
+- **Cache-aside (lazy loading).** The application owns the cache: on a read it checks the cache, loads from the store on a miss, and populates; on a write it updates the store and **invalidates** (deletes) the cached entry, so the next read reloads fresh. Simple, resilient (a cache outage just means more store reads), and the most common pattern — at the cost of a guaranteed miss after every write.
+- **Write-through.** Writes go *through* the cache, which updates itself and the store synchronously. The cache is always fresh and reads after a write hit, but every write pays the cache-plus-store latency, and you cache data that may never be read.
+- **Write-back (write-behind).** Writes update the cache and are flushed to the store asynchronously. Writes are very fast and absorb bursts, but an unflushed node crash can lose writes — so it trades durability for speed and is used only where that's acceptable.
+- **Write-around.** Writes go straight to the store, bypassing the cache; the entry is cached only on a later read. This avoids polluting the cache with write-once data, at the cost of a miss on the first read after a write.
 
-<h2 id="tradeoffs-alternatives">Trade-offs &amp; Alternatives</h2>
+<KnowledgeCheck
+  question="In the cache-aside (lazy-loading) pattern, how is the cache kept consistent with the backing store on a write?"
+  options={[
+    "The cache automatically detects the store changed",
+    "The application writes to the backing store and then invalidates (deletes) the cached entry, so the next read misses and reloads the fresh value — accepting one guaranteed miss after each write in exchange for simplicity and resilience",
+    "Writes are blocked until all replicas update",
+    "The cache is never updated on writes",
+  ]}
+  answer={1}
+  explanation="Cache-aside puts the application in control: it reads through the cache and, on a write, updates the source of truth and then invalidates the stale cache entry rather than trying to update it in place. The next read for that key misses and repopulates with the current value. It's popular because it's simple and fails gracefully — if the cache is down, reads just fall through to the store — though it costs a miss right after each write."
+/>
 
-This section weighs the key design trade-offs and compares the approach to alternatives such as client-side caching, sidecar caches, and managed services like Redis and Memcached.
+The recurring hazard across all of these is **invalidation** — making sure a changed value doesn't linger in cache. TTLs provide a cheap upper bound on staleness (the entry self-expires), and explicit deletes on write provide immediacy; most systems use both. As the saying goes, cache invalidation is one of the genuinely hard problems, because every write path must remember to invalidate, and a missed invalidation is a silently stale read.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+Don't build the multi-region tiered cache on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single cache node in front of the store", "Day one; the working set fits one box; prove the hit-ratio win", "No headroom or HA; a node loss is a full cache wipe and a herd on the store"],
+    ["Consistent-hash cluster with client routing", "Working set or load outgrows one node", "Operating a ring and membership; clients must route by hash; rebalancing on churn"],
+    ["Add replicas + hot-key and stampede defenses", "Node loss can't drop a shard; hot keys and expiries threaten the store", "Replication lag and memory cost; coalescing, near-cache, and TTL jitter to run"],
+    ["Multi-region / tiered (near + remote) caching", "Global latency; protect the store across regions", "Cross-region consistency and invalidation are hard; more layers to keep coherent"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the failure you're buying out of. A single node proves the cache earns its keep, but it has no resilience — lose it and you've wiped the cache and herded the store. Sharding with a **consistent-hash cluster** gives capacity and cheap churn; adding **replicas plus hot-key and stampede defenses** removes the two ways a cache takes down the very store it protects — and is where most systems should live. Only a global product needs **multi-region or tiered caching** (a small near-cache in front of a larger remote cluster), and it pays for it in the genuine difficulty of cross-region invalidation. Most distributed caches are happy at "consistent-hash cluster, replicated, with stampede protection."
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. A cache's failures are unusual because the cache itself is *expendable* — losing cached data isn't data loss — so the real danger isn't the cache breaking; it's the cache failing in a way that **stampedes the backing store**.
+
+<FailureMatrix
+  rows={[
+    { failure: "Single cache node fails", impact: "That shard's keys miss until reloaded; not data loss", detection: "Membership heartbeat / gossip timeout", mitigation: "A replica takes over the shard; consistent hashing reassigns only that node's arc; reads fall through to the store meanwhile", recovery: "Replica promoted or node rejoins; keys repopulate on miss" },
+    { failure: "Cold start / mass cache wipe", impact: "Near-zero hit ratio drives a herd onto the store", detection: "Hit-ratio drop; store load spike", mitigation: "Warm the cache (preload hot keys); coalesce misses; rate-limit store loads; gradual ramp", recovery: "Hit ratio climbs as the working set repopulates" },
+    { failure: "Hot-key meltdown", impact: "One node saturates on a single popular key", detection: "Per-key/per-node rate skew", mitigation: "Replicate the hot key across nodes, near-cache it client-side, split the key", recovery: "Load spreads across nodes/clients; node recovers" },
+    { failure: "Cache stampede on expiry", impact: "Concurrent misses dogpile the store, risking an outage", detection: "Spike of identical misses; store latency", mitigation: "Request coalescing / single-flight; TTL jitter; early async recompute", recovery: "One load repopulates; the herd is collapsed to a single fetch" },
+    { failure: "Replication lag / split-brain", impact: "A replica serves a stale or divergent value", detection: "Replica version skew; partition alarms", mitigation: "Bounded staleness is accepted; on partition, prefer one primary per shard; reconcile by version", recovery: "Replicas converge; stale entries expire by TTL" },
+    { failure: "Memory pressure / mass eviction", impact: "Hit ratio drops as entries are evicted early", detection: "Eviction rate; memory high-water", mitigation: "Add nodes/memory; tune eviction; cap item sizes; shed low-value keys", recovery: "Working set fits again; hit ratio recovers" },
+    { failure: "Backing store outage", impact: "Misses can't be served — the cache can't shield a dead store", detection: "Store error rate on read-through", mitigation: "Serve stale cached values where acceptable; coalesce and rate-limit retries; fail fast", recovery: "Store returns; misses succeed and repopulate" },
+  ]}
+/>
+
+The theme: **a cache can't lose data, but it can stampede the store.** Because every entry is a regenerable copy, node loss and eviction degrade to *misses*, not data loss — annoying but recoverable. The failures to design hardest against are the ones that convert a cache hiccup into a **load spike on the backing store**: a cold start, a hot key, and an expiry stampede. Coalescing, replication, near-caching, and TTL jitter all exist to keep a cache problem from becoming a database outage.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Partition keys across in-memory nodes with consistent hashing and virtual nodes, evict with (approximate) LRU plus TTLs, replicate shards asynchronously for availability and read scale, manage the cache with the cache-aside pattern (invalidate on write), and defend the backing store with hot-key replication/near-caching and stampede protection (request coalescing + TTL jitter)."
+  rationale="Consistent hashing is what makes the cache distributable: it spreads keys evenly and, crucially, moves only ~1/N of them when a node joins or fails, so churn doesn't wipe the cache. LRU with TTLs keeps the right hot fraction in bounded memory, setting the hit ratio that justifies the system. Async replication matches a cache's already-tolerated staleness while adding availability. And because the cache's worst failures are the ones that stampede the store, coalescing, near-caching, and TTL jitter are treated as core, not optional."
+  alternatives="hash%N sharding — even distribution but catastrophic churn, disqualified; LFU instead of LRU — better for stable popularity, slower to adapt; synchronous replication — fresher replicas but slower writes and stall risk; write-through/write-back instead of cache-aside — fresher or faster writes but more coupling and (write-back) durability risk; no replication — simpler but a node loss wipes a shard and herds the store."
+  revisitWhen="The access pattern shifts (favoring LFU or a different working-set size), staleness tolerance tightens (pushing toward sync replication or write-through), the workload develops persistent hot keys (more near-caching/splitting), or global latency/residency forces multi-region tiered caching with its harder invalidation."
+/>
+
+Three axes capture the real tension:
+
+- **Consistent hashing vs. simpler sharding.** `hash % N` distributes just as evenly and is trivial, but it remaps almost everything on churn — fatal for a cache. Consistent hashing (with virtual nodes) costs a little complexity to make membership changes cheap; for a cache that's non-negotiable.
+- **LRU vs. LFU (and exact vs. approximate).** LRU adapts fast to changing hotness and is cheap to approximate; LFU protects long-term-popular items but reacts slowly. Default to (approximate) LRU and reach for LFU only when popularity is stable and long-lived.
+- **Freshness vs. speed.** Synchronous replication and write-through keep the cache fresh but slow writes and add coupling; async replication and cache-aside keep it fast and simple at the cost of slight staleness. Because a cache is a slightly-stale accelerator by nature, default to the fast, relaxed end and tighten only where correctness demands.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section distills the design into the five or six points an interviewer most wants to hear, ready to be delivered in the final minutes of a session.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A distributed cache is a fleet of in-memory nodes in front of a slower store, and its whole value is a high hit ratio — at 95%, fifty million reads a second become two and a half million on the database. It looks like a networked hash map, but 'distributed' is the hard part. First, partitioning: hash%N is fatal because changing the node count remaps almost every key, and in a cache a remapped key is a miss, so one node failure wipes the cache and herds the store — so I use consistent hashing on a ring with virtual nodes, which moves only about 1/N of keys on a membership change and keeps load even. Second, eviction: the cache is deliberately smaller than the data, so it evicts with approximate LRU plus TTLs, and that policy sets the hit ratio. Third, replication: async replicas give availability and read scale, and async is fine because a cache is already a slightly-stale view of the source of truth. Then the two signature failures: a hot key all routes to one node, mitigated by replicating it, near-caching it client-side, or splitting it; and a stampede, when a popular key expires and thousands of misses dogpile the store, mitigated by request coalescing so only one load happens, plus TTL jitter. Writes use cache-aside — update the store, invalidate the entry. The cache can't lose data since it's all regenerable, but its worst failures are the ones that stampede the store, so coalescing and replication are core."
+</Callout>
 
-<h2 id="knowledge-checks-faq">Knowledge Checks &amp; FAQ</h2>
+Common follow-ups an interviewer will use to go deeper: *Why is hash%N fatal and what replaces it? What are virtual nodes for? Which eviction policy and why? Why is async replication OK for a cache? How do you handle a hot key? What is a cache stampede and how do you prevent it? Cache-aside vs write-through? What actually happens to the backing store when the cache fails?* Each maps directly to a section above.
 
-This section provides review questions and answers to the most common follow-up questions interviewers ask about distributed caches.
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+<KnowledgeCheck
+  question="What is the single most important number that justifies a cache's existence, and what drives it?"
+  options={[
+    "Total storage capacity; driven by disk size",
+    "The hit ratio — the fraction of reads served from cache — driven by how much of the hot working set you can hold (memory) and how well you evict (policy); a high hit ratio is what shields the slow backing store from most reads",
+    "Write throughput; driven by replication",
+    "The number of nodes; driven by the network",
+  ]}
+  answer={1}
+  explanation="A cache earns its keep by keeping reads off the backing store, and the hit ratio measures exactly that — at 95%, only 5% of reads fall through. It's set by how much of the hot data fits in memory and how well the eviction policy keeps the right items, which is why memory sizing and eviction are the central capacity and design levers."
+/>
+
+<KnowledgeCheck
+  question="Why does a cache tolerate `hash%N` sharding far worse than a database would?"
+  options={[
+    "Because caches use a different hash function",
+    "Because in a cache, a key that remaps to a different node on a membership change becomes an immediate miss — so hash%N's wholesale remapping turns one node change into a near-total cache wipe and a herd on the store, whereas a database 'merely' reshuffles stored data",
+    "Because caches can't compute modulo quickly",
+    "Because databases never change their node count",
+  ]}
+  answer={1}
+  explanation="Both systems suffer hash%N's wholesale remapping on churn, but the consequence differs: a database physically moves data (expensive but recoverable), while a cache simply finds the key absent at its new node — a miss. So a single node change can invalidate almost the entire cache at once and stampede the backing store, which is why caches specifically need consistent hashing's minimal key movement."
+/>
+
+<KnowledgeCheck
+  question="What problem do virtual nodes solve in a consistent-hashing ring?"
+  options={[
+    "They encrypt the keys",
+    "They place each physical node at many ring positions, so the keyspace is sliced into many small arcs — evening out load across nodes and, when a node fails, spreading its arcs across many successors instead of dumping its whole range on one (also easing heterogeneous hardware)",
+    "They increase the total memory of the cluster",
+    "They make the hash function consistent",
+  ]}
+  answer={1}
+  explanation="A plain ring with few nodes distributes unevenly and concentrates a failed node's entire arc on its single successor. Giving each physical node many virtual positions chops the ring into numerous small arcs spread across all nodes, so load evens out and a failure's keys fan across many nodes. It also lets a bigger machine take more positions, handling heterogeneous capacity gracefully."
+/>
+
+<KnowledgeCheck
+  question="Why is an eviction policy the primary lever on a cache's hit ratio?"
+  options={[
+    "Because it controls the network bandwidth",
+    "Because the cache holds only a fraction of the dataset, so when memory is full, admitting a new entry means dropping an existing one — and which entry you drop is exactly what determines whether future reads hit; LRU/LFU/TTL choices directly shape the hit ratio",
+    "Because it sets the replication factor",
+    "Because it decides the consistent-hash positions",
+  ]}
+  answer={1}
+  explanation="Since a cache is intentionally smaller than the data, it's always making room by evicting. Keeping items likely to be re-read (LRU's recency bet, LFU's frequency bet) raises the hit ratio; evicting them lowers it. So the eviction policy, more than anything else local to a node, governs how effective the cache is — and at scale it's approximated to stay fast."
+/>
+
+<KnowledgeCheck
+  question="A popular key expires and thousands of requests miss it simultaneously. What is this called and how is it prevented?"
+  options={[
+    "A hash collision; prevented by rehashing",
+    "A cache stampede (dogpile / thundering herd); prevented by request coalescing / single-flight so only one request loads from the store while others wait, plus TTL jitter to spread expiries and early async recompute of hot keys",
+    "An eviction storm; prevented by adding memory",
+    "A split-brain; prevented by quorum",
+  ]}
+  answer={1}
+  explanation="When a heavily-read key goes cold, its full uncached load hits the backing store in a single spike — a stampede that can cascade into an outage because the store wasn't sized for that key's raw rate. Request coalescing collapses the herd into one load shared by all waiters; TTL jitter staggers expiries so related keys don't all go cold together; and refreshing hot keys before they expire keeps them warm under load."
+/>
+
+<KnowledgeCheck
+  question="In cache-aside, what happens on a write, and why is the pattern so popular?"
+  options={[
+    "The cache is updated in place and the store is skipped",
+    "The application writes to the backing store and invalidates (deletes) the cached entry so the next read reloads fresh; it's popular because it's simple, keeps the app in control, and fails gracefully — if the cache is down, reads just fall through to the store",
+    "The write blocks until every replica is updated",
+    "The write is buffered and flushed later, risking loss",
+  ]}
+  answer={1}
+  explanation="Cache-aside reads through the cache and, on a write, updates the source of truth then deletes the stale cache entry, forcing a fresh reload on the next read. Its appeal is operational: minimal coupling, easy to reason about, and resilient — a cache outage degrades to more store reads rather than incorrectness. The trade-off is a guaranteed miss right after each write and the need to remember to invalidate on every write path."
+/>
+
+<Faq
+  items={[
+    { question: "What is a distributed cache and why use one?", answer: "It's a cluster of in-memory nodes that sits in front of a slower backing store and serves reads in well under a millisecond. Its value is the hit ratio: by answering most reads from memory, it slashes both latency and the load on the database — at a 95% hit ratio, only 1 in 20 reads reaches the store. It's a read-heavy-workload accelerator, used in front of nearly every large system." },
+    { question: "Why not just use hash(key) % N to pick a node?", answer: "Because it's catastrophic under churn. When the node count N changes, the modulus changes for almost every key, so nearly the whole keyspace remaps at once — and in a cache, a remapped key is a miss. So a single node failure can wipe the cache and herd the backing store. Consistent hashing moves only about 1/N of keys on a membership change, which is the whole reason it exists." },
+    { question: "How does consistent hashing work?", answer: "Hash both keys and nodes onto a circular space (a ring); a key belongs to the first node clockwise from it. Adding or removing a node only affects the arc between it and its predecessor, so only that slice of keys moves — about 1/N — while everyone else is untouched. Virtual nodes (placing each physical node at many ring positions) keep load even and spread a failed node's keys across many successors." },
+    { question: "Why does a cache need to evict, and which policy is best?", answer: "Because it's deliberately smaller than the dataset, so a full node must drop an entry to admit a new one. LRU (least recently used) is a strong, cheap default that bets recent items recur; LFU favors long-term-popular items but adapts slowly; TTL bounds staleness underneath them; random is crude but nearly free. At scale these are approximated (e.g. sampled LRU) to keep the hot path fast. The policy directly sets the hit ratio." },
+    { question: "Why is it OK for a cache to be slightly stale?", answer: "Because the cache is a derived, lossy view of the backing store, which is the real source of truth. The system is already built to tolerate the cache lagging reality a little, so relaxing consistency — async replication, TTL-bounded freshness, reads from replicas — costs no meaningful correctness while buying speed and scale. That latitude is exactly what lets a cache be fast; a strictly-consistent cache would lose much of its point." },
+    { question: "What is replication for in a cache?", answer: "Two things: availability and read scale. If a node dies, a replica already holds its shard, so the keys keep being served instead of becoming a wall of misses against the store; and a popular key can be read from any replica, spreading its load. Replication is usually asynchronous because a cache already tolerates slight staleness, and that keeps writes fast and resilient to a slow replica." },
+    { question: "What is a hot key and how do you handle it?", answer: "A single key so popular that all its traffic routes to one node and saturates it, even though keys overall are spread evenly — because you can't shard below one key by hashing. Mitigations: replicate the hot key across nodes and read any of them, keep it in a client-side near cache so most reads skip the cluster, split it into sub-keys, and coalesce its misses. Detecting per-key rates lets you promote a key to these defenses before it melts a node." },
+    { question: "What is a cache stampede and why is it dangerous?", answer: "When a heavily-read key expires or is evicted, thousands of concurrent requests miss it at once and all rush to recompute it from the backing store simultaneously — a dogpile. It's dangerous because it scales with popularity: the keys the cache shields most are the ones whose expiry can take the store down. It's prevented with request coalescing (one load shared by all waiters), TTL jitter, and refreshing hot keys before they expire." },
+    { question: "What's the difference between cache-aside, write-through, write-back, and write-around?", answer: "Cache-aside: the app reads through the cache and, on a write, updates the store and invalidates the entry — simple and resilient, with a miss after each write. Write-through: writes update cache and store synchronously — always fresh but slower writes. Write-back: writes hit the cache and flush to the store later — fast but can lose unflushed writes on a crash. Write-around: writes go to the store and skip the cache — avoids caching write-once data at the cost of a first-read miss." },
+    { question: "Why is cache invalidation considered hard?", answer: "Because keeping a derived copy consistent with a changing source is a cross-cutting concern: every write path must remember to invalidate or update the cached entry, and a single missed invalidation is a silently stale read with no error to flag it. TTLs give a cheap upper bound on staleness (entries self-expire) and explicit deletes on write give immediacy; most systems use both, but the coordination across all writers is what makes it genuinely tricky." },
+    { question: "What happens when a cache node fails — is data lost?", answer: "No data is lost, because every cached entry is a regenerable copy of data that still lives in the backing store. The shard's keys simply miss until they're reloaded, and with consistent hashing only that node's arc is affected. A replica can take over the shard immediately to avoid even the misses. The real risk isn't losing the cache's data — it's the burst of misses temporarily herding the store, which replication and coalescing blunt." },
+    { question: "When should I not add a distributed cache?", answer: "When the workload is write-heavy or has little re-reading (the hit ratio stays low, so the cache adds complexity for little benefit), when data must be perfectly fresh and you can't tolerate any staleness, or when the dataset is small enough that the database serves it comfortably. A cache is a read-heavy accelerator that trades a little staleness for huge latency and load wins — if your workload doesn't fit that shape, it's complexity you don't need." },
+  ]}
+/>
