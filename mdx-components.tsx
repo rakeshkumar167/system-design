@@ -18,6 +18,7 @@ import { VideoStreamingCapacity } from "@/components/learning/video-streaming-ca
 import { CollaborativeDocEditorCapacity } from "@/components/learning/collaborative-doc-editor-capacity";
 import { DistributedCacheCapacity } from "@/components/learning/distributed-cache-capacity";
 import { CloudDriveCapacity } from "@/components/learning/cloud-drive-capacity";
+import { PaymentSystemCapacity } from "@/components/learning/payment-system-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -109,6 +110,7 @@ const teachingComponents = {
   CollaborativeDocEditorCapacity,
   DistributedCacheCapacity,
   CloudDriveCapacity,
+  PaymentSystemCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
