@@ -1,71 +1,386 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-A payment system interview tests whether you understand that correctness and durability matter far more than raw throughput.
+A payment system moves money: a customer pays a merchant, the funds travel through a bank or card network, and every cent is recorded so the books always balance. From the outside it looks trivial — accept a request, call a bank, return success — and that surface tempts you to design it like any other CRUD API in front of a third party. That instinct is the trap. The moment you remember that the thing being moved is *money*, and that networks time out, services crash, and clients retry, the easy version falls apart: a retried request must not charge the customer twice, a crash mid-flight must not lose or duplicate a payment, and a discrepancy with the bank must be *detectable*, not silently absorbed.
+
+The hard part is not throughput; it's **correctness under failure**. Notice the inversion from most system-design problems: a large processor runs only a few thousand payments a second — trivial QPS next to a cache's tens of millions of reads — so you will not spend your time on sharding for scale. You will spend it on four things. First, **exactly-once**: because clients and networks retry, the same logical payment arrives repeatedly, and an **idempotency key** must make duplicates return the *original* result instead of charging again. Second, an **immutable, always-balanced ledger**: money must be conserved, so every movement is recorded as equal **debits and credits** in an append-only **double-entry ledger**, balances are *derived* from it, and mistakes are fixed with new *reversing* entries, never edits. Third, the **dual-write problem**: writing to your ledger and calling an external bank cannot be one atomic transaction, so a crash between them must not lose or double a payment — which forces a **transactional outbox** or saga. Fourth, **reconciliation**: you must continuously prove your records match the external world and catch any drift. The reframe to lead with: *it looks like an API call that moves money, but the hard part is being correct when everything retries and fails — process each payment exactly once, keep an immutable ledger that always balances, coordinate safely with external banks, and reconcile to prove you never lost or created a cent.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- Are we the merchant integrating one PSP, or the processor/gateway in the middle? (This tutorial designs the processor — the system of record.)
+- What does "done" mean — authorized, captured, or settled? Payment has distinct stages, and conflating them hides bugs.
+- What's the consistency bar on balances — strictly correct always, or eventually? (For money, the ledger must always balance.)
+- Do we handle refunds, disputes/chargebacks, multi-currency? (Refunds in scope; disputes named; FX out of scope.)
+- What are the compliance constraints — do we touch raw card numbers, or tokenize? (We minimize PCI scope.)
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "correctness, not scale" reframe · **5 min** requirements and the money-conservation/exactly-once bars · **5 min** capacity (note throughput is modest; the ledger is the heavy, append-only core) · **5 min** entity model (Payment, LedgerEntry, Account, IdempotencyKey) and the API · **10 min** idempotency and the double-entry ledger — the centerpiece · **10 min** the state machine, the dual-write problem and the outbox, and reconciliation · **5 min** security/compliance, failure modes, and wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for idempotency keys, an immutable double-entry ledger, and an outbox, not whether you can name a card network.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** idempotency and exactly-once, the double-entry ledger, the payment lifecycle / state machine, distributed transactions (the dual-write problem, transactional outbox, saga), reconciliation, and security/compliance at a design level. **Out of scope:** the internals of card networks and bank rails (ISO 8583 and friends), building a fraud-ML model (named, not designed), full PCI-DSS audit mechanics, FX/multi-currency conversion math, payouts and lending, and the merchant-facing UI — name them so the interviewer sees the boundary, then set them aside. This problem revisits idempotency and concurrency from the URL Shortener and Ticket Booking tutorials, but raises the stakes to real money, where "mostly correct" is not correct.
 
 <h2 id="requirements">Requirements</h2>
 
-The core functional requirement is to process a payment exactly once and return a durable result to the caller.
+Separate what the system must *do* from how *well* it must do it. For a payment system the non-functional list is unusually dominant and unusually strict — the entire point is a set of correctness guarantees over money — and it is anchored by two absolutes: **never charge twice, and never lose or create a cent.**
+
+<RequirementsTable
+  functional={[
+    "Charge a customer (authorize and capture a payment)",
+    "Refund a payment, in full or in part",
+    "Record every money movement in a ledger",
+    "Expose a payment's current status",
+    "Reconcile internal records against the external provider",
+    "Be safe to retry — duplicate requests must not double-charge",
+  ]}
+  nonFunctional={[
+    { goal: "Exactly-once", target: "no double charge, ever (idempotent)" },
+    { goal: "Money conservation", target: "books always balance (debits = credits)" },
+    { goal: "Durability", target: "a committed ledger entry is never lost" },
+    { goal: "Consistency", target: "strong for balances and state transitions" },
+    { goal: "Auditability", target: "immutable, append-only history" },
+    { goal: "Throughput", target: "moderate (thousands of payments/sec)" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **exactly-once** is non-negotiable: because retries are inevitable, the system must dedupe at the application level with an idempotency key, so a duplicated request is a no-op that returns the first result. Second, **money conservation**: every movement is equal debits and credits, balances are derived from an immutable ledger, and the sum of all entries for a transaction is always zero — so a bug becomes a *detectable* imbalance rather than a silent loss. Third, **durability and auditability over raw speed**: a committed ledger entry must survive crashes and be readable years later for audit, which is why the ledger is append-only and never mutated. Note what's *relaxed*: throughput is moderate, and some downstream steps (settlement, reconciliation) are allowed to be asynchronous and eventually consistent. The system trades latency and scale headroom for correctness — the opposite of a cache.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-At 100 million payments per day the average rate is about 1,157 payments per second, which is modest — the design weight is correctness, not scale.
+Estimates here exist to make a point most candidates miss: a payment system is **not** a high-QPS scaling problem. We size throughput, money volume, and — the part that actually matters — the immutable ledger's growth.
+
+<PaymentSystemCapacity
+  assumptions={{
+    dailyPayments: 100000000,
+    avgPaymentValueUsd: 50,
+    peakFactor: 5,
+    ledgerEntriesPerPayment: 4,
+    avgEntryBytes: 500,
+    retentionYears: 7,
+  }}
+/>
+
+The takeaways. First, **throughput is modest**: 100M payments/day is only ~1,200/sec on average and ~**5,800/sec at peak** — a number a single well-built service could nearly handle. Contrast that with the Distributed Cache's 50M reads/sec; payments are three to four orders of magnitude smaller in QPS. So you do *not* lead with sharding-for-scale; you lead with correctness. Second, **the money is the point**: ~**$5 billion a day** flows through, so a single double-charge or lost payment isn't a rounding error — it's real money, an angry customer, and a compliance incident. That's why the design spends its complexity budget on idempotency and the ledger. Third, **the ledger is the heavy, append-only core**: each payment fans into ~4 immutable entries (the double-entry postings plus fees), ~**4,600 entries/sec**, and because the ledger is retained for **7 years** for audit it grows to ~**511 TB** that is *never mutated, only appended*. The capacity story for a payment system is the inverse of most: "the load is small, but the data is sacred — optimize for durability, immutability, and audit, not for QPS."
 
 <h2 id="entity-model">Entity Model</h2>
 
-The central entities are Payment, LedgerEntry, Account, and IdempotencyKey, with the immutable ledger serving as the source of truth.
+The model has a distinctive shape: a mutable **Payment** that holds workflow state sits on top of an immutable **ledger** that holds the truth. The single most important idea is that the **ledger is the source of truth** — balances and history come from it — while the Payment row is a *projection* of where a given payment is in its lifecycle.
+
+<EntityModel
+  name="Payment"
+  description="One row per payment attempt — the workflow object that advances through the lifecycle state machine. It carries the idempotency key that makes it safe to retry and a reference to the external provider, but it is NOT the source of truth for money — the ledger is."
+  fields={[
+    { name: "payment_id", type: "uuid", notes: "stable identity" },
+    { name: "idempotency_key", type: "string (unique)", notes: "client-supplied; dedupes retries" },
+    { name: "amount", type: "int (minor units)", notes: "store cents, never floats" },
+    { name: "currency", type: "string", notes: "ISO 4217 code" },
+    { name: "status", type: "enum", notes: "initiated | authorized | captured | settled | failed | refunded" },
+    { name: "payer / payee", type: "account refs", notes: "who is debited / credited" },
+    { name: "psp_ref", type: "string | null", notes: "external provider's transaction id" },
+  ]}
+  keys="A Payment is identified by payment_id and made safe to retry by a unique idempotency_key. Its status is a durable state-machine position, not the money record. The money lives in LedgerEntry rows: each is immutable and names an account, a debit or credit amount, and the transaction that groups them; every transaction's entries sum to zero (money is conserved). An Account's balance is DERIVED — the sum of its ledger entries — never stored as an authoritative mutable field. An IdempotencyKey row maps a client key to the stored result of the first request, so a duplicate returns that result. Amounts are integers in minor units (cents); never use floating point for money."
+/>
+
+Four entities complete the picture. A **LedgerEntry** is an immutable posting: an account, a signed amount (debit or credit), and a transaction id that groups the entries of one movement; the entries of a transaction always sum to zero. An **Account** is a bucket whose **balance is derived** by summing its entries — there is no mutable "balance" column to corrupt, which is what makes the books self-checking. An **IdempotencyKey** records the fingerprint of a request and the result the system produced, so a retry with the same key replays the answer instead of acting again. And the **Payment** ties it together as the workflow object. The discipline to hold onto: the Payment row tells you *where a payment is*; the ledger tells you *what is true about the money* — and only the latter is authoritative.
 
 <h2 id="api-design">API Design</h2>
 
-The API surface is small: POST /payments (with an Idempotency-Key header), POST /payments/&#123;id&#125;/refund, and GET /payments/&#123;id&#125;.
+The interface is small, and its defining feature is in the *headers*, not the verbs: every money-moving request carries an **`Idempotency-Key`**, and the contract is that retrying with the same key returns the original result without acting twice. That single rule is what makes a payment API safe to call over an unreliable network.
+
+<ApiContract
+  method="POST"
+  path="/payments"
+  summary="Charge a customer. Idempotent on the Idempotency-Key header — a retry returns the original result and never charges twice."
+  request={`POST /payments
+Idempotency-Key: 7c1e-merchant-order-9981
+
+{
+  "amount": 4999,            // minor units (cents)
+  "currency": "USD",
+  "payer": "cus_4a2",
+  "payee": "mer_88",
+  "payment_method": "tok_visa_…"   // a token, never a raw card number
+}`}
+  response={`HTTP/1.1 201 Created
+{ "payment_id": "pay_31f", "status": "captured", "amount": 4999, "currency": "USD" }`}
+  statusCodes={[
+    { code: "201", meaning: "Payment created and captured" },
+    { code: "200", meaning: "Duplicate key — the original result is replayed (no second charge)" },
+    { code: "402", meaning: "Declined by the provider (insufficient funds, etc.)" },
+    { code: "409", meaning: "Same key reused with a DIFFERENT request body — rejected" },
+  ]}
+  notes="The Idempotency-Key is client-supplied and unique per logical payment (e.g. derived from the merchant's order id). On a retry the server detects the key, returns the stored result, and does nothing else. Reusing a key with a different body is a client bug and is rejected (409). The payment_method is a token from a vault, so raw card data never touches this service."
+/>
+
+<ApiContract
+  method="POST"
+  path="/payments/{id}/refund"
+  summary="Refund a captured payment, fully or partially. Also idempotent — a retried refund does not refund twice."
+  request={`POST /payments/pay_31f/refund
+Idempotency-Key: 7c1e-refund-0001
+
+{ "amount": 4999 }`}
+  response={`HTTP/1.1 201 Created
+{ "refund_id": "rfnd_07a", "status": "refunded", "amount": 4999 }`}
+  statusCodes={[
+    { code: "201", meaning: "Refund recorded as a new reversing ledger transaction" },
+    { code: "200", meaning: "Duplicate refund key — original result replayed" },
+    { code: "404", meaning: "No such payment, or it was never captured" },
+    { code: "422", meaning: "Refund amount exceeds the captured amount" },
+  ]}
+  notes="A refund is not an edit or a delete of the original — it's a new transaction with reversing entries (credit the customer, debit the merchant), preserving the immutable audit trail. It is itself idempotent so a retried refund request is safe."
+/>
+
+<ApiContract
+  method="GET"
+  path="/payments/{id}"
+  summary="Read a payment's current lifecycle status and details."
+  request={`GET /payments/pay_31f`}
+  response={`HTTP/1.1 200 OK
+{ "payment_id": "pay_31f", "status": "settled", "amount": 4999, "currency": "USD", "psp_ref": "ch_9x2" }`}
+  statusCodes={[
+    { code: "200", meaning: "Returns the payment's state-machine status and provider reference" },
+    { code: "404", meaning: "No such payment" },
+  ]}
+  notes="Status reflects the durable state machine (initiated → authorized → captured → settled, plus failed/refunded). Clients poll or receive webhooks for terminal transitions like settlement, which complete asynchronously."
+/>
+
+The whole surface is: create a payment (idempotent), refund it (idempotent), read its status. Every write is keyed so it's safe to retry; every money movement becomes immutable ledger entries; and amounts are always integer minor units, never floats. Keeping the surface this disciplined is the point — in a payment system, the contract *is* the correctness.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-The high-level architecture routes client requests through a Payment API to a Payment Orchestrator, which writes to a Ledger Service and dispatches to a PSP via a transactional outbox.
+The architecture routes every request through an idempotency gate, advances a durable state machine, records truth in an immutable ledger, and coordinates with the external bank through a transactional outbox — with a reconciliation service auditing the whole thing against reality.
+
+<PaymentSystemArchitecture />
+
+- **Client (merchant / app).** Initiates payments and refunds, always supplying an idempotency key. Retries on timeout — which is exactly why the key matters.
+- **Payment API (idempotency).** The entry point. It checks the idempotency key first: a duplicate short-circuits to the stored result; a first-seen key proceeds. This gate is what makes the system safe to call.
+- **Payment Orchestrator (state machine).** Drives a payment through its lifecycle, persisting each transition before acting, so a crash resumes from a known state rather than a guess.
+- **Ledger Service → Ledger DB (append-only).** Records every movement as balanced double-entry postings in an immutable, append-only store. This is the **source of truth**; balances are derived from it.
+- **Outbox / Events.** The dual-write fix: the orchestrator writes its intent and an outbox row in one local transaction, and a dispatcher reads the outbox and calls the external provider idempotently — so the ledger and the bank can never silently diverge on a crash.
+- **PSP / Bank.** The external payment service provider or card network that actually moves funds. The system treats it as unreliable: calls are idempotent and results are recorded.
+- **Reconciliation.** Periodically compares the internal ledger against the provider's settlement file and flags any discrepancy — the safety net that turns silent drift into a caught exception.
+
+The decisive boundary is **the immutable double-entry ledger is the source of truth, and everything else is built to protect it**: the idempotency gate keeps duplicates out, the state machine makes transitions recoverable, the outbox keeps the ledger and the external world consistent without a distributed transaction, and reconciliation proves it all stayed correct. Every section that follows elaborates one piece: how duplicates are absorbed (idempotency), why the ledger always balances (double-entry), how a payment recovers after a crash (state machine), how to avoid losing or doubling a payment across the ledger/bank boundary (dual-write), and how drift is caught (reconciliation).
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-The four key flows are auth-capture, idempotent retry, reconciliation, and refund — each illuminating a different correctness invariant.
+Four flows cover the system: charging a customer, absorbing a retry, reconciling against the bank, and refunding. The first is the happy path; the other three are where "correct under failure" is earned.
+
+**Authorize & capture.** A charge advances the payment through its state machine — initiated, authorized, captured — persisting each transition, posting balanced double-entry rows to the ledger, and calling the PSP to actually move the money. The ledger records what's true; the PSP performs it.
+
+<AuthCaptureSequence />
+
+**Idempotent retry.** The client's first request succeeds, but the response is lost to a timeout, so the client retries with the *same* idempotency key. The Payment API finds the key already completed and returns the stored original result — no second charge. This is the single most important flow in the system.
+
+<IdempotentRetrySequence />
+
+**Reconciliation.** Asynchronously, the reconciliation service ingests the PSP's settlement file, reads the internal ledger for the same period, matches them line by line, and flags any mismatch — a payment the bank shows that the ledger doesn't, or vice versa — for resolution. It's how silent drift becomes a visible, actionable discrepancy.
+
+<ReconciliationSequence />
+
+**Refund.** A refund is processed like a payment in reverse: validate the original capture, call the PSP to return funds, and post *reversing* double-entry rows (credit the customer, debit the merchant). The original entries are never touched — the refund is a new, immutable transaction, so the full history is preserved.
+
+<RefundSequence />
 
 <h2 id="idempotency">Idempotency & Exactly-Once</h2>
 
-An idempotency key turns a retried request into a safe no-op that returns the original result instead of charging the customer twice.
+This is the property the whole system is built around, because **retries are not an edge case — they are guaranteed.** A client sends a charge, the network times out before the response arrives, and the client has no idea whether the payment happened. Its only safe move is to retry. Multiply that across flaky mobile networks, load-balancer timeouts, and at-least-once message queues, and the same logical payment *will* arrive more than once. Without a defense, every retry is a second charge — the cardinal sin of a payment system.
+
+The defense is an **idempotency key**: a client-supplied identifier, unique per logical payment (often derived from the merchant's order id), sent with every money-moving request. The first time the server sees a key, it processes the request and **stores the key together with the result**. Every subsequent request with that same key skips processing entirely and **replays the stored result**. The retry therefore returns the original `payment_id` and status — the client gets a definitive answer, and the customer is charged exactly once. The key has a scope (per endpoint/account) and a retention window long enough to outlast any client retry strategy.
+
+<Callout variant="info" title="The concurrent-duplicate race, and how to win it">
+The subtle case isn't a retry *after* the first request finishes — it's two requests with the same key arriving *at the same time* (a double-click, or a client retrying aggressively before the first completes). If both check "does this key exist?" and both see "no," both proceed and you double-charge. The fix is to make claiming the key **atomic**: insert the key row *first*, with a **unique constraint**, before doing any work. Exactly one insert wins; the loser gets a uniqueness violation and waits for or reads the winner's result. The database's unique index, not application logic, is what guarantees exactly-once under concurrency — the same insert-first trick the Ticket Booking tutorial used to prevent double-selling a seat.
+</Callout>
+
+<KnowledgeCheck
+  question="Why must a payment API be idempotent, and how does an idempotency key guarantee exactly-once even when two identical requests arrive simultaneously?"
+  options={[
+    "It doesn't need to be — payment networks deduplicate automatically",
+    "Because timeouts and at-least-once networks make client retries inevitable, so the same payment arrives more than once; a client-supplied idempotency key is stored with the result on first use and replayed on any duplicate, so the customer is charged once. Under a simultaneous race, the key row is inserted first with a unique constraint, so exactly one request wins the insert and the rest replay its result",
+    "By locking the customer's entire account for the duration of every payment",
+    "By making the client wait until the network is guaranteed reliable before sending",
+  ]}
+  answer={1}
+  explanation="Retries are guaranteed, not exceptional: a lost response leaves the client no choice but to resend, so a payment API that acts on every request will double-charge. The idempotency key makes the operation safe — first request processes and stores its result under the key; duplicates replay that result without acting. The dangerous case is two duplicates racing before either finishes; inserting the key with a unique database constraint before doing any work means exactly one wins and the others return the winner's result, so the guarantee comes from the database, not hopeful application checks."
+/>
 
 <h2 id="double-entry-ledger">The Double-Entry Ledger</h2>
 
-Every monetary movement is recorded as equal and opposite debit and credit entries in an append-only, immutable ledger that is never updated, only grown.
+The ledger is the heart of the system, and it borrows a 600-year-old accounting idea because that idea is exactly what money needs: **every movement is recorded twice, as equal and opposite debits and credits, so the books always balance.** Charge a customer $50 and the ledger doesn't write "customer paid $50"; it writes a transaction whose entries sum to zero — debit the customer's account $50, credit the merchant's account (say) $48, credit a fee account $2. The invariant that **the entries of every transaction sum to zero** is what conserves money: you cannot create or destroy value by accident, because an unbalanced transaction is, by construction, an invalid one.
+
+Two further properties make the ledger trustworthy. It is **append-only and immutable**: entries are never updated or deleted. A mistake is corrected by posting a *new* reversing transaction, not by editing the old one, so the full history — including the error and its fix — is preserved for audit. And **balances are derived, not stored**: an account's balance is the sum of its entries, computed (or maintained as a cached aggregate that can always be recomputed from the log), never an authoritative mutable column. That sounds like extra work, but it's the source of the ledger's integrity: there is no balance field to corrupt, every balance is provable from first principles, and any bug surfaces as an imbalance you can *detect* rather than a silent drift you can't. For performance, balances are often kept as running aggregates or periodic snapshots, but the append-only entries remain the truth they're derived from.
+
+<KnowledgeCheck
+  question="What makes a double-entry ledger the right model for a payment system's source of truth?"
+  options={[
+    "It stores each account's balance as a single mutable number that's fast to update",
+    "Every movement is recorded as equal debits and credits whose entries sum to zero (so money is conserved and imbalances are detectable), the ledger is append-only and immutable (corrections are new reversing entries, preserving an audit trail), and balances are derived by summing entries rather than stored — so there's no balance field to silently corrupt",
+    "It allows deleting old transactions to save storage once they settle",
+    "It replaces the need for idempotency because entries can't be duplicated",
+  ]}
+  answer={1}
+  explanation="Double-entry encodes money conservation directly: each transaction's debits and credits sum to zero, so value can't be created or lost by accident and any bug shows up as a detectable imbalance. Immutability and append-only writes give a complete, tamper-evident audit trail — errors are fixed with reversing entries, never edits. And deriving balances from the entries (rather than storing a mutable balance) means every balance is provable from the log and there's nothing to silently corrupt. It complements idempotency rather than replacing it."
+/>
 
 <h2 id="payment-lifecycle">Payment Lifecycle & State Machine</h2>
 
-A payment is a durable state machine that advances through initiated, authorized, captured, and settled states, with failed and refunded as terminal error states.
+A payment is not an instantaneous event; it's a **process** that unfolds over time and across systems, so it's modeled as an explicit **state machine**. The canonical path is `initiated → authorized → captured → settled`, with branches to `failed`, `refunded`, and `disputed`. Each state means something specific: **authorized** confirms the funds exist and are held (a hold on a card) without moving them; **captured** actually moves the money (you can authorize at checkout and capture on shipment); **settled** is when funds finally clear between banks, often a day or more later. Conflating these — treating "the API returned 200" as "the money has settled" — is a classic source of bugs, because the stages have different guarantees and different reversal semantics.
+
+Modeling it as a state machine buys **recoverability**, which is the whole point given that crashes happen mid-flow. The rule is **persist the transition before acting on it**: write "moving to authorizing" durably, *then* call the PSP. If the service crashes, recovery reads the persisted state and knows exactly where it was — was the PSP called or not? — and resumes deterministically instead of guessing and risking a double action. Transitions are themselves **idempotent**, so replaying "capture" on an already-captured payment is a no-op. Only defined transitions are allowed (you can't capture a failed payment), which makes illegal money movements unrepresentable. The state machine turns a fragile multi-step, multi-system process into something that can crash at any point and recover correctly.
+
+<KnowledgeCheck
+  question="Why model a payment as a durable state machine, and what is the rule for surviving a crash mid-payment?"
+  options={[
+    "To make the API faster by caching the result in memory",
+    "Because a payment is a multi-step, multi-system process (initiated → authorized → captured → settled, plus failed/refunded) with distinct guarantees per stage; modeling it explicitly makes transitions legal-only and recoverable. The rule is to persist each transition durably BEFORE acting (e.g. before calling the PSP), so after a crash recovery reads the known state and resumes deterministically instead of guessing and risking a double action",
+    "So that balances can be stored directly on the payment row",
+    "Because the state machine replaces the need for a ledger",
+  ]}
+  answer={1}
+  explanation="Authorize, capture, and settle are genuinely different stages with different reversal semantics, so a payment is a process, not an instant — an explicit state machine makes only valid transitions possible and gives every payment a known position. Persisting the transition before performing the side effect is what makes a crash survivable: recovery inspects the durable state to learn whether the external call already happened, then resumes idempotently. Without that ordering, a crash between acting and recording leaves you unable to tell a done action from an undone one."
+/>
 
 <h2 id="distributed-transactions">Distributed Transactions & the Dual-Write Problem</h2>
 
-The ledger write and the external PSP call cannot share an ACID transaction, so the transactional outbox pattern ensures the PSP is called exactly once via idempotent retries.
+Here is the problem that makes payment systems genuinely hard: a single payment requires **two writes to two systems you can't wrap in one transaction** — recording the movement in your ledger, and telling the external bank to move the money. Your database transaction can't include the bank's API call, and the bank can't join your transaction. So whatever order you choose, a crash *between* the two writes is catastrophic. Call the PSP first, then crash before recording it: the money moved but your ledger doesn't know — a **lost** payment. Record the ledger first, then crash before calling the PSP: your books say paid but no money moved — a **phantom** payment. This is the **dual-write problem**, and naive "just do both" code has a window where it silently corrupts money.
+
+The standard fix is the **transactional outbox**. In a *single local database transaction*, the orchestrator writes both the state change *and* a row to an **outbox** table describing the intended external action — atomically, so either both land or neither does. A separate **dispatcher** then reads unprocessed outbox rows and calls the PSP, **idempotently** (using the payment/outbox id as the idempotency key the bank honors), recording the result and marking the row done. Now a crash is safe: if it happens before the dispatcher runs, the outbox row survives and the call is retried; if it happens after the PSP call but before marking done, the idempotent retry recognizes the already-done action and doesn't repeat it. The two systems converge to a consistent state without a distributed transaction. The alternative framing is a **saga**: a sequence of local steps each with a **compensating action** (a capture's compensation is a refund), so a failure partway through unwinds the committed steps rather than leaving them dangling. Outbox gives you reliable at-least-once delivery to the bank; idempotency on the bank side upgrades that to effectively exactly-once.
+
+<KnowledgeCheck
+  question="What is the dual-write problem in a payment system, and how does a transactional outbox solve it?"
+  options={[
+    "It's when two users pay at once; solved by locking the database",
+    "Recording the movement in your ledger and calling the external bank are two writes that can't share one transaction, so a crash between them either loses a payment (bank moved money, ledger didn't record) or creates a phantom one (ledger recorded, bank never called). The outbox writes the state change and an outbox row atomically in one local transaction; a dispatcher then calls the PSP idempotently and marks the row done — so a crash is recoverable and the two systems converge without a distributed transaction",
+    "It's a problem with writing to two database replicas; solved by quorum reads",
+    "It's duplicate API requests; solved entirely by the idempotency key alone",
+  ]}
+  answer={1}
+  explanation="The hard seam in a payment system is between your ledger and an external bank you can't enroll in your transaction. Doing the two writes naively leaves a crash window that loses or fabricates a payment. The transactional outbox removes the seam from the critical path: the intent to call the bank is committed atomically with the state change in one local transaction, then dispatched separately and idempotently, so the external call is guaranteed to happen at least once and, thanks to idempotency, effectively once. A saga with compensations is the alternative when steps must be explicitly unwound."
+/>
 
 <h2 id="reconciliation">Reconciliation</h2>
 
-Reconciliation compares the internal ledger against the PSP's settlement file to catch any drift and flag discrepancies for resolution.
+Even with idempotency, an immutable ledger, and an outbox, you must **prove** your records match reality — because the external world is independent, fallible, and occasionally disagrees with you. A PSP may report a charge your system never recorded, drop a webhook you were counting on, settle a slightly different amount after fees, or process something on a different day. **Reconciliation** is the continuous audit that catches all of this: on a schedule (typically daily, when the provider publishes a **settlement file**), the system reads the provider's record of every transaction, reads its own ledger for the same period, and **matches them line by line**.
+
+The output is a classification of every discrepancy: **missing in ledger** (the PSP has it, you don't — maybe a dropped webhook), **missing at PSP** (you have it, they don't — maybe a phantom write or a not-yet-settled item), **amount mismatch** (fees, FX, or a bug), and **timing** (same transaction, different settlement date). Matches need no action; clean mismatches are **auto-resolved** by well-understood rules (post the missing fee entry, re-fetch the dropped event); the rest are **flagged for a human** with full context. Reconciliation is the safety net that makes every other guarantee *trustworthy* — it converts silent, compounding drift into a visible, bounded, actionable exception, and it's why a real payment system can claim its books are correct rather than merely hope they are.
+
+<KnowledgeCheck
+  question="Why is reconciliation necessary even with idempotency, an immutable ledger, and a transactional outbox in place?"
+  options={[
+    "It isn't — those mechanisms guarantee the external provider always agrees",
+    "Because the external provider is independent and can disagree: dropped webhooks, fee/FX differences, timing, or bugs cause drift between your ledger and the provider's settlement record. Reconciliation periodically matches the two line by line and classifies discrepancies (missing in ledger, missing at PSP, amount/timing mismatches), auto-resolving the clear ones and flagging the rest — turning silent drift into a caught, actionable exception",
+    "Because the ledger is mutable and needs to be re-balanced nightly",
+    "Only to generate marketing reports about transaction volume",
+  ]}
+  answer={1}
+  explanation="Internal correctness mechanisms keep your own system consistent, but they can't guarantee agreement with an external party you don't control — webhooks get dropped, fees and FX shift amounts, and settlement happens on the provider's timeline. Reconciliation independently compares your ledger against the provider's settlement file, classifies every mismatch, resolves the routine cases automatically, and escalates the rest. It's what lets the business assert its books are provably correct instead of trusting that nothing ever drifted."
+/>
 
 <h2 id="security-compliance">Security & Compliance</h2>
 
-PCI-DSS compliance, TLS in transit, encryption at rest, tokenization of card data, and audit logging are non-negotiable requirements for any payment system.
+Handling card data drags you into **PCI-DSS**, and the winning move is to **minimize your scope** so most of those requirements don't apply to your systems at all. The mechanism is **tokenization**: raw card numbers (PANs) are captured directly by a PCI-compliant **vault** (your own or the PSP's) and exchanged for an opaque **token**; your payment service only ever sees and stores the token. Because the sensitive data never enters your application or database, the bulk of your stack falls *out of PCI scope*, which is both a security win (you can't leak what you never hold) and a massive compliance simplification. Around that, the usual disciplines apply: **encrypt in transit and at rest**, tightly control and audit access to the vault, and never log card data.
+
+Two more layers matter at the design level. **Fraud screening** is a pluggable check that runs *before* authorization — scoring the payment on signals (velocity, device, geo, amount) and allowing, challenging (e.g. step-up/3-D Secure), or blocking it; the design point is that it's a gate in the lifecycle, not a bolt-on afterthought, and the actual ML model is out of scope here. And **auditability** comes nearly for free from the architecture you already have: the immutable, append-only ledger is a tamper-evident record of every money movement, exactly what auditors and dispute investigations require. Security in a payment system is less about clever cryptography and more about *not holding what you don't need*, gating risk early, and keeping an immutable trail.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Because throughput is modest, scaling the payment system means optimizing for durability and consistency rather than raw horizontal sharding.
+Don't build the multi-region, partitioned ledger on day one — and remember that for payments the pressure is rarely raw QPS. Each stage answers a specific need and adds a specific cost; name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single service + one ACID database", "Launch; the whole flow fits one transactional DB", "No dual-write safety yet; the external PSP call is still a crash risk"],
+    ["Add idempotency keys + transactional outbox", "Real traffic with retries and an external PSP", "An outbox table + dispatcher to run; idempotent PSP integration"],
+    ["Partition the ledger by account; read replicas for balances", "Ledger growth and balance-read load dominate", "Cross-partition transactions for transfers; eventual consistency on derived balances"],
+    ["Multi-region with data residency", "Global operation and regulatory residency rules", "Cross-region consistency for money; per-region ledgers and reconciliation; much harder ops"],
+  ]}
+  recommendedRow={1}
+/>
+
+The progression tracks the failure you're buying out of, not the load. A single ACID service is correct *within* itself but still has the dual-write hole to the PSP. Adding **idempotency keys and a transactional outbox** closes that hole and makes the system safe to retry and crash-resilient — and because payments are low-QPS, this is where most systems can comfortably live for a long time. **Partitioning the ledger** is driven by *data* growth and balance-read load, not transaction rate, and it introduces cross-partition complexity for transfers and eventual consistency on derived balances. Only a global, regulated operation needs **multi-region with residency**, which is genuinely hard because moving money across consistency boundaries is the most unforgiving distributed-systems problem there is. The headline: scale the *ledger's storage and read path* before you ever worry about write throughput.
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-The key failure modes are PSP timeouts (handled by idempotent retries via the outbox), ledger write failures (transactional with the outbox insert), and reconciliation mismatches (flagged for manual resolution).
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. A payment system's failures are dominated by one rule: **never lose money, never create money, and never charge twice.** The dangerous failures live at the seams — between the API and a retrying client, and between the ledger and the external bank.
+
+<FailureMatrix
+  rows={[
+    { failure: "Timeout after charging (client unsure)", impact: "Client retries; risk of double charge", detection: "Same idempotency key arrives again", mitigation: "Idempotency key replays the stored result; no second charge", recovery: "Client gets the definitive original result" },
+    { failure: "Crash between ledger write and PSP call (dual-write)", impact: "Lost or phantom payment", detection: "Unprocessed outbox row; reconciliation mismatch", mitigation: "Transactional outbox commits intent atomically; dispatcher retries idempotently", recovery: "Dispatcher completes the pending call; states converge" },
+    { failure: "Two identical requests race", impact: "Potential double charge", detection: "Unique-constraint violation on the key insert", mitigation: "Insert idempotency key first with a unique index; one wins, others replay", recovery: "Losers return the winner's result" },
+    { failure: "PSP outage or slow", impact: "Payments stall", detection: "Elevated PSP latency/error rate", mitigation: "Retry with backoff via the outbox; circuit-break; queue intents; fail fast to the client where needed", recovery: "Outbox drains when the PSP recovers; no payment lost" },
+    { failure: "Ledger imbalance / corruption", impact: "Books don't balance — money invariant broken", detection: "Transaction entries don't sum to zero; balance audit", mitigation: "Reject unbalanced transactions at write time; immutable log enables replay; alert immediately", recovery: "Post corrective reversing entries; trace via the audit trail" },
+    { failure: "Reconciliation mismatch", impact: "Internal records drift from the PSP", detection: "Daily settlement-file comparison", mitigation: "Classify and auto-resolve known cases (missing fee, dropped webhook); flag the rest", recovery: "Post missing entries or re-fetch events; human review for the unclear" },
+    { failure: "Refund of a never-captured payment", impact: "Would create money", detection: "State-machine guard (only captured payments refundable)", mitigation: "Reject illegal transitions; refunds post reversing entries only against captures", recovery: "Return an error; no ledger change" },
+  ]}
+/>
+
+The theme: **the seams are where money breaks, so the system is engineered to make every seam recoverable.** A retrying client is absorbed by the idempotency key; the ledger/bank seam is bridged by the outbox; a concurrent race is decided by a unique constraint; a stalled PSP is buffered, not lost, by the outbox; an imbalance is rejected at write time and traceable through the immutable log; and external drift is caught by reconciliation. Because the ledger is append-only, even recovery from a bad state is done by *adding* corrective entries, never by editing history — so the audit trail survives the incident. Losing or fabricating money is the one class of failure with no acceptable mitigation, so every mechanism in the design exists to make that impossible.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-The main trade-off is synchronous versus asynchronous capture: synchronous is simpler but couples the API latency to PSP latency; asynchronous via the outbox is more complex but more resilient.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Expose an idempotent API keyed by a client-supplied idempotency key; record every money movement in an immutable, append-only double-entry ledger that is the single source of truth (with derived balances); drive each payment through a durable, persist-before-act state machine; bridge the ledger and the external PSP with a transactional outbox (plus idempotent PSP calls) to defeat the dual-write problem; refund via reversing entries; and reconcile against the provider's settlement file to catch any drift."
+  rationale="Retries are inevitable, so idempotency keys are the foundation of exactly-once. A double-entry ledger encodes money conservation and auditability directly — imbalances become detectable and history is tamper-evident. A persist-before-act state machine makes a multi-step, multi-system flow crash-recoverable. The transactional outbox is the standard, robust answer to the unavoidable dual-write between your DB and an external bank, giving at-least-once delivery that idempotency upgrades to effectively exactly-once. Reconciliation makes every other guarantee trustworthy by proving agreement with the outside world. Throughput is low, so none of this trades away meaningful scale."
+  alternatives="Two-phase commit across the DB and PSP — true atomicity but the PSP can't enroll and 2PC blocks on coordinator failure, disqualified; trust the PSP's idempotency alone without a local outbox — simpler but loses the atomic intent record and crash recoverability; a single mutable balance column instead of a derived double-entry ledger — faster reads but no audit trail and silent-corruption risk; synchronous settlement in the request path — simpler mental model but couples your latency to bank timelines; storing raw card data instead of tokenizing — avoids a vault hop but pulls your whole stack into PCI scope and raises breach risk."
+  revisitWhen="Throughput genuinely grows past a single ledger DB (partition by account), multi-currency/FX enters scope (adds conversion and per-currency ledgers), disputes/chargebacks become first-class (a richer state machine), or regulatory residency forces multi-region money movement (the hardest consistency problem)."
+/>
+
+Three axes capture the real tension:
+
+- **Outbox vs. 2PC vs. saga for the dual-write.** Two-phase commit promises atomicity but can't include an external bank and blocks on coordinator failure; the transactional outbox gives reliable at-least-once delivery with local-only transactions and pairs with idempotency for effective exactly-once; a saga makes compensations explicit when steps must be unwound. For payments, outbox + idempotency is the pragmatic default.
+- **Strong vs. eventual consistency for balances.** State transitions and the entries of a transaction need strong consistency (the books must balance atomically); *derived* balances can lag slightly as cached aggregates recomputed from the immutable log. Keep correctness where money is decided; relax it only on read projections.
+- **Synchronous vs. asynchronous settlement.** Authorizing/capturing can be synchronous for a snappy response, but real settlement clears on the bank's schedule (often T+1), so model it as an async state transition rather than blocking the request — conflating "captured" with "settled" is a bug, not an optimization.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-In sixty seconds: use an idempotency key for exactly-once processing, write every movement to an immutable double-entry ledger, fix the dual-write problem with a transactional outbox, and close the loop with reconciliation.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A payment system looks like an API that moves money, but the hard part is correctness under failure, not scale — even a large processor is only a few thousand payments a second. So I anchor on four things. First, exactly-once: clients and networks retry, so every money-moving request carries a client-supplied idempotency key; the first request stores its result under the key and any duplicate replays that result, and a concurrent race is settled by inserting the key first under a unique constraint — so we never charge twice. Second, an immutable double-entry ledger as the single source of truth: every movement is equal debits and credits that sum to zero, the ledger is append-only, balances are derived by summing entries, and corrections are reversing entries — so money is conserved and bugs become detectable imbalances. Third, the payment is a durable state machine — initiated, authorized, captured, settled — that persists each transition before acting, so a crash recovers deterministically. Fourth, the dual-write problem: the ledger write and the external bank call can't be one transaction, so I use a transactional outbox — commit the state change and an outbox row atomically, then a dispatcher calls the PSP idempotently — which means a crash never loses or duplicates a payment. Refunds are new reversing transactions, not edits. And reconciliation compares our ledger against the provider's daily settlement file to catch any drift. Card data is tokenized so we stay out of PCI scope. The one rule everything serves: never lose money, never create money, never charge twice."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why is idempotency essential and how does the key work under a race? Why double-entry, and why immutable? What's the difference between authorize, capture, and settle? What is the dual-write problem and how does an outbox fix it? Outbox vs. 2PC vs. saga? Why reconcile if you already have an outbox? How do you avoid storing card data? How are refunds modeled?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Common interview questions cover idempotency key mechanics, double-entry invariants, why balances are derived rather than stored, and how the outbox guarantees exactly-once PSP dispatch.
+<KnowledgeCheck
+  question="A customer is charged but the success response is lost to a timeout, so their client resends the request. What prevents a double charge?"
+  options={[
+    "Nothing — the customer is charged twice and refunded later",
+    "The idempotency key on the request: the first attempt stored its result under that key, so the resend is detected as a duplicate and the stored original result is replayed without charging again",
+    "The double-entry ledger automatically merges the two charges",
+    "The PSP rejects the second request because the card is busy",
+  ]}
+  answer={1}
+  explanation="A lost response is the canonical retry case. Because the client can't tell whether the first charge happened, it resends with the same idempotency key. The server recognizes the key from the first attempt and returns the stored result instead of processing again, so exactly one charge occurs and the client gets a definitive answer. The ledger and PSP aren't what dedupe the request — the idempotency key is."
+/>
+
+<KnowledgeCheck
+  question="Why are balances derived from the ledger rather than stored as a mutable column on each account?"
+  options={[
+    "Because storing balances is impossible in a relational database",
+    "Because deriving a balance by summing immutable entries means there's no mutable field to silently corrupt, every balance is provable from the append-only log, and any discrepancy surfaces as a detectable imbalance — preserving auditability and money conservation (cached aggregates may exist for speed but are always recomputable from the entries)",
+    "Because mutable balances would make the system faster but less popular",
+    "Because the PSP owns all balances, not the payment system",
+  ]}
+  answer={1}
+  explanation="A stored, mutable balance is a single point of silent corruption: one missed update and it's wrong with no way to tell. Deriving the balance from immutable double-entry rows keeps the entries as the sole source of truth, makes every balance provable and reconstructable, and turns errors into visible imbalances. Systems often keep a cached running aggregate for read performance, but it's an optimization that can always be rebuilt from the log, not the authority."
+/>
+
+<Faq
+  items={[
+    { question: "What is a payment system actually responsible for?", answer: "Accepting a request to move money, coordinating with an external bank or PSP to actually move it, recording every movement in a ledger so the books always balance, exposing the payment's status, and supporting refunds — all correctly, even when networks time out, services crash, and clients retry. It's the system of record for money, so its job is correctness and auditability far more than raw throughput." },
+    { question: "Why is throughput not the main challenge?", answer: "Because even a large processor runs only a few thousand payments per second — orders of magnitude below a cache or feed system. The difficulty is that each of those payments must be exactly-once, durably recorded, always balanced, recoverable across crashes, and reconciled with an external party. You spend your design budget on correctness mechanisms (idempotency, double-entry ledger, outbox, reconciliation), not on sharding for scale." },
+    { question: "What is an idempotency key and why is it required?", answer: "A client-supplied identifier, unique per logical payment, sent with every money-moving request. The server stores it with the result on first use and replays that result for any duplicate, so retries — which are inevitable because of timeouts and at-least-once networks — never cause a second charge. It's the foundation of exactly-once processing." },
+    { question: "How do you handle two identical requests arriving at the exact same time?", answer: "Make claiming the key atomic: insert the idempotency-key row first, with a unique database constraint, before doing any work. Exactly one insert succeeds; the others get a uniqueness violation and replay the winner's result. The guarantee comes from the database's unique index, not from an application-level 'check then act,' which would have a race window." },
+    { question: "What is a double-entry ledger and why use one?", answer: "An accounting model where every movement is recorded as equal debits and credits across accounts, so each transaction's entries sum to zero and money is conserved. The ledger is append-only and immutable, corrections are new reversing entries (not edits), and balances are derived by summing entries. This gives a tamper-evident audit trail and makes bugs surface as detectable imbalances rather than silent losses." },
+    { question: "Why are balances derived instead of stored?", answer: "So there's no mutable balance field to silently corrupt. A balance computed from immutable entries is always provable and reconstructable from the log, and any inconsistency shows up as an imbalance you can catch. For performance, systems keep cached running aggregates or snapshots, but those are optimizations that can always be recomputed from the authoritative entries." },
+    { question: "What's the difference between authorize, capture, and settle?", answer: "Authorize confirms the funds exist and places a hold without moving money; capture actually moves the money (you might authorize at checkout and capture on shipment); settle is when funds finally clear between banks, often a day or more later. They have different guarantees and reversal semantics, so a payment is modeled as a state machine and you must not treat 'API returned 200' as 'money settled.'" },
+    { question: "What is the dual-write problem?", answer: "A payment needs two writes that can't share one transaction — recording it in your ledger and calling the external bank. A crash between them either loses a payment (bank moved money, ledger didn't record it) or creates a phantom one (ledger recorded, bank never called). Naive 'do both' code has a window where it silently corrupts money, which is why you need an outbox or saga." },
+    { question: "How does a transactional outbox fix the dual-write problem?", answer: "In one local database transaction you write both the state change and a row to an outbox table describing the intended external call — atomically. A separate dispatcher reads outbox rows and calls the PSP idempotently, recording the result and marking the row done. A crash is now recoverable: the outbox row survives and the call is retried, and idempotency prevents a repeat, so the ledger and the bank converge without a distributed transaction." },
+    { question: "What is reconciliation and why is it needed?", answer: "It's the continuous audit that compares your internal ledger against the provider's settlement file, line by line, and classifies any discrepancy (missing in ledger, missing at PSP, amount or timing mismatch). Even with idempotency and an outbox, the external provider is independent and can drop webhooks, apply fees, or settle on its own schedule — reconciliation turns that silent drift into a caught, actionable exception so you can prove your books are correct." },
+    { question: "How do refunds work without breaking the audit trail?", answer: "A refund is a new transaction with reversing entries — credit the customer, debit the merchant — not an edit or deletion of the original. The original entries stay immutable, so the complete history (charge and refund) is preserved for audit. Refunds are themselves idempotent and only allowed against captured payments, so a retried refund won't double-refund and you can't refund something that never moved money." },
+    { question: "How do you handle card data and PCI compliance?", answer: "By minimizing scope through tokenization: raw card numbers are captured by a PCI-compliant vault and exchanged for an opaque token, so your payment service only ever handles the token and the bulk of your stack falls out of PCI scope. Combine that with encryption in transit and at rest, strict audited access to the vault, never logging card data, and a fraud-screening gate before authorization. You can't leak what you never store." },
+  ]}
+/>
