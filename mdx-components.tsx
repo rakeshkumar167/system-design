@@ -17,6 +17,7 @@ import { TicketBookingCapacity } from "@/components/learning/ticket-booking-capa
 import { VideoStreamingCapacity } from "@/components/learning/video-streaming-capacity";
 import { CollaborativeDocEditorCapacity } from "@/components/learning/collaborative-doc-editor-capacity";
 import { DistributedCacheCapacity } from "@/components/learning/distributed-cache-capacity";
+import { CloudDriveCapacity } from "@/components/learning/cloud-drive-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -100,6 +101,7 @@ const teachingComponents = {
   VideoStreamingCapacity,
   CollaborativeDocEditorCapacity,
   DistributedCacheCapacity,
+  CloudDriveCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
