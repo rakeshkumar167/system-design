@@ -16,6 +16,7 @@ import { NotificationCapacity } from "@/components/learning/notification-capacit
 import { TicketBookingCapacity } from "@/components/learning/ticket-booking-capacity";
 import { VideoStreamingCapacity } from "@/components/learning/video-streaming-capacity";
 import { CollaborativeDocEditorCapacity } from "@/components/learning/collaborative-doc-editor-capacity";
+import { DistributedCacheCapacity } from "@/components/learning/distributed-cache-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -91,6 +92,7 @@ const teachingComponents = {
   TicketBookingCapacity,
   VideoStreamingCapacity,
   CollaborativeDocEditorCapacity,
+  DistributedCacheCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
