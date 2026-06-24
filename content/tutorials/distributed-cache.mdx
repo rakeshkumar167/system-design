@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section frames the distributed cache problem the way an interviewer expects — clarifying scope, bounding the design space, and setting expectations for what we will and will not cover.
+
+<h2 id="requirements">Requirements</h2>
+
+This section captures the functional and non-functional requirements that drive every design decision that follows.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the numbers — dataset size, working set, node count, and the hit-ratio math that justifies the whole investment.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core entities: the cache entry, the hash ring, the node, the replica set, and the backing store as source of truth.
+
+<h2 id="api-design">API Design</h2>
+
+This section specifies the client-facing API — get, set, and delete — and explains how the client library handles consistent-hash routing transparently.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the overall architecture: client, cache router, sharded cache nodes, replicas, backing store, and the membership service that keeps the ring current.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section traces four key flows — cache hit, cache miss with read-through, node rebalance after failure, and cache stampede with request coalescing.
+
+<h2 id="consistent-hashing">Consistent Hashing</h2>
+
+This section explains the hash-ring approach and why virtual nodes minimize key movement when nodes join or leave.
+
+<h2 id="eviction-policies">Eviction Policies</h2>
+
+This section compares LRU, LFU, and TTL-based eviction and explains when each is the right choice for a bounded in-memory cache.
+
+<h2 id="replication-consistency">Replication &amp; Consistency</h2>
+
+This section covers how writes propagate to replicas, the tunable consistency knobs (synchronous vs. asynchronous replication), and the staleness trade-off.
+
+<h2 id="hot-keys">Hot Keys &amp; Hotspots</h2>
+
+This section explains why a single popular key can saturate one shard and how near-cache replication and load-aware routing mitigate the hotspot.
+
+<h2 id="cache-stampede">Cache Stampede</h2>
+
+This section describes the thundering-herd failure when a hot key expires simultaneously for many callers, and how request coalescing (single-flight) with TTL jitter prevents it.
+
+<h2 id="write-policies">Write Policies &amp; Invalidation</h2>
+
+This section compares write-through, write-back, and write-around policies alongside cache invalidation strategies, and explains which guarantees each offers.
+
+<h2 id="scalability-evolution">Scalability &amp; Evolution</h2>
+
+This section maps out how the cluster grows from a handful of nodes to hundreds, covering resharding, tiered caches, and multi-region deployments.
+
+<h2 id="resiliency-failure-modes">Resiliency &amp; Failure Modes</h2>
+
+This section catalogs the failure modes — node crash, network partition, replica lag, and stampede — and the mitigations that keep the system serving traffic.
+
+<h2 id="tradeoffs-alternatives">Trade-offs &amp; Alternatives</h2>
+
+This section weighs the key design trade-offs and compares the approach to alternatives such as client-side caching, sidecar caches, and managed services like Redis and Memcached.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section distills the design into the five or six points an interviewer most wants to hear, ready to be delivered in the final minutes of a session.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks &amp; FAQ</h2>
+
+This section provides review questions and answers to the most common follow-up questions interviewers ask about distributed caches.

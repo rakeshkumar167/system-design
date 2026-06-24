@@ -9,6 +9,7 @@ import PastebinContent from "@/content/tutorials/pastebin.mdx";
 import NotificationServiceContent from "@/content/tutorials/notification-service.mdx";
 import TicketBookingContent from "@/content/tutorials/ticket-booking.mdx";
 import VideoStreamingContent from "@/content/tutorials/video-streaming.mdx";
+import DistributedCacheContent from "@/content/tutorials/distributed-cache.mdx";
 import CollaborativeDocEditorContent from "@/content/tutorials/collaborative-doc-editor.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
@@ -17,6 +18,7 @@ const content: Record<string, ComponentType> = {
   "rate-limiter": RateLimiterContent,
   "pastebin": PastebinContent,
   "notification-service": NotificationServiceContent,
+  "distributed-cache": DistributedCacheContent,
   "ticket-booking": TicketBookingContent,
   "video-streaming": VideoStreamingContent,
   "collaborative-doc-editor": CollaborativeDocEditorContent,

@@ -52,7 +52,7 @@ export const problems: readonly Problem[] = [
       "Build a sharded, replicated in-memory cache with eviction policies and tunable consistency.",
     difficulty: "Intermediate",
     concepts: ["Consistent hashing", "Eviction", "Replication", "Hot keys"],
-    status: "coming-soon",
+    status: "available",
     sequence: 5,
   },
   {
