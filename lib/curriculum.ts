@@ -182,7 +182,7 @@ export const problems: readonly Problem[] = [
       "Process payments exactly once with ledgers, idempotency keys, and reconciliation.",
     difficulty: "Advanced",
     concepts: ["Double-entry ledger", "Idempotency", "Consistency", "Reconciliation"],
-    status: "coming-soon",
+    status: "available",
     sequence: 18,
   },
   {

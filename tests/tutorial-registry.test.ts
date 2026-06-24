@@ -2,11 +2,11 @@ import { describe, it, expect } from "vitest";
 import { getTutorial, tutorials } from "@/lib/tutorial-registry";
 
 describe("tutorial registry", () => {
-  it("registers the URL Shortener, Rate Limiter, Pastebin, Notification Service, Distributed Cache, Ticket Booking, Video Streaming, Collaborative Doc Editor, and Cloud Drive tutorials", () => {
-    expect(Object.keys(tutorials).sort()).toEqual(["cloud-drive", "collaborative-doc-editor", "distributed-cache", "notification-service", "pastebin", "rate-limiter", "ticket-booking", "url-shortener", "video-streaming"]);
+  it("registers the URL Shortener, Rate Limiter, Pastebin, Notification Service, Distributed Cache, Ticket Booking, Video Streaming, Collaborative Doc Editor, Cloud Drive, and Payment System tutorials", () => {
+    expect(Object.keys(tutorials).sort()).toEqual(["cloud-drive", "collaborative-doc-editor", "distributed-cache", "notification-service", "pastebin", "payment-system", "rate-limiter", "ticket-booking", "url-shortener", "video-streaming"]);
   });
 
-  it("describes the URL Shortener's eighteen sections, the Rate Limiter's fifteen, the Pastebin's eighteen, the Notification Service's eighteen, the Distributed Cache's eighteen, the Ticket Booking's eighteen, the Video Streaming's eighteen, the Collaborative Doc Editor's eighteen, and the Cloud Drive's eighteen", () => {
+  it("describes the URL Shortener's eighteen sections, the Rate Limiter's fifteen, the Pastebin's eighteen, the Notification Service's eighteen, the Distributed Cache's eighteen, the Ticket Booking's eighteen, the Video Streaming's eighteen, the Collaborative Doc Editor's eighteen, the Cloud Drive's eighteen, and the Payment System's eighteen", () => {
     expect(getTutorial("url-shortener")?.sections).toHaveLength(18);
     expect(getTutorial("rate-limiter")?.sections).toHaveLength(15);
     expect(getTutorial("pastebin")?.sections).toHaveLength(18);
@@ -16,6 +16,7 @@ describe("tutorial registry", () => {
     expect(getTutorial("video-streaming")?.sections).toHaveLength(18);
     expect(getTutorial("collaborative-doc-editor")?.sections).toHaveLength(18);
     expect(getTutorial("cloud-drive")?.sections).toHaveLength(18);
+    expect(getTutorial("payment-system")?.sections).toHaveLength(18);
   });
 
   it("gives every section a unique id and a valid depth", () => {

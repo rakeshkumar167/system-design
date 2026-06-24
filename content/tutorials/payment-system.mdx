@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+A payment system interview tests whether you understand that correctness and durability matter far more than raw throughput.
+
+<h2 id="requirements">Requirements</h2>
+
+The core functional requirement is to process a payment exactly once and return a durable result to the caller.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+At 100 million payments per day the average rate is about 1,157 payments per second, which is modest — the design weight is correctness, not scale.
+
+<h2 id="entity-model">Entity Model</h2>
+
+The central entities are Payment, LedgerEntry, Account, and IdempotencyKey, with the immutable ledger serving as the source of truth.
+
+<h2 id="api-design">API Design</h2>
+
+The API surface is small: POST /payments (with an Idempotency-Key header), POST /payments/&#123;id&#125;/refund, and GET /payments/&#123;id&#125;.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+The high-level architecture routes client requests through a Payment API to a Payment Orchestrator, which writes to a Ledger Service and dispatches to a PSP via a transactional outbox.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+The four key flows are auth-capture, idempotent retry, reconciliation, and refund — each illuminating a different correctness invariant.
+
+<h2 id="idempotency">Idempotency & Exactly-Once</h2>
+
+An idempotency key turns a retried request into a safe no-op that returns the original result instead of charging the customer twice.
+
+<h2 id="double-entry-ledger">The Double-Entry Ledger</h2>
+
+Every monetary movement is recorded as equal and opposite debit and credit entries in an append-only, immutable ledger that is never updated, only grown.
+
+<h2 id="payment-lifecycle">Payment Lifecycle & State Machine</h2>
+
+A payment is a durable state machine that advances through initiated, authorized, captured, and settled states, with failed and refunded as terminal error states.
+
+<h2 id="distributed-transactions">Distributed Transactions & the Dual-Write Problem</h2>
+
+The ledger write and the external PSP call cannot share an ACID transaction, so the transactional outbox pattern ensures the PSP is called exactly once via idempotent retries.
+
+<h2 id="reconciliation">Reconciliation</h2>
+
+Reconciliation compares the internal ledger against the PSP's settlement file to catch any drift and flag discrepancies for resolution.
+
+<h2 id="security-compliance">Security & Compliance</h2>
+
+PCI-DSS compliance, TLS in transit, encryption at rest, tokenization of card data, and audit logging are non-negotiable requirements for any payment system.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+Because throughput is modest, scaling the payment system means optimizing for durability and consistency rather than raw horizontal sharding.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+The key failure modes are PSP timeouts (handled by idempotent retries via the outbox), ledger write failures (transactional with the outbox insert), and reconciliation mismatches (flagged for manual resolution).
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+The main trade-off is synchronous versus asynchronous capture: synchronous is simpler but couples the API latency to PSP latency; asynchronous via the outbox is more complex but more resilient.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+In sixty seconds: use an idempotency key for exactly-once processing, write every movement to an immutable double-entry ledger, fix the dual-write problem with a transactional outbox, and close the loop with reconciliation.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+Common interview questions cover idempotency key mechanics, double-entry invariants, why balances are derived rather than stored, and how the outbox guarantees exactly-once PSP dispatch.
