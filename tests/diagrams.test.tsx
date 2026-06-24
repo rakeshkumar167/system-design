@@ -1,6 +1,13 @@
 import { render, screen } from "@testing-library/react";
 import { describe, it, expect } from "vitest";
 import { VideoStreamingArchitecture } from "@/components/diagrams/video-streaming-architecture";
+import { DistributedCacheArchitecture } from "@/components/diagrams/distributed-cache-architecture";
+import {
+  CacheHitSequence,
+  CacheMissSequence,
+  NodeRebalanceSequence,
+  StampedeSequence,
+} from "@/components/diagrams/cache-flows";
 import { CollaborativeDocEditorArchitecture } from "@/components/diagrams/collaborative-doc-editor-architecture";
 import {
   EditBroadcastSequence,
@@ -200,5 +207,28 @@ describe("collaborative editor flow sequences", () => {
     expect(screen.getByRole("img", { name: /presence|cursor/i })).toBeInTheDocument();
     render(<ReconnectSyncSequence />);
     expect(screen.getByRole("img", { name: /reconnect|sync|catch/i })).toBeInTheDocument();
+  });
+});
+
+describe("DistributedCacheArchitecture", () => {
+  it("exposes the distributed cache architecture to non-visual readers", () => {
+    render(<DistributedCacheArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /distributed cache architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/consistent hashing/i)).toBeInTheDocument();
+  });
+});
+
+describe("cache flow sequences", () => {
+  it("renders the hit, miss, rebalance, and stampede sequences", () => {
+    render(<CacheHitSequence />);
+    expect(screen.getByRole("img", { name: /hit/i })).toBeInTheDocument();
+    render(<CacheMissSequence />);
+    expect(screen.getByRole("img", { name: /miss/i })).toBeInTheDocument();
+    render(<NodeRebalanceSequence />);
+    expect(screen.getByRole("img", { name: /rebalance|ring|node|hash/i })).toBeInTheDocument();
+    render(<StampedeSequence />);
+    expect(screen.getByRole("img", { name: /stampede|herd|coalesc/i })).toBeInTheDocument();
   });
 });

@@ -67,6 +67,13 @@ import {
   PresenceSequence,
   ReconnectSyncSequence,
 } from "@/components/diagrams/collab-editor-flows";
+import { DistributedCacheArchitecture } from "@/components/diagrams/distributed-cache-architecture";
+import {
+  CacheHitSequence,
+  CacheMissSequence,
+  NodeRebalanceSequence,
+  StampedeSequence,
+} from "@/components/diagrams/cache-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -129,6 +136,11 @@ const teachingComponents = {
   ConflictResolutionSequence,
   PresenceSequence,
   ReconnectSyncSequence,
+  DistributedCacheArchitecture,
+  CacheHitSequence,
+  CacheMissSequence,
+  NodeRebalanceSequence,
+  StampedeSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
