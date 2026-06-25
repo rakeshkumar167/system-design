@@ -107,6 +107,13 @@ import {
   LeaseRecoverySequence,
   RetryBackoffSequence as JobSchedulerRetryBackoffSequence,
 } from "@/components/diagrams/job-scheduler-flows";
+import { MapsNavigationArchitecture } from "@/components/diagrams/maps-navigation-architecture";
+import {
+  RouteQuerySequence,
+  MapMatchSequence,
+  TrafficUpdateSequence,
+  TileFetchSequence,
+} from "@/components/diagrams/maps-navigation-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -199,6 +206,11 @@ const teachingComponents = {
   DispatchExecuteSequence,
   LeaseRecoverySequence,
   JobSchedulerRetryBackoffSequence,
+  MapsNavigationArchitecture,
+  RouteQuerySequence,
+  MapMatchSequence,
+  TrafficUpdateSequence,
+  TileFetchSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

@@ -356,3 +356,34 @@ describe("job scheduler flow sequences", () => {
     expect(screen.getByRole("img", { name: /retry/i })).toBeInTheDocument();
   });
 });
+
+import { MapsNavigationArchitecture } from "@/components/diagrams/maps-navigation-architecture";
+import {
+  RouteQuerySequence,
+  MapMatchSequence,
+  TrafficUpdateSequence,
+  TileFetchSequence,
+} from "@/components/diagrams/maps-navigation-flows";
+
+describe("MapsNavigationArchitecture", () => {
+  it("exposes the maps and navigation architecture to non-visual readers", () => {
+    render(<MapsNavigationArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /maps (and )?navigation architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/contraction hierarch/i)).toBeInTheDocument();
+  });
+});
+
+describe("maps and navigation flow sequences", () => {
+  it("renders the route, map-match, traffic, and tile sequences", () => {
+    render(<RouteQuerySequence />);
+    expect(screen.getByRole("img", { name: /route/i })).toBeInTheDocument();
+    render(<MapMatchSequence />);
+    expect(screen.getByRole("img", { name: /match/i })).toBeInTheDocument();
+    render(<TrafficUpdateSequence />);
+    expect(screen.getByRole("img", { name: /traffic/i })).toBeInTheDocument();
+    render(<TileFetchSequence />);
+    expect(screen.getByRole("img", { name: /tile/i })).toBeInTheDocument();
+  });
+});
