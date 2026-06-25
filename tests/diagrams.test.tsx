@@ -325,3 +325,34 @@ describe("logging flow sequences", () => {
     expect(screen.getByRole("img", { name: /retention|tier/i })).toBeInTheDocument();
   });
 });
+
+import { DistributedJobSchedulerArchitecture } from "@/components/diagrams/distributed-job-scheduler-architecture";
+import {
+  ScheduleJobSequence,
+  DispatchExecuteSequence,
+  LeaseRecoverySequence,
+  RetryBackoffSequence as JobRetryBackoffSequence,
+} from "@/components/diagrams/job-scheduler-flows";
+
+describe("DistributedJobSchedulerArchitecture", () => {
+  it("exposes the job scheduler architecture to non-visual readers", () => {
+    render(<DistributedJobSchedulerArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /job scheduler architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/at-least-once/i)).toBeInTheDocument();
+  });
+});
+
+describe("job scheduler flow sequences", () => {
+  it("renders the schedule, dispatch, lease-recovery, and retry sequences", () => {
+    render(<ScheduleJobSequence />);
+    expect(screen.getByRole("img", { name: /schedul/i })).toBeInTheDocument();
+    render(<DispatchExecuteSequence />);
+    expect(screen.getByRole("img", { name: /dispatch/i })).toBeInTheDocument();
+    render(<LeaseRecoverySequence />);
+    expect(screen.getByRole("img", { name: /recover/i })).toBeInTheDocument();
+    render(<JobRetryBackoffSequence />);
+    expect(screen.getByRole("img", { name: /retry/i })).toBeInTheDocument();
+  });
+});

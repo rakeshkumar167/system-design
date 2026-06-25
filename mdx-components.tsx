@@ -99,6 +99,13 @@ import {
   SearchQuerySequence,
   RetentionTierSequence,
 } from "@/components/diagrams/logging-flows";
+import { DistributedJobSchedulerArchitecture } from "@/components/diagrams/distributed-job-scheduler-architecture";
+import {
+  ScheduleJobSequence,
+  DispatchExecuteSequence,
+  LeaseRecoverySequence,
+  RetryBackoffSequence as JobSchedulerRetryBackoffSequence,
+} from "@/components/diagrams/job-scheduler-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -185,6 +192,11 @@ const teachingComponents = {
   IndexBuildSequence,
   SearchQuerySequence,
   RetentionTierSequence,
+  DistributedJobSchedulerArchitecture,
+  ScheduleJobSequence,
+  DispatchExecuteSequence,
+  LeaseRecoverySequence,
+  JobSchedulerRetryBackoffSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
