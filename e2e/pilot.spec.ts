@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(22);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(21);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -153,5 +153,17 @@ test("learner can open the distributed logging tutorial", async ({ page }) => {
   await expect(page.locator("#indexing")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /distributed logging architecture/i }).first(),
+  ).toBeVisible();
+});
+
+test("learner can open the distributed job scheduler tutorial", async ({ page }) => {
+  await page.goto("/learn/distributed-job-scheduler");
+  await expect(
+    page.getByRole("heading", { name: /design a distributed job scheduler/i }),
+  ).toBeVisible();
+  await page.goto("/learn/distributed-job-scheduler#leasing-coordination");
+  await expect(page.locator("#leasing-coordination")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /job scheduler architecture/i }).first(),
   ).toBeVisible();
 });
