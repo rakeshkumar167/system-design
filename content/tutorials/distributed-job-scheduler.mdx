@@ -1,71 +1,378 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section frames the distributed job scheduler as an interview problem, covering scope, ambiguities to clarify, and what a strong answer demonstrates.
+A distributed job scheduler runs work on a schedule: a user registers a job — "send this report every morning at 7," "retry this payment in 30 minutes," "clean up these files at midnight" — and the system guarantees it runs at the right time, without anyone babysitting it. Cron does this on one machine; Airflow's scheduler, Quartz, Temporal, and the cloud schedulers do it across a fleet for millions of jobs. From the outside it's the most mundane thing imaginable — a table of "run X at time T" — and that framing produces a design that works beautifully until the one machine holding the cron table reboots and a thousand jobs silently never run.
+
+The hard part is doing this **reliably, at scale, on infrastructure that fails**. Four problems fall out the moment "one machine" becomes "many." First, **a worker can die in the middle of a job**, so the system must notice and run it somewhere else — which means a job can end up running **more than once**. That gives you **at-least-once** execution, and to keep "more than once" from meaning "two workers at the same time," you need a **lease** (a time-bounded claim) so exactly one worker owns a due job, with the lease expiring and the job being re-claimed if its owner dies. Second, because at-least-once allows a retry *after* a job already did its work, the work must be **idempotent** — exactly-once *delivery* is impossible, but exactly-once *effect* is achievable. Third, the component that decides "what's due right now" must itself not be a **single point of failure**, so it's **leader-elected** and its state is durable. Fourth, humans schedule jobs at round numbers, so a huge fraction fire at exactly midnight or the top of the hour — a **thundering herd** that a naive design tries to run all at once. The reframe to lead with: *it looks like a cron table, but the hard part is firing reliably at scale on a fleet that crashes — run each job at-least-once with a lease so a dead worker's job is re-claimed, make the work idempotent so a retry is safe, elect a leader so the scheduler has no single point of failure, and shard and smear the firings so the midnight stampede doesn't crush you.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- One-time jobs, recurring (cron) jobs, or both? Recurring jobs add "compute the next fire time" and dominate the volume.
+- What's the reliability bar — is missing a run unacceptable, or best-effort? This decides at-least-once vs at-most-once.
+- How precisely on-time must jobs fire — to the second, or is a minute of slack fine? Tighter precision costs more scanning/coordination.
+- Can jobs be made idempotent, or do some have non-repeatable side effects? This shapes how hard you fight duplication.
+- What's the scale — thousands of jobs or hundreds of millions — and how clustered are the schedules? Clustering drives the thundering-herd design.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "reliable cron at scale" reframe · **5 min** requirements (at-least-once, no SPOF, exactly-once effect) · **5 min** capacity (note the thundering herd and that concurrency sizes the workers) · **5 min** entity model (Job, JobRun, Lease) and the API · **10 min** scheduling + reliable execution with leasing — the centerpiece · **10 min** idempotency, retries/backoff, and the thundering herd · **5 min** failure modes and wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for leasing, at-least-once + idempotency, and leader election, not whether you can name a cron library.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** scheduling and time triggers (cron, one-time, recurring), reliable at-least-once execution, leasing and coordination/leader election, idempotency / exactly-once effects, retries / backoff / dead-letter, and scaling / the thundering herd. **Out of scope:** the workers' actual job logic (we schedule and deliver work; what the job *does* is the user's), multi-job DAG/workflow dependencies (a full workflow engine like Airflow or Temporal is a richer problem), the consensus-algorithm internals behind leader election (we lean on a coordination service), and the UI — name them so the interviewer sees the boundary, then set them aside. This problem reuses idempotency from the Payment System and the queue/worker pattern from the Notification Service, but centers them on *time-triggered, reliably-executed* work.
 
 <h2 id="requirements">Requirements</h2>
 
-This section defines functional requirements such as one-time and recurring job scheduling, and non-functional requirements such as at-least-once execution, low latency, and high throughput.
+Separate what the system must *do* from how *well* it must do it. For a scheduler the non-functional list is where the difficulty lives, and it's anchored by two guarantees in tension: **never silently skip a job**, and **never duplicate its effect**.
+
+<RequirementsTable
+  functional={[
+    "Schedule one-time jobs (run at time T)",
+    "Schedule recurring jobs (cron expressions)",
+    "Run each job at its scheduled time and record the outcome",
+    "Retry failed jobs and surface persistent failures",
+    "Cancel or update a scheduled job",
+    "Expose job status and recent run history",
+  ]}
+  nonFunctional={[
+    { goal: "Reliable execution", target: "at-least-once; no missed jobs" },
+    { goal: "Exactly-once effect", target: "no harmful duplication (idempotent)" },
+    { goal: "No single point of failure", target: "leader-elected scheduler" },
+    { goal: "Durability", target: "the schedule survives any crash" },
+    { goal: "Scheduling latency", target: "fire within seconds of due time" },
+    { goal: "Scale", target: "millions of jobs; spiky firing" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **at-least-once reliability**: a job must run even if the worker assigned to it dies, so the system re-claims and re-runs it — accepting that a job may occasionally run twice rather than risk it running zero times. Second, **exactly-once effect**: since duplication is unavoidable under at-least-once, the burden shifts to making jobs **idempotent** so a second run is harmless; the system provides idempotency keys and fencing to help. Third, **no single point of failure**: the scheduler that decides what's due must be leader-elected with durable state, because a scheduler outage that loses the schedule means thousands of jobs silently never fire — the quiet catastrophe this design exists to prevent. Note what's *relaxed*: jobs need only fire within a few seconds of their due time (not to the millisecond), and at-least-once is preferred over the stricter at-most-once. The system trades exact timing and exactly-once delivery for reliability and recoverability.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section walks through the capacity math for scheduling millions of jobs, quantifying the thundering herd, worker concurrency, and execution history storage.
+Estimates here make two non-obvious points: the average load is modest, but the *peak* is brutal because of synchronized firing, and the worker fleet is sized by **concurrency**, not by the trigger rate.
+
+<DistributedJobSchedulerCapacity
+  assumptions={{
+    scheduledJobs: 100000000,
+    avgRunsPerJobPerDay: 24,
+    peakFactor: 20,
+    avgJobDurationSec: 30,
+    avgRecordBytes: 1000,
+    historyRetentionDays: 30,
+  }}
+/>
+
+The takeaways. First, **the average is easy, the peak is the problem**: ~2.4 billion runs a day is only ~**28,000/sec** on average — a single scheduler tier can comfortably find that many due jobs — but because humans schedule at round times (midnight, the top of every hour), firing clusters into a **thundering herd** that spikes ~20× to ~**556,000/sec**. You must size for the synchronized burst and actively spread it, not provision for the average. Second, **concurrency sizes the workers**, not the trigger rate: by Little's law, with ~28k jobs starting per second and each running ~30 seconds, ~**833,000 jobs are in flight at once** — so the worker fleet is dimensioned by how many run *concurrently*, and must scale elastically to absorb the peak. Third, **run history is the storage driver**: the job *definitions* are tiny, but recording every execution for 30 days is ~**72 TB** — an append-only, time-bounded history that's retained and then expired, much like a log. The capacity story: a scheduler isn't hard because of raw volume; it's hard because the load is spiky and the work is concurrent and must be reliable.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section introduces the core entities: the durable Job definition with its next fire time, the immutable JobRun execution record, the Lease, and the schedule index.
+The model separates the *durable intent* (a Job and when it should next fire) from the *immutable record* of what happened (each run) and the *transient claim* that makes execution safe (a Lease). The most important idea: the Job plus its **next fire time** is the source of truth the scheduler reads; everything else supports running it reliably.
+
+<EntityModel
+  name="Job"
+  description="A scheduled unit of work — one-time or recurring. It holds the schedule, the next time it should fire, the payload to hand a worker, and the retry policy. The Job plus its next_fire_time is the durable source of truth the scheduler scans; it survives any crash."
+  fields={[
+    { name: "job_id", type: "uuid", notes: "stable identity" },
+    { name: "schedule", type: "cron | one-time", notes: "when it runs; cron for recurring" },
+    { name: "next_fire_time", type: "datetime", notes: "indexed; the scheduler scans by this" },
+    { name: "payload", type: "blob", notes: "opaque work handed to the worker" },
+    { name: "status", type: "enum", notes: "scheduled | running | succeeded | failed | paused" },
+    { name: "idempotency_key", type: "string", notes: "dedupes a run's effect" },
+    { name: "max_retries", type: "int", notes: "attempts before dead-lettering" },
+  ]}
+  keys="A Job is keyed by job_id and ordered for discovery by next_fire_time (the schedule index — the scheduler queries 'jobs where next_fire_time <= now'). Each attempt is an immutable JobRun (run_id, job_id, attempt number, start/end, outcome) — the audit history. A Lease records which worker currently owns a due run and when the claim expires; if the worker dies, the lease lapses and the run is re-claimable. After a recurring job runs, the scheduler computes the next_fire_time from the cron expression and updates the Job. The durable Job + next_fire_time is authoritative; JobRuns are append-only history; the Lease is transient coordination state."
+/>
+
+Three supporting entities complete the picture. A **JobRun (Execution)** is an immutable record of one attempt — when it started, which worker ran it, and how it ended — so the full history of successes, failures, and retries is preserved for debugging and audit (and is the storage driver from the capacity model). A **Lease** is a time-bounded claim on a due run: it names the owning worker and an expiry, and it's what guarantees that only one worker runs a job at a time while still allowing recovery if that worker dies. And the **schedule index** — jobs ordered by `next_fire_time` — is what lets the scheduler efficiently answer "what's due now?" without scanning every job. The discipline: durable intent (Job), immutable history (JobRun), transient ownership (Lease).
 
 <h2 id="api-design">API Design</h2>
 
-This section presents the public API contract for creating, reading, and deleting jobs, including idempotency key support and cron expression scheduling.
+The interface is small — schedule, cancel, inspect — and its defining feature is the **schedule specification** (one-time or cron) plus an **idempotency key** on creation, so registering the same job twice doesn't create two.
+
+<ApiContract
+  method="POST"
+  path="/jobs"
+  summary="Schedule a job, one-time or recurring (cron). Idempotent on the key so a retried submission doesn't double-schedule."
+  request={`POST /jobs
+Idempotency-Key: report-job-acct-42
+
+{
+  "schedule": "0 7 * * *",        // cron: every day at 07:00 (or { "at": "2026-07-01T02:00Z" })
+  "payload": { "task": "daily_report", "account": "42" },
+  "max_retries": 5,
+  "timezone": "UTC"
+}`}
+  response={`HTTP/1.1 201 Created
+{ "job_id": "job_19f", "next_fire_time": "2026-06-26T07:00:00Z", "status": "scheduled" }`}
+  statusCodes={[
+    { code: "201", meaning: "Job scheduled; next_fire_time computed and persisted" },
+    { code: "200", meaning: "Duplicate idempotency key — the existing job is returned" },
+    { code: "400", meaning: "Invalid cron expression or schedule" },
+  ]}
+  notes="A cron expression schedules recurring runs; an 'at' timestamp schedules a one-time run. The idempotency key makes creation safe to retry. On creation the scheduler computes and persists next_fire_time so the durable schedule is immediately authoritative."
+/>
+
+<ApiContract
+  method="DELETE"
+  path="/jobs/{id}"
+  summary="Cancel a scheduled job (or pause/update it)."
+  request={`DELETE /jobs/job_19f`}
+  response={`HTTP/1.1 204 No Content`}
+  statusCodes={[
+    { code: "204", meaning: "Job cancelled; it will not fire again" },
+    { code: "409", meaning: "Job is mid-run — cancellation marks it to stop recurring" },
+    { code: "404", meaning: "No such job" },
+  ]}
+  notes="Cancelling removes future firings. A run already in flight isn't force-killed by the scheduler; cancellation stops future occurrences and marks the job paused. Updating a job (PATCH) recomputes next_fire_time."
+/>
+
+<ApiContract
+  method="GET"
+  path="/jobs/{id}"
+  summary="Read a job's status, next fire time, and recent run history."
+  request={`GET /jobs/job_19f`}
+  response={`HTTP/1.1 200 OK
+{
+  "job_id": "job_19f", "status": "scheduled", "next_fire_time": "2026-06-26T07:00:00Z",
+  "recent_runs": [ { "run_id": "r_88", "attempt": 1, "outcome": "succeeded", "ended": "2026-06-25T07:00:09Z" } ]
+}`}
+  statusCodes={[
+    { code: "200", meaning: "Returns the job, its next fire time, and recent JobRuns" },
+    { code: "404", meaning: "No such job" },
+  ]}
+  notes="Recent runs come from the immutable JobRun history. Status reflects the durable job state machine; next_fire_time is what the scheduler will act on next."
+/>
+
+The whole surface is: schedule (idempotent), cancel/update, inspect. Creation persists the durable schedule immediately so it's authoritative the moment it returns; the idempotency key keeps double-submits safe; and status reads come from the immutable run history. Everything heavy — finding due jobs, leasing, executing, retrying — happens behind this thin surface.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section describes the high-level components: the scheduler tier, job store, dispatch queue, worker fleet, coordination service, history store, and dead-letter queue.
+The architecture splits the durable schedule from the act of running it: a leader-elected scheduler finds what's due and hands it to a queue, a pool of workers leases and executes jobs, and a coordination service keeps the scheduler highly available and the leases honest.
+
+<DistributedJobSchedulerArchitecture />
+
+- **Client API.** Where jobs are scheduled, cancelled, and inspected. Creation persists a durable job with its next fire time.
+- **Scheduler (leader-elected).** The brain: it scans the job store for jobs whose `next_fire_time <= now` and enqueues them for execution. It's **leader-elected** via the coordination service so there's exactly one active scheduler (no double-enqueue) and no single point of failure — a standby takes over if the leader dies.
+- **Job Store.** The durable source of truth: job definitions, the schedule index (by next fire time), and status. Survives any crash, so nothing is silently lost.
+- **Dispatch Queue.** Holds due jobs for workers and provides the **lease / visibility timeout**: a delivered job is invisible to others until the worker acks or the lease expires.
+- **Workers.** A horizontally scaled, elastic pool. Each **leases** a due job, executes it, renews the lease for long jobs, writes the result, and on failure routes to retry/DLQ. Sized by concurrency.
+- **Coordination service.** Provides leader election for the scheduler and backs the lease/fencing semantics (etcd/ZooKeeper-style).
+- **History Store + Retry/DLQ.** Immutable run records for status and audit; a retry path with backoff and a dead-letter queue for jobs that exhaust their attempts.
+
+The decisive boundary is **the durable schedule is the source of truth, and a lease makes execution recoverable**: the leader-elected scheduler guarantees exactly one component decides what's due, the durable store guarantees nothing is forgotten across crashes, and the lease guarantees that a due job runs on exactly one worker at a time — but is re-claimed if that worker dies, yielding at-least-once. Every section that follows elaborates one piece: how due jobs are found (scheduling), how a crash doesn't lose a run (reliable execution), how exactly-one-at-a-time-but-recoverable works (leasing), why jobs must be idempotent (exactly-once effect), how failures heal (retries), and how the midnight stampede is tamed (hot partitions).
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section traces four key flows: scheduling a job, dispatching and executing it, recovering from a crashed worker via lease expiry, and retrying a failed job with backoff.
+Four flows cover the system: scheduling a job, dispatching and running a due job, recovering when a worker dies, and retrying a failure. The first two are the happy path; the last two are where reliability is earned.
+
+**Schedule a job.** The client submits a one-time or cron job; the scheduler validates it, computes the next fire time, and persists it durably to the job store. From that instant the schedule is authoritative and will survive any restart.
+
+<ScheduleJobSequence />
+
+**Dispatch and execute.** The scheduler scans for jobs whose time has come, enqueues each due job, and a worker claims it under a lease, executes it, and marks it done — after which the scheduler computes the next fire time for a recurring job. The lease is what protects the run if the worker dies.
+
+<DispatchExecuteSequence />
+
+**Lease recovery.** A worker leases a job and starts running it, then crashes before finishing. Its lease isn't renewed, so it expires; the job becomes visible again; another worker re-claims and runs it to completion. The job still runs — **at-least-once** — which is exactly why it must be idempotent.
+
+<LeaseRecoverySequence />
+
+**Retry with backoff.** A worker runs a job and it fails. The attempt count is incremented; if it's under the max, the job is re-enqueued with exponential backoff and jitter; if it has exhausted its attempts, it's moved to the dead-letter queue for a human to inspect. Transient failures heal themselves; permanent ones are quarantined.
+
+<JobSchedulerRetryBackoffSequence />
 
 <h2 id="scheduling-triggers">Scheduling & Time Triggers</h2>
 
-This section covers how the scheduler evaluates cron expressions and one-time timestamps to compute next fire times, and how it scans the schedule index efficiently.
+The first deep dive is the scheduler's core question: **how do you efficiently find what's due right now** among a hundred million jobs? The durable answer is a **time-ordered index** on `next_fire_time`. The scheduler periodically queries "all jobs where `next_fire_time <= now`," dispatches them, and — for recurring jobs — computes the *next* fire time from the cron expression and updates the row. Indexing by fire time means the scan touches only the small set of due jobs, not the entire table; partitioning that index by time bucket makes the scan cheap and shardable. The alternative, an in-memory **timer wheel** (a ring of buckets that "ticks"), fires with very low latency and no polling, but it must be rebuilt from the durable store on restart and is harder to scale across machines — so production systems usually anchor on the durable time-index, optionally with an in-memory timer for near-term precision.
+
+The key tension is **scheduling latency versus scan cost**. Scan every second and jobs fire promptly but you hammer the store with mostly-empty scans; scan every minute and you halve the load but jobs can fire up to a minute late. Most schedulers pick a scan interval matching their latency SLA (a few seconds) and shard the scan so each shard handles a slice of the keyspace. Recurring jobs also raise a subtlety: **what if the scheduler was down when a job was due?** On recovery it sees the past-due `next_fire_time` and must decide whether to fire the missed run (catch-up) or skip to the next occurrence — a policy choice (Airflow calls it backfill vs catchup) the design must make explicit. The durable, indexed schedule is what makes all of this recoverable: the truth of "what should run when" never lives only in memory.
+
+<KnowledgeCheck
+  question="How does a scheduler efficiently find which of a hundred million jobs are due, and what's the core tradeoff?"
+  options={[
+    "It scans every job every second and checks the time",
+    "It keeps a durable time-ordered index on next_fire_time and queries 'jobs where next_fire_time <= now', so the scan touches only due jobs; for recurring jobs it computes the next fire time after each run. The core tradeoff is scan interval vs scheduling latency — scan more often to fire promptly at higher store load, or less often to reduce load at the cost of jobs firing later",
+    "It loads all jobs into memory and never persists them",
+    "It asks each worker to poll for its own jobs",
+  ]}
+  answer={1}
+  explanation="Indexing jobs by next_fire_time lets the scheduler pull just the due set with a range query instead of scanning everything, and recurring jobs get their next fire time recomputed from the cron expression after running. The durable index also makes the schedule survive restarts. The tradeoff is how often to scan: frequent scans fire jobs promptly but load the store with mostly-empty queries, while infrequent scans are cheaper but increase how late a job can fire — so you match the scan interval to your latency SLA and shard the scan to scale."
+/>
 
 <h2 id="reliable-execution">Reliable Execution & At-Least-Once</h2>
 
-This section explains how the visibility timeout and lease mechanism ensure a job always runs even if its worker crashes, guaranteeing at-least-once delivery.
+Reliability means a scheduled job **actually runs**, even though the machines running it crash. The mechanism is a durable **state machine** per run — `scheduled → claimed → running → succeeded` (or `failed`) — combined with the rule **persist the transition before acting**. When the scheduler dispatches a job it's recorded as claimed/enqueued durably; when a worker finishes it records success durably *before* the run is considered done. The payoff is that a crash at any point leaves a known, recoverable state: if a worker dies after claiming but before finishing, the system can tell the job was in flight and run it again.
+
+That recovery is precisely what produces **at-least-once** semantics, and it's a deliberate choice over the alternative. The two options for an unreliable executor are **at-most-once** (try once; if the worker dies, the job just doesn't run) and **at-least-once** (re-run until it succeeds; the job may run more than once). For scheduled work — backups, billing, reports, retries — *not running* is almost always worse than *running twice*, so schedulers choose at-least-once: better to occasionally double-send a report than to silently skip a customer's bill. The cost of that choice is duplication, which the next two sections address (leases to minimize concurrent duplicates, idempotency to make the unavoidable ones harmless). The principle: make every transition durable so a crash is recoverable, and prefer running a job again over never running it.
+
+<KnowledgeCheck
+  question="Why do job schedulers choose at-least-once execution over at-most-once, and what makes it work across crashes?"
+  options={[
+    "At-most-once is impossible to implement",
+    "Because for scheduled work (backups, billing, reports) not running is worse than running twice, schedulers prefer at-least-once: a durable per-run state machine with 'persist the transition before acting' means a crash leaves a recoverable state, so a job claimed by a worker that then dies is detected and run again — accepting possible duplication rather than a silent miss",
+    "Because at-least-once guarantees a job never runs twice",
+    "Because workers never crash in practice",
+  ]}
+  answer={1}
+  explanation="The executor is unreliable, so you pick which failure you can tolerate: at-most-once risks silently skipping a job when a worker dies, while at-least-once risks running it more than once. For scheduled work a missed run is usually the worse outcome, so schedulers choose at-least-once. It works because each state transition is persisted before the side effect, so recovery can see a job was in flight and re-run it. The price — possible duplicates — is then handled with leases and idempotency."
+/>
 
 <h2 id="leasing-coordination">Leasing & Coordination</h2>
 
-This section details how the coordination service provides distributed leases to workers and how leader election eliminates a single point of failure in the scheduler tier.
+At-least-once says "run it again if needed," but you don't want *two workers running the same job at the same time* every time — that's wasteful and amplifies duplication. The fix is a **lease** (a.k.a. visibility timeout): when a worker claims a due job, it gets a time-bounded, exclusive ownership of that run. While the lease is held, no other worker can pick the job up. If the worker finishes, it releases the lease; if it dies, the lease **expires** and the job becomes claimable again, so another worker takes over. Long-running jobs **renew** their lease with a heartbeat so it doesn't expire mid-execution. The lease is the elegant heart of the design: it gives **exactly-one-at-a-time** ownership during normal operation while still allowing **recovery** after a crash — at-least-once without constant double-running.
+
+Two coordination problems sit alongside it. First, the **scheduler must not be a single point of failure**, and there must be exactly one active scheduler (two would double-enqueue every job). This is solved with **leader election** via a coordination service (etcd, ZooKeeper, or a database lock): one scheduler instance is the leader and does the scanning; standbys wait, and if the leader's lease lapses, a standby is elected. Second, the **zombie problem**: a worker whose lease expired might not *know* it — it could have been paused (a long GC, a network partition) and wake up still thinking it owns the job, after another worker has taken over. The guard is a **fencing token**: each lease carries a monotonically increasing number, and the downstream store rejects writes carrying a stale token, so a revived zombie can't corrupt state. Leasing plus leader election plus fencing is what lets a crash-prone fleet behave, most of the time, as if exactly one worker runs each job exactly once.
+
+<KnowledgeCheck
+  question="What does a lease (visibility timeout) provide, and why are leader election and fencing tokens also needed?"
+  options={[
+    "A lease permanently assigns a job to one worker forever",
+    "A lease gives a worker time-bounded exclusive ownership of a due job, so only one worker runs it at a time, but if that worker dies the lease expires and another re-claims it (at-least-once with recovery). Leader election ensures exactly one active scheduler so jobs aren't double-enqueued and there's no single point of failure; fencing tokens (monotonic per-lease numbers the store validates) stop a 'zombie' worker whose lease already expired from corrupting state",
+    "Leases make jobs run faster",
+    "Fencing tokens encrypt the job payload",
+  ]}
+  answer={1}
+  explanation="The lease is what reconciles 'exactly one at a time' with 'recover if the owner dies': it's exclusive while held and re-claimable when it expires, and long jobs renew it via heartbeat. Leader election handles the scheduler side — exactly one instance scans and enqueues, with standby failover, so it's neither a bottleneck nor a single point of failure. Fencing tokens close the zombie gap: a paused worker that revives after its lease expired carries a stale token, which the store rejects, preventing it from clobbering the work another worker has since done."
+/>
 
 <h2 id="idempotency-exactly-once">Idempotency & Exactly-Once Effects</h2>
 
-This section explains why exactly-once delivery is impossible in distributed systems and how idempotent job handlers, deduplication keys, and fencing tokens achieve exactly-once effects.
+Here is the hard truth that surprises people: **exactly-once *delivery* is impossible** in a system with crashes. No matter how careful the protocol, there's always a window where a worker completes a job's side effect and then dies *before* recording that it finished — so recovery can't tell whether the work happened, and must run it again. You cannot eliminate this; you can only make the duplicate **harmless**. So the real goal is **exactly-once *effect***: the job may execute more than once, but the observable outcome is as if it ran once.
+
+The way you get there is **idempotency**. An idempotent job produces the same result whether it runs once or five times: "set the status to shipped" is naturally idempotent; "increment the counter" or "send the email" is not. For work that isn't naturally idempotent, you make it so with a **dedupe / idempotency key**: the job carries a stable key, and the downstream system records "I already processed key K" and ignores a repeat — exactly the pattern the Payment System used to avoid double-charging. **Fencing tokens** (from leasing) handle the zombie case where a stale worker tries to apply old work. The design implication is liberating: *stop trying to guarantee a job runs exactly once, and instead make running it twice safe.* That's why the API exposes an idempotency key, why the entity model carries one per job, and why "are your jobs idempotent?" is the first question to ask about any at-least-once system. Reliability comes from at-least-once execution; correctness comes from idempotent effects.
+
+<KnowledgeCheck
+  question="Why can't a distributed scheduler guarantee exactly-once execution, and how is correctness achieved instead?"
+  options={[
+    "It can, by using a strong enough database transaction",
+    "Because a worker can always crash after performing a job's side effect but before recording completion, recovery must re-run it — so exactly-once delivery is impossible. Correctness is achieved via exactly-once *effect*: make jobs idempotent (or use a dedupe/idempotency key and fencing tokens) so running more than once produces the same outcome as running once",
+    "By never retrying failed jobs",
+    "By running every job on a single machine",
+  ]}
+  answer={1}
+  explanation="There's an unavoidable gap between doing the work and durably recording that it was done; a crash in that gap forces a re-run, so you can't promise exactly-once delivery. The achievable and sufficient goal is exactly-once effect: design the work to be idempotent, or attach a stable idempotency key that the downstream system uses to ignore duplicates, with fencing tokens guarding against stale zombie writers. Reliability comes from at-least-once execution; correctness comes from making the repeat harmless."
+/>
 
 <h2 id="retries-failures">Retries, Backoff & Failure Handling</h2>
 
-This section covers the retry lifecycle: incrementing attempt counts, exponential backoff with jitter, the maximum retry limit, and promotion to the dead-letter queue.
+Jobs fail — a downstream is briefly down, a timeout trips, a node dies — and a scheduler's job is to make **transient** failures heal themselves while not letting **permanent** ones run forever. The mechanism is **retry with exponential backoff and jitter**: on failure, the job is re-enqueued after a delay that grows with each attempt (1s, 2s, 4s, 8s…), with random **jitter** added so a batch of jobs that failed together don't all retry in lockstep and re-stampede the recovering dependency. Backoff gives a struggling downstream room to recover instead of being hammered; jitter spreads the retries out.
+
+Retrying can't be unbounded, so each job has a **max attempts** cap; once exhausted, the job is moved to a **dead-letter queue (DLQ)** — parked, not silently dropped — where it can be inspected, fixed, and replayed. This is the safety valve for the **poison pill**: a job that will *never* succeed (bad payload, a permanent bug) would otherwise retry forever, burning capacity; the max-attempts + DLQ pattern quarantines it. Two more failure shapes need handling. **Stuck / long-running jobs**: a worker that hangs would hold its lease forever, so leases expire (and jobs that legitimately run long must heartbeat to renew) — an expired lease reclaims a hung job. And **distinguishing transient from permanent**: ideally the job result signals which (retry a 503, don't retry a 400), so you don't waste attempts on hopeless work or give up on recoverable work. Good retry handling is what makes "at-least-once" practical rather than a source of runaway load.
+
+<KnowledgeCheck
+  question="How should a scheduler handle a job that keeps failing, and why add jitter to backoff?"
+  options={[
+    "Retry it immediately and forever until it succeeds",
+    "Retry with exponential backoff up to a max number of attempts, then move it to a dead-letter queue for inspection instead of retrying forever (quarantining poison-pill jobs that can never succeed). Jitter — randomness added to the backoff delay — prevents many jobs that failed together from retrying in lockstep and re-overwhelming the recovering dependency",
+    "Delete the job after the first failure",
+    "Keep retrying with a fixed 1-second delay",
+  ]}
+  answer={1}
+  explanation="Exponential backoff gives a failing dependency room to recover and avoids hammering it, while a max-attempts cap plus a dead-letter queue stops a permanently-broken (poison-pill) job from retrying forever and burning capacity — it's parked for a human instead of silently dropped. Jitter matters because failures often correlate (a downstream outage fails many jobs at once); without randomization they'd all retry simultaneously and re-stampede the dependency, so spreading the retry times smooths the recovery."
+/>
 
 <h2 id="hot-partitions">Hot Partitions & the Thundering Herd</h2>
 
-This section explains why jobs cluster at round times and how schedule sharding and staggered firing smear the burst load to keep the system within capacity.
+The most distinctive failure mode of a scheduler comes from human behavior: people schedule jobs at **round times**. "Every day at midnight," "every hour on the hour," "every Monday at 9." The result is that an enormous fraction of all jobs become due at the *exact same instant* — the capacity model's 20× peak — and a naive scheduler tries to find and dispatch them all at once, overwhelming the scan, the queue, and the workers in a **thundering herd**. Midnight UTC is a notorious spike for every scheduling system on earth.
+
+The defenses spread the load in time and space. **Smearing / jitter**: don't fire everything scheduled for `00:00:00` at exactly that microsecond — add a small randomized offset so a "midnight" job actually fires somewhere in the first minute or few minutes after midnight, flattening the spike (acceptable because most jobs don't need second-precision). **Sharding the schedule**: partition the job space (by hash of job id, or by time bucket) across many scheduler shards and worker groups, so no single component owns the whole herd — the burst is divided across the fleet rather than hitting one node. **Elastic workers**: scale the worker pool up ahead of known peaks and down afterward, since concurrency (not average rate) is what must absorb the spike. **Rate-limiting dispatch**: the scheduler can pace how fast it enqueues a huge due-batch so downstreams aren't flooded. The lesson generalizes: any system triggered by wall-clock time will see synchronized load, so deliberately **de-synchronize** it — smear the firings and shard the work — rather than provisioning for an instantaneous peak you could have spread out.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section discusses horizontal scaling of each tier, trade-offs in partition count and rebalancing, and how the architecture evolves from a small to a large deployment.
+Don't build the sharded, multi-region scheduler on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single cron box", "A handful of jobs on one machine", "Single point of failure; the box reboots and jobs silently miss; no scale"],
+    ["Durable job store + worker pool", "Jobs must survive restarts; work must parallelize", "Operating a store and workers; need a lease so workers don't double-run"],
+    ["Leader-elected scheduler + sharded schedule + leases", "Millions of jobs; no-SPOF and at-least-once required; thundering herd", "Leader election + coordination to run; sharded scans; smearing the herd"],
+    ["Multi-region / partitioned schedulers", "Global scale, locality, regional isolation", "Cross-region coordination; partitioned ownership; harder consistency and ops"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the failure you're buying out of. A single cron box is simple but is a textbook single point of failure — reboot it and jobs vanish. A **durable store plus a worker pool** survives restarts and parallelizes work, but needs a lease so two workers don't run the same job. Adding a **leader-elected scheduler, a sharded schedule, and lease-based at-least-once** is where the system becomes reliable, highly available, and able to absorb the thundering herd — the center of gravity for most real schedulers. Only global operations need **multi-region partitioned schedulers**, which pay for locality and isolation with genuinely hard cross-region coordination. Most distributed schedulers are well-served by "leader-elected scheduler, durable sharded store, lease-based workers, with the herd smeared."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section catalogs failure scenarios including scheduler crashes, worker loss, coordination outages, and job store unavailability, along with mitigations for each.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. A scheduler's failures are dominated by two rules: **never silently skip a job**, and **never let a duplicate cause harm**. The dangerous failures are the quiet ones — a job that just never fires.
+
+<FailureMatrix
+  rows={[
+    { failure: "Worker crashes mid-job", impact: "A run is interrupted", detection: "Lease expires without renewal", mitigation: "Lease lapses; another worker re-claims and re-runs (at-least-once); jobs are idempotent", recovery: "Job completes on the new worker; outcome recorded" },
+    { failure: "Scheduler / leader fails", impact: "No jobs dispatched — silent misses", detection: "Leader lease lost; coordination heartbeat", mitigation: "Leader election promotes a standby; durable schedule is intact; catch up past-due jobs", recovery: "New leader resumes scanning; missed jobs fire per catch-up policy" },
+    { failure: "Duplicate execution", impact: "A job runs twice", detection: "Idempotency-key / fencing-token checks downstream", mitigation: "Idempotent jobs + dedupe keys make the repeat a no-op; fencing rejects stale zombies", recovery: "Effect is exactly-once; duplicate is absorbed" },
+    { failure: "Missed / late firing (scan lag, clock skew)", impact: "Jobs fire late or in the wrong order", detection: "Scheduling-latency metric; due-but-unfired backlog", mitigation: "Shard the scan; tighten interval; use synced clocks (NTP) and tolerate small skew; catch-up policy", recovery: "Backlog drains; firing returns to within SLA" },
+    { failure: "Thundering herd at round times", impact: "Burst overwhelms scan/queue/workers", detection: "Spiky due-job rate at 00:00 / top of hour", mitigation: "Smear/jitter fire times; shard the schedule; scale workers elastically; rate-limit dispatch", recovery: "Load spreads over the window; system stays within capacity" },
+    { failure: "Poison-pill job (never succeeds)", impact: "Endless retries burn capacity", detection: "Attempts exceed max", mitigation: "Cap retries; dead-letter the job for inspection; alert", recovery: "Job parked in DLQ; fixed and replayed by a human" },
+    { failure: "Job store outage", impact: "Can't read schedule or persist state", detection: "Store error rate; scheduler scan failures", mitigation: "Replicated, durable store with failover; scheduler pauses dispatch rather than guessing", recovery: "Store recovers; scheduler resumes from durable state; catch up" },
+  ]}
+/>
+
+The theme: **the lease turns crashes into re-runs, leader election turns a scheduler failure into a failover, and idempotency turns the resulting duplicates into no-ops.** A worker dying is just a lapsed lease and a re-claim; the scheduler dying is just an election and a catch-up against the durable schedule; a duplicate is absorbed by idempotency and fencing; and the two scale-driven failures — the thundering herd and poison pills — are met by smearing/sharding and by max-attempts + DLQ. Because the schedule is durable and runs are immutable, recovery is almost always "resume from the persisted state and catch up." The one truly unacceptable outcome — a job silently never running — is designed out by making the schedule durable, the scheduler highly available, and execution at-least-once.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares the pull-based dispatch model against push-based alternatives, SQL-backed schedulers versus dedicated stores, and managed services versus self-hosted solutions.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Persist jobs in a durable store indexed by next fire time; a leader-elected scheduler scans for due jobs and enqueues them; workers lease (visibility-timeout) each due job, execute it, and heartbeat-renew long leases, so a crashed worker's job is re-claimed and run again (at-least-once); make jobs idempotent (via keys + fencing tokens) for exactly-once effect; retry failures with exponential backoff + jitter up to a max then dead-letter; and smear/shard firings to survive the round-time thundering herd."
+  rationale="The hard requirement is reliability on a crashing fleet, so at-least-once via leases is the keystone: a lease gives single-owner execution during normal operation and recovery when the owner dies. Leader election removes the scheduler as a single point of failure and prevents double-enqueue. Exactly-once delivery is impossible, so idempotency makes the unavoidable duplicates harmless — reliability from at-least-once, correctness from idempotent effects. Backoff + max-attempts + DLQ make retries safe rather than a runaway load, and smearing/sharding defuse the synchronized-firing spike that is unique to time-triggered systems."
+  alternatives="At-most-once execution — no duplicates but silently skips jobs when a worker dies, unacceptable for backups/billing; a single non-replicated scheduler — simpler but a single point of failure that loses the schedule; in-memory timer wheels only — low-latency firing but lost on restart and hard to scale, so used atop (not instead of) a durable index; chasing exactly-once delivery — impossible across crashes, so wasted effort versus idempotency; no backoff/DLQ — retries either hammer a downstream or loop forever on poison pills; one global scheduler without sharding — can't absorb the thundering herd."
+  revisitWhen="Jobs need sub-second firing precision (add in-memory timers), some jobs genuinely can't be made idempotent (need stronger dedupe/transactional outbox at the boundary), workflow dependencies between jobs appear (move toward a DAG/workflow engine), or global scale and data-residency force multi-region partitioned schedulers with their harder coordination."
+/>
+
+Three axes capture the real tension:
+
+- **At-least-once vs at-most-once.** At-most-once never duplicates but silently skips a job when a worker dies; at-least-once never skips but may duplicate. For scheduled work a missed run is the worse failure, so at-least-once (with idempotency to neutralize duplicates) is the default.
+- **Durable time-index scan vs in-memory timer wheel.** Scanning a durable `next_fire_time` index is recoverable and scalable but polls and adds a little latency; a timer wheel fires instantly with no polling but is volatile and hard to distribute. Anchor on the durable index; add timers for near-term precision if needed.
+- **Leader-elected single scheduler vs sharded schedulers.** One elected leader is simple and avoids double-enqueue but caps scan throughput; sharding the schedule across many schedulers scales and divides the herd but adds partition-ownership coordination. Start leader-elected; shard when the due-rate or herd demands it.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section provides a 60-second verbal summary that hits the key design decisions an interviewer expects: at-least-once execution via leasing, leader election, idempotent jobs, and thundering herd mitigation.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A job scheduler looks like a cron table, but the hard part is firing reliably at scale on a fleet that crashes. Jobs live in a durable store indexed by their next fire time, and a leader-elected scheduler scans for what's due and enqueues it — leader-elected so there's exactly one active scheduler and no single point of failure, durable so nothing is silently lost across restarts. Workers lease each due job: a lease is a time-bounded exclusive claim, so only one worker runs a job at a time, but if that worker crashes the lease expires and another re-claims it — that's at-least-once execution, with long jobs heartbeating to renew the lease and fencing tokens stopping a zombie worker from corrupting state. Since a worker can always die after doing the work but before recording it, exactly-once delivery is impossible, so I make jobs idempotent — via an idempotency key the downstream dedupes on — for exactly-once effect: reliability from at-least-once, correctness from idempotency. Failures retry with exponential backoff and jitter up to a max, then dead-letter so a poison-pill job doesn't loop forever. And the signature problem: people schedule at round times, so a huge burst fires at midnight — a thundering herd I defuse by smearing fire times with jitter, sharding the schedule, and scaling workers elastically, because by Little's law the fleet is sized by concurrency, not the average rate. The one outcome I never allow is a job silently never running."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *How do you find due jobs efficiently? Why at-least-once over at-most-once? What does a lease give you, and how do you recover from a worker crash? Why is exactly-once impossible, and what do you do instead? How do retries and dead-lettering work? What's the thundering herd and how do you handle it? How is the scheduler not a single point of failure?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section presents targeted knowledge checks and a FAQ covering common interview follow-ups on lease durations, clock skew, cron expression parsing, and deduplication strategies.
+<KnowledgeCheck
+  question="A worker leases a job, starts running it, and crashes before finishing. What happens, and why must the job be idempotent?"
+  options={[
+    "The job is lost, because its worker died",
+    "The lease isn't renewed, so it expires; the job becomes claimable again and another worker re-runs it (at-least-once). Because the first worker may have completed the side effect before crashing, the re-run can repeat it — so the job must be idempotent (or use a dedupe key) for the effect to be exactly-once",
+    "Two workers run it simultaneously from the start",
+    "The scheduler permanently marks the job failed",
+  ]}
+  answer={1}
+  explanation="The lease is what makes a crash recoverable: an unrenewed lease lapses, the job is re-claimed, and it runs again, so it isn't silently skipped. But the crash could have happened after the work was done and before completion was recorded, so the re-run might repeat the side effect. Idempotency (or an idempotency key the downstream dedupes on) makes that repeat harmless, turning at-least-once execution into exactly-once effect."
+/>
+
+<KnowledgeCheck
+  question="Why does a huge spike of jobs fire at midnight, and how is it handled?"
+  options={[
+    "A bug in cron; fixed by upgrading the library",
+    "Humans schedule jobs at round times (midnight, top of the hour), so a large fraction become due at the same instant — a thundering herd. It's handled by smearing/jittering fire times so they spread over a window, sharding the schedule across scheduler/worker shards, scaling workers elastically for the peak, and rate-limiting dispatch",
+    "Clocks are wrong at midnight; fixed by NTP",
+    "It doesn't happen if jobs are idempotent",
+  ]}
+  answer={1}
+  explanation="The spike is behavioral, not a bug: people overwhelmingly choose round times, so schedules synchronize and a giant batch comes due together. Provisioning for that instantaneous peak is wasteful; instead you de-synchronize it — add jitter so 'midnight' jobs spread across the following minutes, partition the schedule so no single component owns the whole burst, scale workers (sized by concurrency) ahead of known peaks, and pace dispatch so downstreams aren't flooded."
+/>
+
+<Faq
+  items={[
+    { question: "What is a distributed job scheduler?", answer: "A service that runs work on a schedule — one-time ('run at 2 a.m.') or recurring (a cron expression) — across a fleet of machines, guaranteeing each job runs at its time reliably, even when workers and the scheduler itself crash. Think cron, but distributed, durable, highly available, and scaled to millions of jobs. Examples include Airflow's scheduler, Quartz, Temporal, and cloud schedulers." },
+    { question: "Why isn't this just cron on a server?", answer: "Cron on one machine is a single point of failure: if the box reboots or dies, scheduled jobs silently never run, and it can't scale or recover a job whose worker crashed mid-execution. A distributed scheduler adds a durable schedule, a leader-elected scheduler with no single point of failure, lease-based at-least-once execution so crashed jobs are re-run, retries, and the ability to absorb millions of jobs and synchronized bursts." },
+    { question: "What does at-least-once execution mean here?", answer: "It means the system guarantees a job runs even if the worker assigned to it dies — by re-claiming and re-running it — at the cost of the job possibly running more than once. It's chosen over at-most-once (which risks silently skipping a job) because for scheduled work like backups and billing, running twice is usually far less harmful than not running at all. Duplication is then neutralized with idempotency." },
+    { question: "What is a lease / visibility timeout?", answer: "A time-bounded exclusive claim a worker takes on a due job. While the lease is held, no other worker can run that job, so there's single-owner execution; if the worker dies, the lease expires and the job becomes claimable by another worker, enabling recovery. Long-running jobs renew the lease with a heartbeat so it doesn't expire mid-execution. The lease is how at-least-once avoids constant double-running." },
+    { question: "Why is the scheduler leader-elected?", answer: "So there's exactly one active scheduler deciding what's due — two would double-enqueue every job — and so the scheduler isn't a single point of failure. A coordination service (etcd, ZooKeeper, or a database lock) elects one leader to scan and dispatch; standbys wait, and if the leader's lease lapses, a standby is promoted. The durable schedule means the new leader can resume and catch up without losing jobs." },
+    { question: "Why can't a scheduler guarantee exactly-once execution?", answer: "Because a worker can always crash after performing a job's side effect but before durably recording that it finished. Recovery then can't tell whether the work happened and must re-run it, so a duplicate is unavoidable — exactly-once delivery is impossible in a system with crashes. The achievable goal is exactly-once effect: make the job idempotent so running it more than once yields the same outcome as once." },
+    { question: "How do you make jobs idempotent?", answer: "Some work is naturally idempotent ('set status to shipped'). For work that isn't ('increment a counter', 'send an email'), attach a stable idempotency/dedupe key: the downstream system records that it already processed that key and ignores repeats. Fencing tokens (monotonic per-lease numbers the store validates) additionally stop a stale 'zombie' worker from applying outdated work. The principle is to make a repeat harmless rather than to prevent it." },
+    { question: "How are failures and retries handled?", answer: "Failed jobs are retried with exponential backoff and jitter — the delay grows each attempt and randomization keeps correlated failures from retrying in lockstep — up to a max number of attempts. Once attempts are exhausted, the job is moved to a dead-letter queue for inspection rather than retried forever, which quarantines poison-pill jobs that can never succeed. Ideally the result distinguishes transient (retry) from permanent (don't) failures." },
+    { question: "What is the thundering herd in a scheduler?", answer: "Because people schedule jobs at round times, a large fraction become due at the exact same instant — for example a massive spike at midnight — which a naive scheduler tries to dispatch all at once, overwhelming the scan, queue, and workers. It's handled by smearing/jittering fire times so they spread over a window, sharding the schedule across components, scaling workers elastically for the peak, and rate-limiting dispatch." },
+    { question: "How does the scheduler find which jobs are due efficiently?", answer: "It keeps jobs in a durable store indexed by next_fire_time and periodically queries 'jobs where next_fire_time <= now', so the scan touches only the due set rather than every job. For recurring jobs it computes the next fire time from the cron expression after each run. The scan interval trades scheduling latency against load, and the scan can be sharded by keyspace to scale." },
+    { question: "What happens if the scheduler was down when a job was due?", answer: "Because the schedule is durable, on recovery the new leader sees the past-due next_fire_time and applies a catch-up policy: either fire the missed run (catch-up/backfill) or skip to the next occurrence, depending on the job's configuration. The key point is that nothing is silently lost — the durable, indexed schedule lets the scheduler detect and handle missed firings rather than forgetting them." },
+    { question: "How many workers do you need?", answer: "Sized by concurrency, not by the average trigger rate. By Little's law, concurrent in-flight jobs ≈ arrival rate × average job duration — so with tens of thousands of jobs starting per second each running tens of seconds, hundreds of thousands run at once. The worker pool is dimensioned for that concurrency and scaled elastically to absorb the thundering-herd peak, then scaled back down afterward." },
+  ]}
+/>
