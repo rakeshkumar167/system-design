@@ -302,7 +302,7 @@ export const problems: readonly Problem[] = [
       "Schedule and run millions of jobs reliably with at-least-once execution and leader leasing.",
     difficulty: "Advanced",
     concepts: ["At-least-once execution", "Leasing", "Time-based triggers", "Idempotency"],
-    status: "coming-soon",
+    status: "available",
     sequence: 30,
   },
   {

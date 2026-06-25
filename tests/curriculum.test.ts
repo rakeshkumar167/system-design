@@ -7,10 +7,10 @@ describe("curriculum", () => {
     expect(new Set(problems.map((p) => p.slug)).size).toBe(33);
   });
 
-  it("exposes URL Shortener, Rate Limiter, Pastebin, Notification Service, Distributed Cache, Video Streaming, Ticket Booking, Payment System, Distributed Logging, Collaborative Doc Editor, and Cloud Drive as available", () => {
+  it("exposes URL Shortener, Rate Limiter, Pastebin, Notification Service, Distributed Cache, Video Streaming, Ticket Booking, Payment System, Distributed Logging, Collaborative Doc Editor, Cloud Drive, and Distributed Job Scheduler as available", () => {
     expect(
       problems.filter((p) => p.status === "available").map((p) => p.slug),
-    ).toEqual(["url-shortener", "rate-limiter", "pastebin", "notification-service", "distributed-cache", "video-streaming", "ticket-booking", "payment-system", "distributed-logging", "collaborative-doc-editor", "cloud-drive"]);
+    ).toEqual(["url-shortener", "rate-limiter", "pastebin", "notification-service", "distributed-cache", "video-streaming", "ticket-booking", "payment-system", "distributed-logging", "collaborative-doc-editor", "cloud-drive", "distributed-job-scheduler"]);
     expect(getProblem("rate-limiter")?.title).toBe("Rate Limiter");
     expect(getProblem("pastebin")?.title).toBe("Pastebin");
     expect(getProblem("notification-service")?.title).toBe("Notification Service");
@@ -21,6 +21,7 @@ describe("curriculum", () => {
     expect(getProblem("distributed-logging")?.title).toBe("Distributed Logging Platform");
     expect(getProblem("collaborative-doc-editor")?.title).toBe("Collaborative Document Editor");
     expect(getProblem("cloud-drive")?.title).toBe("Cloud Drive");
+    expect(getProblem("distributed-job-scheduler")?.title).toBe("Distributed Job Scheduler");
   });
 
   it("numbers problems sequentially from 1 to 33", () => {

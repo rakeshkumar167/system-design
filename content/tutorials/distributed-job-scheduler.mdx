@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section frames the distributed job scheduler as an interview problem, covering scope, ambiguities to clarify, and what a strong answer demonstrates.
+
+<h2 id="requirements">Requirements</h2>
+
+This section defines functional requirements such as one-time and recurring job scheduling, and non-functional requirements such as at-least-once execution, low latency, and high throughput.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section walks through the capacity math for scheduling millions of jobs, quantifying the thundering herd, worker concurrency, and execution history storage.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section introduces the core entities: the durable Job definition with its next fire time, the immutable JobRun execution record, the Lease, and the schedule index.
+
+<h2 id="api-design">API Design</h2>
+
+This section presents the public API contract for creating, reading, and deleting jobs, including idempotency key support and cron expression scheduling.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section describes the high-level components: the scheduler tier, job store, dispatch queue, worker fleet, coordination service, history store, and dead-letter queue.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section traces four key flows: scheduling a job, dispatching and executing it, recovering from a crashed worker via lease expiry, and retrying a failed job with backoff.
+
+<h2 id="scheduling-triggers">Scheduling & Time Triggers</h2>
+
+This section covers how the scheduler evaluates cron expressions and one-time timestamps to compute next fire times, and how it scans the schedule index efficiently.
+
+<h2 id="reliable-execution">Reliable Execution & At-Least-Once</h2>
+
+This section explains how the visibility timeout and lease mechanism ensure a job always runs even if its worker crashes, guaranteeing at-least-once delivery.
+
+<h2 id="leasing-coordination">Leasing & Coordination</h2>
+
+This section details how the coordination service provides distributed leases to workers and how leader election eliminates a single point of failure in the scheduler tier.
+
+<h2 id="idempotency-exactly-once">Idempotency & Exactly-Once Effects</h2>
+
+This section explains why exactly-once delivery is impossible in distributed systems and how idempotent job handlers, deduplication keys, and fencing tokens achieve exactly-once effects.
+
+<h2 id="retries-failures">Retries, Backoff & Failure Handling</h2>
+
+This section covers the retry lifecycle: incrementing attempt counts, exponential backoff with jitter, the maximum retry limit, and promotion to the dead-letter queue.
+
+<h2 id="hot-partitions">Hot Partitions & the Thundering Herd</h2>
+
+This section explains why jobs cluster at round times and how schedule sharding and staggered firing smear the burst load to keep the system within capacity.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section discusses horizontal scaling of each tier, trade-offs in partition count and rebalancing, and how the architecture evolves from a small to a large deployment.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section catalogs failure scenarios including scheduler crashes, worker loss, coordination outages, and job store unavailability, along with mitigations for each.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares the pull-based dispatch model against push-based alternatives, SQL-backed schedulers versus dedicated stores, and managed services versus self-hosted solutions.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section provides a 60-second verbal summary that hits the key design decisions an interviewer expects: at-least-once execution via leasing, leader election, idempotent jobs, and thundering herd mitigation.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section presents targeted knowledge checks and a FAQ covering common interview follow-ups on lease durations, clock skew, cron expression parsing, and deduplication strategies.

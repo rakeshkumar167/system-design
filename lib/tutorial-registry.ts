@@ -325,6 +325,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "distributed-job-scheduler": {
+    slug: "distributed-job-scheduler",
+    title: "Design a Distributed Job Scheduler",
+    description:
+      "An interview-grade walkthrough of a distributed job scheduler: scheduling and time triggers, reliable at-least-once execution, leasing and leader-election coordination, idempotency and exactly-once effects, retries with backoff and dead-letter, the thundering herd of synchronized firings, scaling, and failure modes.",
+    difficulty: "Advanced",
+    readingMinutes: 36,
+    concepts: ["At-least-once execution", "Leasing", "Time-based triggers", "Idempotency"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "scheduling-triggers", label: "Scheduling & Time Triggers", depth: "advanced" },
+      { id: "reliable-execution", label: "Reliable Execution & At-Least-Once", depth: "advanced" },
+      { id: "leasing-coordination", label: "Leasing & Coordination", depth: "advanced" },
+      { id: "idempotency-exactly-once", label: "Idempotency & Exactly-Once Effects", depth: "advanced" },
+      { id: "retries-failures", label: "Retries, Backoff & Failure Handling", depth: "advanced" },
+      { id: "hot-partitions", label: "Hot Partitions & the Thundering Herd", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {
