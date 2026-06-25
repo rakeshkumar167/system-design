@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section frames the maps and navigation design problem as an interviewer would present it.
+
+<h2 id="requirements">Requirements</h2>
+
+This section establishes the functional and non-functional requirements for the system.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the key capacity numbers: route QPS, tile QPS, and graph size in RAM.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core data entities including road segments, nodes, and the adjacency graph.
+
+<h2 id="api-design">API Design</h2>
+
+This section specifies the public API contracts for routing, geocoding, and tile serving.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the high-level system architecture connecting all major components.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section traces the detailed request flows for routing, map matching, traffic updates, and tile fetches.
+
+<h2 id="road-graph">The Road Network as a Graph</h2>
+
+This section models the road network as a directed weighted graph where edge weights represent travel time.
+
+<h2 id="shortest-path">Shortest-Path Routing</h2>
+
+This section explains why Dijkstra and A-star do not scale to continental road graphs at query time.
+
+<h2 id="precomputation">Precomputation & Hierarchies</h2>
+
+This section covers contraction hierarchies and customizable route planning as the solution to per-query cost.
+
+<h2 id="map-matching">Map Matching & Geocoding</h2>
+
+This section explains how noisy GPS traces are snapped to the road graph using a hidden Markov model.
+
+<h2 id="traffic-eta">Live Traffic & ETA</h2>
+
+This section describes how GPS probe data is aggregated into live edge weights and applied to routing.
+
+<h2 id="tile-serving">Map Tile Serving</h2>
+
+This section covers the z/x/y tile pyramid and how CDN caching makes tile serving a distribution problem.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section discusses how the system scales horizontally and evolves over time.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section identifies the key failure modes and the mitigations that keep the system available.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares key design decisions and the alternative approaches considered.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section provides a concise summary of the key points to communicate in an interview setting.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section contains review questions and frequently asked questions about the design.

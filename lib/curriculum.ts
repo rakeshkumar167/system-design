@@ -242,7 +242,7 @@ export const problems: readonly Problem[] = [
       "Compute shortest paths and live ETAs over a continental road graph with traffic.",
     difficulty: "Advanced",
     concepts: ["Graph routing", "Geospatial indexing", "Traffic modeling", "Precomputation"],
-    status: "coming-soon",
+    status: "available",
     sequence: 24,
   },
   {
