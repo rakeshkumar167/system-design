@@ -13,6 +13,7 @@ import DistributedCacheContent from "@/content/tutorials/distributed-cache.mdx";
 import CollaborativeDocEditorContent from "@/content/tutorials/collaborative-doc-editor.mdx";
 import CloudDriveContent from "@/content/tutorials/cloud-drive.mdx";
 import PaymentSystemContent from "@/content/tutorials/payment-system.mdx";
+import DistributedLoggingContent from "@/content/tutorials/distributed-logging.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -26,6 +27,7 @@ const content: Record<string, ComponentType> = {
   "collaborative-doc-editor": CollaborativeDocEditorContent,
   "cloud-drive": CloudDriveContent,
   "payment-system": PaymentSystemContent,
+  "distributed-logging": DistributedLoggingContent,
 };
 
 export function generateStaticParams() {

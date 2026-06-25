@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section frames the distributed logging platform problem as it appears in system design interviews.
+
+<h2 id="requirements">Requirements</h2>
+
+This section covers the functional and non-functional requirements for a distributed logging platform.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section walks through the capacity math for a firehose-scale logging system.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core entities such as LogEvent, LogStream, Index, Segment, and Tier.
+
+<h2 id="api-design">API Design</h2>
+
+This section specifies the ingest and search APIs for the logging platform.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section describes the end-to-end architecture from log producers through the durable buffer to the hot and cold stores.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section traces the four key flows: log ingest, index build, search query, and retention tiering.
+
+<h2 id="ingestion-pipeline">Ingestion Pipeline & Buffering</h2>
+
+This section dives into the durable buffer that decouples write-heavy producers from the slower indexing path.
+
+<h2 id="parsing-structure">Parsing & Structured Logs</h2>
+
+This section explains how raw log bytes are parsed into structured fields for efficient indexing.
+
+<h2 id="indexing">Indexing for Search</h2>
+
+This section covers the inverted index over hot data and the trade-off between indexing everything versus indexing only labels.
+
+<h2 id="storage-tiers">Storage Tiers & Retention</h2>
+
+This section details the hot-to-cold storage tiering strategy and the lifecycle policies that manage retention.
+
+<h2 id="query-search">Query & Search</h2>
+
+This section explains how time-bounded queries scatter over hot shards and fall back to cold storage for older ranges.
+
+<h2 id="cost-cardinality">Cost, Sampling & Cardinality</h2>
+
+This section addresses how sampling, label capping, and noise dropping keep indexing costs manageable at scale.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section covers horizontal scaling of each pipeline stage and how the system evolves over time.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section enumerates the failure modes across the ingest, index, and query paths and the mitigations for each.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares key architectural decisions such as index-all versus index-labels-only and push versus pull ingest.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section provides a concise answer framework for delivering the distributed logging design in a 45-minute interview.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section contains knowledge-check questions and frequently asked interview questions on distributed logging.

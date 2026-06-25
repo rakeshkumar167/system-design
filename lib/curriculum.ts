@@ -202,7 +202,7 @@ export const problems: readonly Problem[] = [
       "Collect, index, and search logs from thousands of services with retention tiers.",
     difficulty: "Advanced",
     concepts: ["Ingestion pipeline", "Indexing", "Search", "Retention"],
-    status: "coming-soon",
+    status: "available",
     sequence: 20,
   },
   {
