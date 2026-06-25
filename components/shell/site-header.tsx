@@ -27,6 +27,12 @@ export function SiteHeader() {
             Curriculum
           </Link>
           <Link
+            href="/topics"
+            className="rounded-lg px-3 py-2 text-sm font-medium text-ink-muted transition-colors hover:bg-surface-2 hover:text-ink"
+          >
+            Topics
+          </Link>
+          <Link
             href="/learn/url-shortener"
             className="hidden rounded-lg px-3 py-2 text-sm font-medium text-ink-muted transition-colors hover:bg-surface-2 hover:text-ink sm:inline-block"
           >

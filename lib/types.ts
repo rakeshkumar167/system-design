@@ -19,6 +19,24 @@ export interface TutorialMeta {
   sections: readonly TutorialSection[];
 }
 
+export interface Topic {
+  /** URL-safe identifier, unique within its category. */
+  slug: string;
+  title: string;
+  /** Short parenthetical of key sub-concepts, e.g. "JWT, OAuth 2.0, OIDC". May be empty. */
+  blurb: string;
+  status: ProblemStatus;
+}
+
+export interface TopicCategory {
+  /** URL-safe identifier. */
+  slug: string;
+  title: string;
+  /** One-sentence description of the category. */
+  summary: string;
+  topics: readonly Topic[];
+}
+
 export interface Problem {
   /** URL-safe identifier, also the tutorial route segment. */
   slug: string;
