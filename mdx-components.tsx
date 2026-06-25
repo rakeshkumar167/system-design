@@ -19,6 +19,7 @@ import { CollaborativeDocEditorCapacity } from "@/components/learning/collaborat
 import { DistributedCacheCapacity } from "@/components/learning/distributed-cache-capacity";
 import { CloudDriveCapacity } from "@/components/learning/cloud-drive-capacity";
 import { PaymentSystemCapacity } from "@/components/learning/payment-system-capacity";
+import { DistributedLoggingCapacity } from "@/components/learning/distributed-logging-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -118,6 +119,7 @@ const teachingComponents = {
   DistributedCacheCapacity,
   CloudDriveCapacity,
   PaymentSystemCapacity,
+  DistributedLoggingCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
