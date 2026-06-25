@@ -294,3 +294,34 @@ describe("payment flow sequences", () => {
     expect(screen.getByRole("img", { name: /refund/i })).toBeInTheDocument();
   });
 });
+
+import { DistributedLoggingArchitecture } from "@/components/diagrams/distributed-logging-architecture";
+import {
+  LogIngestSequence,
+  IndexBuildSequence,
+  SearchQuerySequence,
+  RetentionTierSequence,
+} from "@/components/diagrams/logging-flows";
+
+describe("DistributedLoggingArchitecture", () => {
+  it("exposes the distributed logging architecture to non-visual readers", () => {
+    render(<DistributedLoggingArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /distributed logging architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/firehose/i)).toBeInTheDocument();
+  });
+});
+
+describe("logging flow sequences", () => {
+  it("renders the ingest, index-build, search, and retention sequences", () => {
+    render(<LogIngestSequence />);
+    expect(screen.getByRole("img", { name: /ingest/i })).toBeInTheDocument();
+    render(<IndexBuildSequence />);
+    expect(screen.getByRole("img", { name: /index/i })).toBeInTheDocument();
+    render(<SearchQuerySequence />);
+    expect(screen.getByRole("img", { name: /search/i })).toBeInTheDocument();
+    render(<RetentionTierSequence />);
+    expect(screen.getByRole("img", { name: /retention|tier/i })).toBeInTheDocument();
+  });
+});

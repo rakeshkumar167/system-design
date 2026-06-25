@@ -91,6 +91,13 @@ import {
   ReconciliationSequence,
   RefundSequence,
 } from "@/components/diagrams/payment-flows";
+import { DistributedLoggingArchitecture } from "@/components/diagrams/distributed-logging-architecture";
+import {
+  LogIngestSequence,
+  IndexBuildSequence,
+  SearchQuerySequence,
+  RetentionTierSequence,
+} from "@/components/diagrams/logging-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -171,6 +178,11 @@ const teachingComponents = {
   IdempotentRetrySequence,
   ReconciliationSequence,
   RefundSequence,
+  DistributedLoggingArchitecture,
+  LogIngestSequence,
+  IndexBuildSequence,
+  SearchQuerySequence,
+  RetentionTierSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
