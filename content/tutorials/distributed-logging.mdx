@@ -1,71 +1,364 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section frames the distributed logging platform problem as it appears in system design interviews.
+A distributed logging platform collects the log output of an entire fleet — thousands of services, each emitting a steady stream of lines about what it's doing — and makes that ocean of text searchable when an engineer needs it: to debug an incident at 3 a.m., to audit who did what, to understand a system's behavior across machines. ELK (Elasticsearch/Logstash/Kibana), Splunk, and Loki are the canonical examples. From the outside it looks almost embarrassingly simple — write log lines somewhere central and grep them — and that framing will get you a design that works for one server and falls over at one hundred.
+
+The hard part is the **firehose**. This is the most write-heavy system in the curriculum: millions of events per second flowing *in*, and comparatively rare queries flowing *out*. That inversion changes everything. First, you cannot let the logging system harm the systems it logs — if the indexer is slow or a traffic spike hits, the pipeline must absorb it, never **backpressure** the producing services into stalling. That forces a **durable buffer** (Kafka-style) between ingestion and processing, **at-least-once** delivery, and the willingness to **shed load or sample** under overload rather than push back. Second, **indexing is the cost driver**, not storage: a full inverted index over everything costs *more than the logs themselves*, so the real decision is *what* to index — recent data only, or just labels with the payload left as searchable-but-unindexed text (the ELK-vs-Loki split). Third, logs are write-once, time-ordered, and almost never read again, with queries heavily biased toward the last few hours — so storage must be **tiered** (hot indexed SSD → cold compressed object storage) on a **retention** schedule, because keeping everything hot forever is unaffordable. The reframe to lead with: *it looks like writing log lines to a store and grepping them, but the hard part is surviving a write firehose cheaply — buffer it so producers are never harmed, index only what's worth indexing, and tier storage down by age so multi-year retention stays affordable.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What's the ingest volume — events/sec and bytes/day? This sizes the entire pipeline and is the dominant constraint.
+- How fresh must logs be when searched — seconds, or is a minute fine? That sets how aggressively you can batch and buffer.
+- How long must logs be retained, and for what — debugging (days) or compliance (years)? Retention drives the tiering.
+- Are logs structured (JSON) or free-text? Structure determines how much you can index and aggregate.
+- What's the read pattern — mostly recent debugging, or deep historical analytics? Recency bias justifies hot/cold tiering.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "write firehose, not grep" reframe · **5 min** requirements and the never-backpressure-producers bar · **5 min** capacity (ingest volume, index cost, and tiered storage fall out here) · **5 min** entity model and the ingest/search API · **10 min** the ingestion pipeline + durable buffer and indexing — the centerpiece · **10 min** storage tiers/retention, query, and cost/cardinality control · **5 min** failure modes and wrap-up. Say your assumptions out loud — the interviewer is grading whether you reach for a durable buffer, index-only-hot, and tiering, not whether you can name Elasticsearch.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the ingestion pipeline and buffering, parsing/structure, indexing for search, storage tiers and retention, query/search over huge time ranges, and cost/sampling/cardinality control. **Out of scope:** metrics and time-series aggregation (the separate Metrics & Monitoring problem — metrics are pre-aggregated numbers, not raw text), distributed tracing spans, alerting/anomaly-detection rules, the dashboard/visualization UI, and deep PII redaction beyond a mention — name them so the interviewer sees the boundary, then set them aside. This problem reuses the async-pipeline ideas from the Notification Service but inverts the read/write balance into a pure firehose.
 
 <h2 id="requirements">Requirements</h2>
 
-This section covers the functional and non-functional requirements for a distributed logging platform.
+Separate what the system must *do* from how *well* it must do it. For a logging platform the non-functional list is dominated by the write path, and it carries one rule that overrides the rest: **the logging system must never take down the systems it logs.**
+
+<RequirementsTable
+  functional={[
+    "Collect logs from thousands of services and hosts",
+    "Make recent logs searchable within seconds",
+    "Support structured (JSON) and unstructured (free-text) logs",
+    "Filter and search by time, service, level, and fields",
+    "Retain older logs cheaply for debugging and compliance",
+    "Expire logs automatically past their retention window",
+  ]}
+  nonFunctional={[
+    { goal: "Write throughput", target: "millions of events/sec" },
+    { goal: "Producer safety", target: "never backpressure or block producers" },
+    { goal: "Ingest-to-searchable latency", target: "seconds" },
+    { goal: "Durability of accepted logs", target: "at-least-once (no silent loss)" },
+    { goal: "Cost efficiency", target: "index only hot data; tier the rest" },
+    { goal: "Query pattern", target: "time-bounded, recency-biased" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **producer safety**: the platform ingests a firehose, and a slow downstream or a spike must be absorbed by a buffer, never pushed back onto the applications — a logging outage must degrade to dropped/sampled logs, not stalled services. Second, **at-least-once durability**: once a log is accepted it shouldn't vanish, but exactly-once is needless overhead for logs, so the design embraces at-least-once and de-duplicates on read where it matters. Third, **cost efficiency as a requirement**: at millions of events a second, indexing and storing everything is ruinous, so indexing recent data only and tiering older data to cheap storage is a functional necessity, not an optimization. Note what's *relaxed*: a few seconds of ingest-to-searchable lag is fine, perfect ordering is not required, and slow queries over old/cold data are acceptable because they're rare. The system trades read latency and freshness for the ability to swallow an enormous write stream affordably.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section walks through the capacity math for a firehose-scale logging system.
+Estimates here make the defining point: this is a **write** problem. We size the ingest firehose, the cost of indexing it, and the storage the retention window demands.
+
+<DistributedLoggingCapacity
+  assumptions={{
+    dailyLogEvents: 500000000000,
+    avgEventBytes: 500,
+    peakFactor: 3,
+    compressionRatio: 0.1,
+    indexFraction: 0.3,
+    hotRetentionDays: 7,
+    coldRetentionDays: 365,
+  }}
+/>
+
+The takeaways. First, **the firehose is the system**: ~**5.8 million events/sec** on average and ~**17 million/sec** at peak, **250 TB/day** of raw logs — orders of magnitude more write pressure than any other tutorial here, while reads (engineers running searches) are a relative trickle. So the architecture optimizes for *ingesting* cheaply, and a durable buffer must absorb that 3× peak without ever backpressuring producers. Second, **indexing costs more than the logs**: a full inverted index over just the **7-day hot window** is ~**525 TB** — larger than the compressed logs it covers — which is the single most important economic fact in the design and the reason you index only hot data (or only labels) rather than everything forever. Third, **retention forces tiering**: a year of logs is ~**9.1 PB** even after compressing 10×, so cold data cannot live on indexed SSDs; it lives in cheap, unindexed object storage and is retrieved rarely. The capacity story drives the whole design: buffer the firehose, index a small hot slice, and tier everything else down by age.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core entities such as LogEvent, LogStream, Index, Segment, and Tier.
+The model is small and unusually *immutable*: the core unit is a **LogEvent** that, once written, is never updated — only stored, indexed, aged, and eventually expired. Everything else exists to organize an ever-growing, time-ordered stream of these.
+
+<EntityModel
+  name="LogEvent"
+  description="One immutable log line. Written once, indexed if recent, and aged down through storage tiers until it expires. It carries a timestamp, the source that emitted it, a severity, the message, and optional structured fields for filtering and aggregation."
+  fields={[
+    { name: "timestamp", type: "datetime", notes: "event time; the primary partition dimension" },
+    { name: "service", type: "string", notes: "emitting service / host (a label)" },
+    { name: "level", type: "enum", notes: "DEBUG | INFO | WARN | ERROR" },
+    { name: "message", type: "text", notes: "the log body (free-text or JSON)" },
+    { name: "fields", type: "map", notes: "parsed structured fields (status, latency, …)" },
+    { name: "trace_id", type: "string | null", notes: "correlate logs across services" },
+  ]}
+  keys="A LogEvent is immutable and identified by (timestamp, source, a generated id used for at-least-once de-duplication). Events are grouped into time-partitioned, immutable Segments (a shard of a time window), which are the unit of indexing, tiering, and expiry. An Index is an inverted index built over a hot segment's fields/terms so recent logs are searchable; cold segments are stored without an index. A storage Tier (hot / warm / cold) holds segments of a given age, and a retention lifecycle moves segments down the tiers and finally deletes them. Logs are written once and rarely read, so the model optimizes for cheap append and time-pruned scans, not point mutation."
+/>
+
+Four concepts complete the picture. A **Segment** is an immutable, time-partitioned chunk of log data — the unit you index, move between tiers, and expire as a whole, which is what makes lifecycle management tractable (you age and drop whole segments, never individual lines). An **Index** is the inverted index over a hot segment's terms and fields that makes search fast; building it is the expensive step, so it's done only for recent segments. A **Tier** is a storage class (hot SSD, warm, cold object storage) holding segments by age. And the **retention lifecycle** is the policy that walks segments down the tiers and finally deletes them. The discipline: logs are append-only, time-ordered, immutable derived data — so you never update, you only append, index-if-recent, tier-by-age, and expire.
 
 <h2 id="api-design">API Design</h2>
 
-This section specifies the ingest and search APIs for the logging platform.
+The interface has two very different sides reflecting the read/write inversion: a **high-volume, fire-and-forget ingest** path optimized for throughput, and a **time-bounded search** path optimized for pruning. The defining choice on the write side is that ingest is **batched and asynchronous** — agents ship bundles of events and the platform accepts them into a buffer without making the producer wait for indexing.
+
+<ApiContract
+  method="POST"
+  path="/logs"
+  summary="Ingest a batch of log events. Fire-and-forget from the producer's view: accepted into a durable buffer, indexed later. Never blocks the caller on downstream work."
+  request={`POST /logs
+Content-Encoding: gzip
+
+{
+  "batch": [
+    { "ts": "2026-06-25T09:00:01.123Z", "service": "checkout", "level": "ERROR",
+      "message": "payment timeout", "fields": { "order": "o_91", "ms": 5031 }, "trace_id": "t_7" },
+    { "ts": "2026-06-25T09:00:01.140Z", "service": "checkout", "level": "INFO",
+      "message": "retry scheduled", "fields": { "order": "o_91" } }
+  ]
+}`}
+  response={`HTTP/1.1 202 Accepted
+{ "accepted": 2, "buffered": true }`}
+  statusCodes={[
+    { code: "202", meaning: "Batch accepted into the buffer (not yet indexed)" },
+    { code: "429", meaning: "Overloaded — shed/sample; the agent backs off and spools locally" },
+    { code: "413", meaning: "Batch too large — split and resend" },
+  ]}
+  notes="Logs are shipped in compressed batches by a local agent, not one HTTP call per line. A 202 means durably buffered, not searchable yet — there's a few-second lag while the indexer consumes. Under overload the platform returns 429 and sheds load rather than backpressuring; the agent spools to local disk and retries, so producers never block."
+/>
+
+<ApiContract
+  method="GET"
+  path="/search"
+  summary="Search logs within a bounded time range, filtered by service, level, and fields. Time-bounded so the engine can prune to the relevant segments."
+  request={`GET /search?q=payment+timeout&service=checkout&level=ERROR
+        &from=2026-06-25T08:00Z&to=2026-06-25T10:00Z&limit=100`}
+  response={`HTTP/1.1 200 OK
+{ "matches": 37, "events": [ /* … */ ], "tier": "hot", "took_ms": 180 }`}
+  statusCodes={[
+    { code: "200", meaning: "Returns matching events; recent ranges are fast (hot/indexed)" },
+    { code: "400", meaning: "Missing or too-wide time range — a bound is required" },
+    { code: "206", meaning: "Partial — cold range still being retrieved from the archive" },
+  ]}
+  notes="A time range is mandatory: it lets the engine prune to just the relevant time-partitioned segments instead of scanning everything. Recent ranges hit the indexed hot tier and return in milliseconds; old ranges fall back to slow cold storage. Most queries are recent, so the common case is fast."
+/>
+
+The whole surface is: batch-ingest into a buffer (202, never blocking), and time-bounded search that prunes by time. The write path is built for volume and producer safety; the read path is built to prune aggressively so a query never scans a petabyte. Keeping ingest asynchronous and search time-bounded is what lets one system serve a firehose of writes and occasional deep searches without either starving the other.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section describes the end-to-end architecture from log producers through the durable buffer to the hot and cold stores.
+The architecture is a pipeline: producers ship into a collector, a durable buffer decouples ingestion from the slow indexing path, an indexer makes recent data searchable in a hot tier, an archiver compresses everything into cold storage, and a query service serves time-bounded searches across both.
+
+<DistributedLoggingArchitecture />
+
+- **Services + Agent.** Every service runs a local **agent/forwarder** that batches its log output, compresses it, and ships it — buffering to local disk if the platform is briefly unavailable, so the app never blocks on logging.
+- **Ingest Collector.** Receives batches, validates and enriches them (add service/host/trace metadata), and writes them to the buffer. Returns `202` immediately.
+- **Log Buffer (durable, Kafka-style).** The shock absorber. It durably holds the firehose and **decouples producers from the indexer**, so a spike or a slow/failed indexer never backpressures the apps. Consumers read at their own pace via offsets (at-least-once).
+- **Indexer.** Consumes recent events from the buffer, parses fields, builds the **inverted index**, and writes searchable segments to the hot store — committing its offset only after a durable write.
+- **Hot Store / Cold Store.** Recent data lives **indexed on fast SSD** (the hot tier); older data is **compressed and archived in object storage** (the cold tier), unindexed and cheap. A lifecycle path ages data hot → cold and finally expires it.
+- **Query Service.** Serves time-bounded searches: it prunes to the relevant time segments, scatter-gathers across hot shards for recent ranges, and falls back to slow cold retrieval for old ranges.
+
+The decisive boundary is **a durable buffer between a write firehose and everything downstream**: it makes the system's worst case (indexer down, traffic spike) a buffering problem rather than a producer outage. Around it, the design spends its budget where the money is — index only the hot slice, tier the rest to cheap storage, prune queries by time — because ingesting and retaining the firehose, not serving queries, is the dominant cost. Every section that follows elaborates one piece: how the firehose is absorbed (ingestion), how raw lines become searchable structure (parsing, indexing), how data ages affordably (tiers/retention), how searches stay fast (query), and how cost is kept under control (cardinality/sampling).
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section traces the four key flows: log ingest, index build, search query, and retention tiering.
+Four flows cover the system: ingesting a batch, indexing it, searching, and aging data down the tiers. The first two are the write firehose; the last two are read and lifecycle.
+
+**Log ingest.** A service emits a line; its agent batches and compresses many lines and ships them; the collector validates and enriches the batch and appends it to the durable buffer, acking the agent. The producer is never made to wait for indexing.
+
+<LogIngestSequence />
+
+**Index build.** The indexer consumes a batch from the buffer at its own pace, parses fields, builds the inverted index, writes a searchable segment to the hot store, and only then commits its consumer offset — so a crash re-processes rather than loses (at-least-once).
+
+<IndexBuildSequence />
+
+**Search.** An engineer runs a time-bounded query. The query service prunes to the relevant time segments, scatter-gathers across the hot shards, and merges the results; for an old time range it falls back to retrieving from cold storage. Because queries are recency-biased, the common path is the fast hot one.
+
+<SearchQuerySequence />
+
+**Retention & tiering.** A lifecycle policy notices segments past the hot window, compresses and copies them to cold object storage, drops their index, deletes them from the hot tier, and finally expires segments past the retention limit entirely. Tiering by age is what keeps the storage bill sustainable.
+
+<RetentionTierSequence />
 
 <h2 id="ingestion-pipeline">Ingestion Pipeline & Buffering</h2>
 
-This section dives into the durable buffer that decouples write-heavy producers from the slower indexing path.
+This is the centerpiece, because ingesting the firehose safely is the whole job. The pipeline is **agent → collector → durable buffer → indexer**, and the load-bearing component is the **durable buffer** (Kafka or similar) sitting between the collector and everything downstream. Its purpose is **decoupling**: producers write at the speed of the firehose, while the indexer consumes at the speed it can sustain, and the buffer holds the difference. When traffic spikes 3× or the indexer slows down or restarts, the buffer absorbs the gap — the producing services notice nothing. Without it, a slow indexer would propagate backpressure all the way to the applications, and your logging system would become an outage cause instead of a debugging tool. That is the cardinal sin this design exists to prevent.
+
+The buffer also defines the delivery semantics. Consumers track **offsets** and commit them only after durably writing the indexed segment, which gives **at-least-once**: a crash re-reads from the last committed offset and re-indexes, so nothing is lost but a duplicate can occur (de-duplicated later by event id). Exactly-once is deliberately avoided — it's expensive coordination for data where an occasional duplicate log line is harmless. The other essential behavior is **what happens at the limit**: when the firehose exceeds capacity, the platform **sheds load** — it samples, drops low-value (e.g. DEBUG) logs, or returns `429` so agents spool to local disk and retry — rather than backpressuring producers. Agents buffering locally turns a platform hiccup into delayed logs, not lost work or stalled services. The principle throughout: **absorb, decouple, and degrade gracefully — never push back on the apps.**
+
+<KnowledgeCheck
+  question="Why is a durable buffer (e.g. Kafka) placed between log collectors and the indexer, and what does it guarantee?"
+  options={[
+    "To compress the logs before storage",
+    "To decouple producers from the slow indexing path: producers write at firehose speed while the indexer consumes at its own pace, and the buffer absorbs spikes and indexer slowdowns/restarts so producers are never backpressured. Consumers commit offsets only after a durable write, giving at-least-once delivery; under overload the platform sheds/samples rather than pushing back",
+    "To run the search queries directly from the buffer",
+    "To guarantee exactly-once delivery with no duplicates ever",
+  ]}
+  answer={1}
+  explanation="The buffer is the shock absorber that keeps a logging outage from becoming an application outage. It lets the fast firehose and the slower indexer run independently, holding the difference during spikes or indexer downtime, so producers never stall. Offset-based consumption with commit-after-write yields at-least-once (occasional duplicates, no loss), and at the capacity limit the system sheds load or samples instead of backpressuring producers — exactly-once would be needless cost for logs."
+/>
 
 <h2 id="parsing-structure">Parsing & Structured Logs</h2>
 
-This section explains how raw log bytes are parsed into structured fields for efficient indexing.
+A raw log line is just text, but search and aggregation need **structure** — fields you can filter and group by (service, level, status code, latency, user id). There are two philosophies for getting it. **Structured logging** has applications emit JSON with named fields from the start, so the platform gets clean structure for free; this is the modern best practice. **Unstructured logging** emits free-text lines that the platform must **parse** — extracting fields with patterns/grok rules at ingest — which is brittle (formats drift) and CPU-intensive but necessary for legacy and third-party logs.
+
+The deeper choice is *when* to impose structure. **Schema-on-write** parses and indexes fields at ingest time: searches are fast because the structure is precomputed, but you pay the parsing/indexing cost on every event and must decide the schema up front. **Schema-on-read** stores the raw line and extracts fields only when a query needs them: ingest is cheap and flexible (no schema to maintain), but queries do more work. Most platforms blend the two — index a handful of high-value fields and labels at write time, keep the rest of the payload as raw text parsed on read. Enrichment also happens here: the collector stamps each event with its source service, host, and trace_id, which is what later lets you correlate a single request's logs across many services. Structure is what turns a pile of text into something you can actually query.
 
 <h2 id="indexing">Indexing for Search</h2>
 
-This section covers the inverted index over hot data and the trade-off between indexing everything versus indexing only labels.
+Indexing is what makes search fast, and it is also the dominant cost — so this is the section where the economics are won or lost. The workhorse is the **inverted index** (as in Lucene/Elasticsearch): a map from each term to the list of events containing it, so a search for "payment timeout" is a lookup, not a scan. It makes queries fast and rich, but building and storing it is expensive — recall the capacity model, where a full index over just the hot week was ~525 TB, *larger than the compressed logs themselves*. You cannot afford to index everything forever, so every real design makes two cost-cutting choices.
+
+First, **index only hot data.** Recent logs (days) are indexed on fast storage; older logs are aged into cold storage **without** an index, because they're rarely searched and an index over months of data is unjustifiable. Second, **choose how much to index**, which is the famous **ELK-vs-Loki** trade. The Elasticsearch approach **indexes everything** — every field full-text — giving powerful, fast search at a high ingest and storage cost. The Loki approach **indexes only labels** (service, level, a few dimensions) and leaves the log payload as compressed, *unindexed* text; queries first narrow by label, then brute-force-scan the much smaller matching chunk. Loki ingests far more cheaply and stores far less index, at the price of slower full-text search. The right answer depends on your read patterns: index-everything when rich ad-hoc search is essential and worth the cost; index-labels when volume is huge, budgets are tight, and most queries filter by known dimensions first. Either way, the lesson is that **indexing is a dial you turn against cost**, not a free default.
+
+<KnowledgeCheck
+  question="Why is indexing the central cost decision in a logging platform, and what are the two main ways to control it?"
+  options={[
+    "Indexing is free; the cost is only in storage",
+    "An inverted index makes search fast but is expensive to build and store — often larger than the compressed logs themselves. Control it by (1) indexing only hot/recent data and leaving the cold archive unindexed, and (2) choosing how much to index: index everything for rich fast search at high cost (ELK), or index only labels and brute-force-scan the unindexed payload for cheap ingest and slower search (Loki)",
+    "By compressing the index so it takes no space",
+    "By indexing cold data more heavily than hot data",
+  ]}
+  answer={1}
+  explanation="Search speed comes from the inverted index, but that index can cost more than the logs it covers, so it's the primary lever on the platform's economics. The two standard controls are scope and depth: only index recent data that's actually searched (tier the rest unindexed), and decide how much to index — full-text everything (ELK) for powerful search at high cost, or just labels (Loki) with the payload left as cheap unindexed text that queries scan after narrowing by label. The choice follows the read pattern and budget."
+/>
 
 <h2 id="storage-tiers">Storage Tiers & Retention</h2>
 
-This section details the hot-to-cold storage tiering strategy and the lifecycle policies that manage retention.
+Logs have a usage curve that storage design exploits directly: they're written once, ordered by time, and overwhelmingly read **recently** — an engineer debugging today rarely searches last quarter. So storage is **tiered by age**. The **hot tier** holds the last few days on fast SSD, fully indexed, sized for low-latency search. A **warm tier** may hold somewhat older data on cheaper disk with a lighter index. The **cold tier** holds everything older in **compressed object storage** (S3 and friends), **unindexed**, cheap, and slow to query — which is fine because cold queries are rare. The capacity model showed why this is non-negotiable: a year of logs is petabytes, far too much to keep hot and indexed.
+
+The mechanism is a **retention lifecycle** operating on immutable, time-partitioned **segments**. Because each segment is a whole time window, the lifecycle can act on it atomically: when a segment ages past the hot window, compress it, copy it to cold storage, drop its index, and delete the hot copy; when it ages past the retention limit, delete it entirely. Working at segment granularity (not per-line) is what makes aging and expiry efficient — a single metadata operation moves or drops millions of events. Retention is also where compliance lives: regulatory logs may need years in cold storage while debug logs expire in days, so retention is set **per stream/class**, not globally. Tiering plus retention is the entire reason a platform ingesting 250 TB/day doesn't bankrupt its owner: keep a tiny indexed hot slice, push the rest down to cheap storage, and let it expire on schedule.
+
+<KnowledgeCheck
+  question="Why tier log storage into hot/warm/cold, and how does the retention lifecycle work efficiently?"
+  options={[
+    "To keep three copies of every log for durability",
+    "Because logs are write-once and read with a strong recency bias, so recent data is kept indexed on fast SSD (hot) while older data is compressed into cheap unindexed object storage (cold) and rarely queried; a retention lifecycle ages immutable time-partitioned segments hot→cold and finally expires them, acting on whole segments so a single operation moves or drops millions of events",
+    "To index cold data more than hot data for compliance",
+    "Because object storage is faster than SSD for search",
+  ]}
+  answer={1}
+  explanation="The recency bias in reads means you only need the recent slice fast and indexed; everything older can sit in cheap, slow, unindexed object storage because it's seldom touched. Tiering exploits that to keep costs sane at petabyte scale. The lifecycle operates on immutable, time-partitioned segments, so aging a segment to cold (compress, copy, drop index, delete hot) or expiring it past retention is an atomic, metadata-level action over a whole time window — efficient even at millions of events per segment, and configurable per stream for compliance."
+/>
 
 <h2 id="query-search">Query & Search</h2>
 
-This section explains how time-bounded queries scatter over hot shards and fall back to cold storage for older ranges.
+Queries against a logging platform look nothing like queries against a typical database, and the design leans into that. The first rule is that **every query is time-bounded** — a `from`/`to` range is mandatory — because time is the partition dimension. With a time range, the engine **prunes** to just the segments overlapping that window and ignores everything else; a search for "the last hour" never touches last month's petabytes. This time-pruning is the single most important query optimization, and it's why the API refuses an unbounded search.
+
+Within the pruned window, the engine does a **scatter-gather**: it fans the query out to the shards/nodes holding the relevant hot segments, each searches its inverted index locally, and the coordinator merges the partial results (and applies any aggregation). Because the hot tier is indexed and sharded by time, recent searches return in milliseconds. A query that reaches into **cold** data takes a different, slower path — the archived segments must be fetched from object storage and brute-force scanned (they're unindexed) — so those queries are visibly slower and often run asynchronously. The saving grace is the **recency bias**: the overwhelming majority of searches target recent data and hit the fast hot path, so the system is optimized for the common case while still able to answer the rare deep historical query, just more slowly. Aggregations (counts, rates, top-N over a window) ride the same machinery: prune by time, compute per-shard, merge.
+
+<KnowledgeCheck
+  question="Why is a time range mandatory on every search, and how does a recent query stay fast?"
+  options={[
+    "To limit how many results are returned to the user",
+    "Because logs are partitioned by time, a time range lets the engine prune to just the segments overlapping that window instead of scanning everything; within that window it scatter-gathers across time-sharded, indexed hot segments and merges the results, so recent queries return in milliseconds. Old ranges fall back to slow brute-force scans of unindexed cold storage, but those are rare due to recency bias",
+    "Because the database can only sort by time",
+    "To make cold queries faster than hot ones",
+  ]}
+  answer={1}
+  explanation="Time is the partition key, so a bounded range is what lets the engine skip the vast majority of data — an unbounded search would have to scan petabytes, which is why the API requires a range. Inside the window, recent data is indexed and sharded by time, so a scatter-gather across the relevant hot shards with a merge returns quickly. Cold ranges require fetching and scanning unindexed archives and are therefore slow, but the strong recency bias means almost all real queries hit the fast hot path."
+/>
 
 <h2 id="cost-cardinality">Cost, Sampling & Cardinality</h2>
 
-This section addresses how sampling, label capping, and noise dropping keep indexing costs manageable at scale.
+At millions of events a second, **cost is a first-class design concern**, not an afterthought — and the two things that blow it up are sheer volume and indexing. The blunt, effective lever is **sampling and dropping**: not every log is worth keeping. Drop or heavily sample noisy DEBUG logs and health-check spam; keep all ERRORs. **Head sampling** decides at ingest (keep 1 in N), cheap but blind; **tail sampling** decides after seeing an outcome (keep everything for failed/slow requests, sample the boring successes), smarter but needs buffering. Dynamic sampling adapts the rate to volume. The goal is to spend your ingest and index budget on the logs that carry signal.
+
+The subtler, infamous cost trap is **high cardinality**. A field's cardinality is its number of distinct values, and indexing a high-cardinality field — a user id, a request id, a full URL with unique params — explodes the index, because the inverted index must track a posting list for *every distinct value*. A single unbounded field (say, a unique id per request as an indexed label) can make the index larger than the logs and grind the platform to a halt; this is the classic way teams accidentally melt their logging bill. The defenses: **don't index high-cardinality fields as labels** (keep them in the searchable-but-unindexed payload), cap or bucket cardinality, and reserve labels for low-cardinality dimensions (service, level, region). This connects straight back to the indexing trade — the Loki "index only labels" model works precisely *because* it forbids high-cardinality labels. The throughline of the whole platform: you cannot keep and index everything, so deliberate choices about what to sample, what to index, and which fields to keep low-cardinality are what make logging at scale affordable.
+
+<KnowledgeCheck
+  question="Why does indexing a high-cardinality field (like a unique request id) blow up a logging platform's cost, and how is it controlled?"
+  options={[
+    "High-cardinality fields are slow to compress",
+    "Because an inverted index keeps a posting list per distinct value, indexing a field with near-unique values (request id, user id, full URL) creates an enormous number of entries — the index can grow larger than the logs and overwhelm the system. Control it by not indexing high-cardinality fields as labels (leave them in the unindexed payload), capping/bucketing cardinality, and reserving labels for low-cardinality dimensions like service, level, and region",
+    "Because high-cardinality fields can't be sampled",
+    "By indexing them twice for redundancy",
+  ]}
+  answer={1}
+  explanation="Cardinality is the number of distinct values, and the inverted index pays per distinct value with a posting list, so a near-unique field produces a massive index — the single most common way teams accidentally explode their logging cost. The fix is to keep high-cardinality data out of the indexed label set (searchable via payload scan instead), bound or bucket it, and index only low-cardinality dimensions. This is exactly why label-only indexing models forbid high-cardinality labels, and it pairs with sampling/dropping to keep volume and index size affordable."
+/>
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section covers horizontal scaling of each pipeline stage and how the system evolves over time.
+Don't build the multi-region sampled pipeline on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Local log files + grep / one log DB", "A handful of services; low volume", "Doesn't centralize or scale; search is manual; loss on host failure"],
+    ["Central collector + searchable store", "Many services; need cross-service search", "Operating a store and index; no shock absorber for spikes yet"],
+    ["Durable buffer + index hot + tier cold", "Firehose volume; spikes threaten producers; cost climbs", "A buffer and lifecycle to run; at-least-once dedup; index-only-hot discipline"],
+    ["Multi-region, sampling, federated query", "Global fleet; egress and budget pressure", "Cross-region routing and federated search; sampling policy; harder ops"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the cost and risk you're buying out of. Local files don't scale and lose data with the host. A **central collector plus a searchable store** gives cross-service search but has no shock absorber — a spike or a slow indexer threatens the producers. Adding the **durable buffer, index-only-hot, and tiered storage** is where the platform becomes safe and affordable at firehose scale, and is where most systems should live — it's the recommended center of gravity. Only a global operation needs **multi-region collection with sampling and federated query**, paying for it in cross-region routing, a sampling policy, and the operational weight of querying across regions. Most logging platforms are well-served by "buffered pipeline, hot index, cold tier, with sampling for cost."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section enumerates the failure modes across the ingest, index, and query paths and the mitigations for each.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. A logging platform's failures are dominated by one rule: **degrade the logging, never the producers.** Losing some logs under extreme load is acceptable; stalling the services that emit them is not.
+
+<FailureMatrix
+  rows={[
+    { failure: "Indexer / consumer outage", impact: "Recent logs not yet searchable", detection: "Consumer lag on the buffer rises", mitigation: "Durable buffer retains events; indexer resumes from its committed offset; scale out consumers", recovery: "Indexer catches up from the buffer; lag drains" },
+    { failure: "Buffer full / sustained overload", impact: "Risk of backpressuring producers", detection: "Buffer high-water; ingest 429 rate", mitigation: "Shed load: sample, drop low-value (DEBUG) logs, return 429; agents spool locally — never block producers", recovery: "Spooled logs drain when capacity returns; rates normalize" },
+    { failure: "Agent can't reach the platform", impact: "Logs stuck at the source", detection: "Agent ship failures / local spool growth", mitigation: "Agent buffers to local disk and retries with backoff; bounded spool drops oldest if full", recovery: "Agent flushes the spool on reconnect (at-least-once)" },
+    { failure: "Duplicate delivery (at-least-once)", impact: "Same log indexed twice", detection: "Duplicate event ids", mitigation: "Idempotent write keyed by event id; de-duplicate on read", recovery: "Dedup collapses duplicates; results stay correct" },
+    { failure: "Hot store full", impact: "Can't index new recent data", detection: "Hot capacity / disk alarms", mitigation: "Aggressive lifecycle to cold; add capacity; tighten hot retention/sampling", recovery: "Aging frees hot space; ingest resumes" },
+    { failure: "Cold retrieval slow / unavailable", impact: "Historical queries slow or fail", detection: "Cold query latency / object-store errors", mitigation: "Run cold queries async; cache recent cold fetches; set expectations (206 partial)", recovery: "Object store recovers; query completes" },
+    { failure: "High-cardinality index blowup", impact: "Index bloat; degraded ingest/query", detection: "Index size / cardinality metrics spike", mitigation: "Stop indexing the offending field as a label; cap cardinality; move it to payload", recovery: "Index shrinks after the field is de-indexed; performance recovers" },
+  ]}
+/>
+
+The theme: **the buffer turns most failures into lag, not loss, and load shedding protects the producers.** An indexer outage becomes consumer lag the durable buffer absorbs; an overload becomes shed/sampled logs and locally-spooled agents, never stalled apps; at-least-once duplicates are collapsed by idempotent, event-id-keyed writes; and the two cost-driven failures — hot store full and high-cardinality blowup — are met by aggressive tiering and by de-indexing the offending field. Because logs are immutable and the pipeline is buffered, recovery is almost always "drain the backlog," and the one failure mode treated as unacceptable — backpressuring the producing services — is designed out by always preferring to drop or sample logs over pushing back.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares key architectural decisions such as index-all versus index-labels-only and push versus pull ingest.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Ship logs via local agents into a collector that writes to a durable buffer (Kafka-style), decoupling the write firehose from a downstream indexer so producers are never backpressured; deliver at-least-once and shed/sample under overload; index only recent (hot) data with an inverted index over low-cardinality labels plus searchable payload; tier storage hot SSD → cold compressed object storage on a per-stream retention lifecycle; and serve time-bounded, recency-biased queries via scatter-gather over the hot tier with a slow cold fallback."
+  rationale="The firehose is the dominant force, so a durable buffer is the keystone — it decouples producers from processing and converts spikes and indexer failures into recoverable lag instead of application outages. Indexing is the cost driver, so index only the hot slice and keep labels low-cardinality, choosing index depth (everything vs labels-only) by read pattern and budget. Logs are write-once and recency-biased, so tiering to cheap object storage with retention is what makes petabyte-scale retention affordable. At-least-once with read-side dedup matches the data (a duplicate log is harmless; exactly-once is needless cost), and time-bounded queries prune the search so the common recent case is fast."
+  alternatives="Write logs straight to a database/Elasticsearch with no buffer — simpler but backpressures producers and falls over on spikes, disqualified at scale; index everything full-text (ELK) — powerful search but high ingest/storage cost; index only labels (Loki) — cheap ingest, slower full-text; exactly-once delivery — needless coordination for logs; keep everything hot and indexed — bankrupting at petabyte scale; no sampling — pay to store and index pure noise; pull-based collection — central control but harder to scale to a huge dynamic fleet than push-with-agents."
+  revisitWhen="Read patterns shift toward rich ad-hoc full-text search (lean toward index-everything), budgets tighten or volume explodes (lean toward label-only indexing and heavier sampling), a field's cardinality blows up the index (de-index it), compliance forces long cold retention (tune per-stream lifecycle), or global scale and egress costs force multi-region collection with federated query and sampling."
+/>
+
+Three axes capture the real tension:
+
+- **Index everything vs index labels only.** Full-text indexing (ELK) gives powerful, fast ad-hoc search but a high ingest and storage bill; label-only indexing (Loki) ingests cheaply and stores little index but makes full-text search a slower payload scan. Choose by how much rich search you truly need versus your budget and volume.
+- **At-least-once vs exactly-once.** Logs tolerate the occasional duplicate, so at-least-once with offset-commit-after-write plus read-side dedup is the pragmatic default; exactly-once buys coordination overhead for a guarantee logs don't need.
+- **Keep-and-index everything vs sample and tier.** Retaining and indexing every event is simplest and most complete but unaffordable at firehose scale; sampling noise, indexing only hot data, capping cardinality, and tiering to cold storage trade some completeness and historical query speed for an economically viable system — which at this volume is mandatory, not optional.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section provides a concise answer framework for delivering the distributed logging design in a 45-minute interview.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A logging platform looks like writing log lines somewhere and grepping them, but the hard part is that it's the most write-heavy system you'll design — millions of events a second in, rare queries out — so it's all about surviving a firehose cheaply without harming the services you're logging. The keystone is a durable buffer, Kafka-style, between the collectors and the indexer: producers write at firehose speed, the indexer consumes at its own pace, and the buffer absorbs spikes and indexer outages, so a logging problem never backpressures the apps. Delivery is at-least-once with offset-commit-after-write and read-side dedup, and under overload I shed load or sample rather than push back — agents spool locally. Indexing is the real cost driver: a full inverted index over just the hot week is bigger than the logs themselves, so I index only recent hot data and keep labels low-cardinality; the big choice is index-everything for rich search like Elasticsearch, versus index-only-labels and scan the payload like Loki, picked by read pattern and budget. Storage is tiered: recent data indexed on SSD, everything older compressed into cheap unindexed object storage, aged down by a per-stream retention lifecycle over immutable time-partitioned segments. Queries are always time-bounded so the engine prunes to the right segments and scatter-gathers over the hot tier, with a slow cold fallback — and recency bias means almost all queries are fast. The throughline: you can't keep and index everything, so buffering, index-only-hot, tiering, and sampling are what make it affordable."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why a durable buffer and what does it guarantee? At-least-once vs exactly-once for logs? Why is indexing the cost driver, and ELK vs Loki? How do storage tiers and retention work? Why must queries be time-bounded? What is high cardinality and why does it blow up the index? How do you avoid backpressuring producers under overload?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section contains knowledge-check questions and frequently asked interview questions on distributed logging.
+<KnowledgeCheck
+  question="What is the single most important reason a logging platform puts a durable buffer between ingestion and indexing?"
+  options={[
+    "To save money on storage",
+    "So a slow or failed indexer, or a traffic spike, never backpressures the producing services — the buffer decouples the firehose from processing and absorbs the difference, turning downstream problems into recoverable lag instead of an outage of the apps being logged",
+    "To make searches faster",
+    "To guarantee exactly-once delivery",
+  ]}
+  answer={1}
+  explanation="The cardinal rule is that the logging system must not harm the systems it logs. The durable buffer decouples producers (writing at firehose speed) from the indexer (consuming at its own pace), so spikes and indexer downtime become buffer backlog the platform drains later, never backpressure that stalls applications. It also enables at-least-once via offsets, but its primary job is producer safety."
+/>
+
+<KnowledgeCheck
+  question="Why do logging platforms index only recent data instead of all of it?"
+  options={[
+    "Because old data is less important legally",
+    "Because the inverted index is the dominant cost — often larger than the compressed logs — and queries are strongly recency-biased, so only recent (hot) data is indexed on fast storage while older data is compressed into cheap, unindexed cold object storage that's rarely and slowly searched",
+    "Because old logs can't be compressed",
+    "Because indexing old data is technically impossible",
+  ]}
+  answer={1}
+  explanation="A full index over even a week of logs can exceed the size of the logs themselves, so indexing everything for the full retention window is economically impossible at firehose scale. Since reads overwhelmingly target recent data, the platform indexes only the hot slice and tiers older data into cheap unindexed object storage, accepting slow rare cold queries in exchange for an affordable system."
+/>
+
+<Faq
+  items={[
+    { question: "What is a distributed logging platform?", answer: "A system that collects log output from thousands of services and hosts, makes recent logs searchable within seconds, and retains older logs cheaply for debugging and compliance. Examples are ELK (Elasticsearch/Logstash/Kibana), Splunk, and Loki. Its defining challenge is ingesting an enormous write firehose affordably without harming the services that produce the logs." },
+    { question: "Why is logging mostly a write problem?", answer: "Because the system ingests millions of events per second continuously, while reads — engineers running searches — are comparatively rare. That inversion means the architecture is optimized for cheap, safe, high-volume ingest (buffering, tiering, index-only-hot, sampling) rather than for query latency, which is the opposite emphasis of most read-heavy systems." },
+    { question: "Why put a Kafka-style buffer in the pipeline?", answer: "To decouple producers from the slower indexing path. Producers write at firehose speed while the indexer consumes at its own pace, and the durable buffer holds the difference, absorbing traffic spikes and indexer outages. This keeps a logging problem from ever backpressuring or stalling the applications being logged, and it provides offset-based at-least-once delivery." },
+    { question: "What delivery guarantee do logs use, and why not exactly-once?", answer: "At-least-once: consumers commit their buffer offset only after durably writing the indexed data, so a crash re-processes rather than loses, at the cost of occasional duplicates that are de-duplicated on read by event id. Exactly-once requires expensive coordination that isn't worth it for logs, where a duplicate line is harmless and the priority is not losing data." },
+    { question: "What happens when the platform is overloaded?", answer: "It sheds load rather than backpressuring producers: it samples, drops low-value logs (like DEBUG or health checks), and returns 429 so agents back off and spool to local disk, flushing when capacity returns. The rule is to degrade the logging — drop or delay — never the producing services. Losing some logs under extreme load is acceptable; stalling apps is not." },
+    { question: "Why is indexing the main cost, and what's the ELK-vs-Loki trade?", answer: "An inverted index makes search fast but is expensive to build and store — often larger than the compressed logs. ELK/Elasticsearch indexes everything full-text for powerful, fast search at high cost; Loki indexes only labels (service, level) and leaves the payload as cheap unindexed text that queries scan after narrowing by label, giving much cheaper ingest and storage at the price of slower full-text search. You pick based on read patterns and budget." },
+    { question: "How does storage tiering work?", answer: "Logs are tiered by age: a hot tier keeps recent days indexed on fast SSD for low-latency search, a cold tier keeps older data compressed in cheap object storage without an index, and a retention lifecycle ages immutable time-partitioned segments hot→cold and finally deletes them past their retention window. It works at segment granularity so a single operation moves or expires millions of events." },
+    { question: "Why must every search specify a time range?", answer: "Because logs are partitioned by time, so a bounded range lets the engine prune to just the segments overlapping that window instead of scanning everything. Within the window it scatter-gathers across time-sharded indexed hot segments and merges results, so recent queries are fast. An unbounded query would have to scan petabytes, which is why the API requires a range." },
+    { question: "What is the high-cardinality problem?", answer: "Cardinality is the number of distinct values a field has. An inverted index keeps a posting list per distinct value, so indexing a high-cardinality field — a request id, user id, or full URL — creates a huge number of index entries that can exceed the size of the logs and grind the platform down. The fix is to keep high-cardinality fields out of the indexed labels (search them via payload scan), cap or bucket them, and index only low-cardinality dimensions." },
+    { question: "Structured vs unstructured logs — which is better?", answer: "Structured logs (JSON with named fields) are the modern best practice because the platform gets clean, queryable structure for free, making search and aggregation tractable. Unstructured free-text logs must be parsed with brittle, CPU-intensive patterns at ingest. Most platforms index a few high-value structured fields/labels at write time and keep the rest of the payload as text parsed on read." },
+    { question: "How fresh are logs when you search them?", answer: "Typically a few seconds behind real time. Ingest is asynchronous — agents batch and ship, the collector returns 202 once data is durably buffered, and the indexer consumes and indexes shortly after — so there's a small lag between a log being emitted and being searchable. That few-second freshness is an accepted trade for the throughput and producer safety that batching and buffering provide." },
+    { question: "When is a dedicated logging platform overkill?", answer: "When you have a handful of services and low volume, where centralized log files plus simple search suffice, or when what you actually need is metrics (pre-aggregated numeric time series for dashboards and alerts) rather than searchable raw text — that's the separate Metrics & Monitoring problem. The chunking, buffering, indexing, and tiering machinery here pays off specifically at high-volume, multi-service, search-heavy scale." },
+  ]}
+/>
