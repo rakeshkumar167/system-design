@@ -1,71 +1,383 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section frames the maps and navigation design problem as an interviewer would present it.
+A maps and navigation service answers a deceptively simple question — "how do I drive from here to there, and how long will it take?" — over a road network the size of a continent, for billions of requests a day, while the answer keeps changing because traffic does. Google Maps, Apple Maps, Waze, and every routing API underneath a ride-hailing or delivery app are this system. From the outside it looks like a textbook exercise: model the roads as a graph, run Dijkstra, return the shortest path. That framing gets you a correct router that works beautifully on a city and then falls over the instant the graph is a country, because Dijkstra on a 50-million-node graph settles tens of millions of nodes per query and you have tens of thousands of queries per second.
+
+The hard part is **answering shortest-path queries fast, at scale, over a graph whose edge weights never stop moving**. Three problems fall out of that. First, **the query is too expensive to compute from scratch**: Dijkstra and `A*` are correct but settle a huge fraction of a continental graph per route, which is hopeless at the required latency and QPS — so the dominant idea is **precomputation**, building an offline **hierarchy** of the road network (contraction hierarchies, or customizable route planning) so that an online query is a bidirectional search touching a few hundred nodes and returns in milliseconds. Second, **the graph is alive**: edge weights are *travel times* that change minute to minute with congestion, so the system ingests a firehose of **GPS probes**, fuses them into live weights, and must fold those new weights into the precomputed hierarchy *without* rebuilding it from scratch. Third, the **inputs and the map itself are messy**: raw GPS is noisy and addresses are human, so you need **map matching** and **geocoding** to get onto the graph at all, and the map imagery is served as **tiles** that outnumber routes ~50× but are static and cacheable. The reframe to lead with: *it looks like running Dijkstra on the road graph, but Dijkstra settles half a continent per query and the weights change with traffic — so the real design is precomputing a hierarchy of the network so a route is a millisecond in-memory lookup, continuously re-weighting that graph from GPS probes, and serving the map itself as cacheable tiles from the edge.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- Driving routes only, or multi-modal (transit, walking, cycling)? Each mode is a different graph and cost model; driving with live traffic is the rich core.
+- Does the route need to reflect *live* traffic, or is free-flow / historical good enough? Live traffic is what forces the dynamic-weights machinery.
+- How fresh must traffic be — seconds, or a couple of minutes? This sizes the probe pipeline and how often you re-customize the hierarchy.
+- Do we serve the map tiles too, or just the routing API? Tiles are a separate, CDN-dominated subsystem.
+- What scale and coverage — a metro, a country, the planet? Scale is what kills the naive Dijkstra framing and motivates precomputation.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "Dijkstra doesn't scale, so precompute" reframe · **5 min** requirements (low-latency routing, read-heavy scale, fresh traffic) · **5 min** capacity (the impossible naive-Dijkstra number; tiles dwarf routes) · **5 min** entity model (the road graph) and the API · **10 min** routing: the graph, why Dijkstra/`A*` don't scale, and precomputation/contraction hierarchies — the centerpiece · **8 min** live traffic + ETA and map matching · **5 min** tiles, failure modes, and wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for precomputation, an in-memory graph, and traffic re-weighting, not whether you can recite Dijkstra's pseudocode.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the road network as a directed weighted graph, shortest-path routing and why it doesn't scale, precomputation / contraction hierarchies, map matching and geocoding, live traffic and ETA, and map-tile serving — plus scaling, failure modes, and trade-offs. **Out of scope:** turn-by-turn voice guidance and client UX, multi-modal/transit routing internals (driving is the deep dive), the cartography pipeline that *produces* tiles (we serve them), satellite imagery, and detailed re-routing mechanics — name them so the interviewer sees the boundary, then set them aside. This problem reuses CDN and caching intuition from the Pastebin and Video Streaming tutorials and read-heavy scaling from the URL Shortener, but centers them on a *routable graph* and *geospatial* data.
 
 <h2 id="requirements">Requirements</h2>
 
-This section establishes the functional and non-functional requirements for the system.
+Separate what the system must *do* from how *well* it must do it. For maps the functional list is short and intuitive; the difficulty lives almost entirely in the non-functional column — latency, scale, and freshness — which is what forces every interesting decision later.
+
+<RequirementsTable
+  functional={[
+    "Compute the fastest route between two points",
+    "Return turn-by-turn directions and a live ETA",
+    "Geocode addresses to coordinates (and reverse)",
+    "Serve map tiles to render the map",
+    "Reflect current traffic conditions in routes and ETAs",
+    "Support alternates and basic route options (avoid tolls, etc.)",
+  ]}
+  nonFunctional={[
+    { goal: "Route latency", target: "a route in tens of milliseconds" },
+    { goal: "Read-heavy scale", target: "billions of route + tile requests/day" },
+    { goal: "Traffic freshness", target: "weights updated continuously (≈minutes)" },
+    { goal: "Availability", target: "routing stays up; degrade to free-flow" },
+    { goal: "Global coverage", target: "continental graphs, worldwide" },
+    { goal: "Consistency", target: "eventual for traffic; routes need not be instant-fresh" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **low route latency at high QPS**: a navigation request must return in tens of milliseconds, and there are tens of thousands per second — which is exactly the combination plain Dijkstra cannot meet, and the reason precomputation is the spine of the design. Second, **read-heavy scale with a cacheable layer**: the system is overwhelmingly reads (routes and tiles), and tiles in particular are static and can be pushed to a CDN, so the architecture splits the **compute-bound route engine** from the **cache-bound tile delivery**. Third, **traffic freshness with relaxed consistency**: weights should track reality within minutes, but a route need not reflect a jam that started one second ago — **eventual consistency** of traffic is acceptable, which is what lets the system aggregate probes and re-customize the hierarchy on an interval rather than per-event. Note what's *relaxed*: routing can **degrade gracefully** to free-flow or historical weights if the live traffic feed is unavailable, because a slightly-stale route beats no route. The system trades perfect, instantaneous traffic accuracy for speed, scale, and availability.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the key capacity numbers: route QPS, tile QPS, and graph size in RAM.
+Estimates here make one dramatic point: the *request* rate is ordinary, but the *per-query* cost of the naive algorithm is astronomical — which is the entire justification for precomputation. A second point falls out for free: tiles, not routes, dominate request volume, but they're the easy part.
+
+<MapsNavigationCapacity
+  assumptions={{
+    nodes: 50000000,
+    edges: 120000000,
+    bytesPerEdge: 32,
+    routeRequestsPerDay: 1000000000,
+    tilesPerRoute: 50,
+    dijkstraSettledFraction: 0.5,
+    chNodesPerQuery: 400,
+  }}
+/>
+
+The takeaways. First, **route QPS is modest but naive Dijkstra is impossible**: a billion routes a day is only ~**11,600/sec** on average — a rate any service tier handles — but a plain Dijkstra settles ~half the graph, ~**25 million** nodes, *per query*, which across the fleet is ~**289 billion** node-settles per second. That number is not "expensive," it's physically impossible, and it is the single fact that forces the whole design offline. Second, **precomputation collapses the per-query cost ~62,500×**: a contraction hierarchy answers a query by settling a few hundred nodes instead of 25 million, turning routing into a **millisecond in-memory lookup** — the difference between impossible and trivial. Third, **the routable graph fits in RAM**: ~**3.84 GB** of edges means the entire road network lives in memory on each route-engine replica, so routing is served from RAM by **stateless replicas**, never a database query per request. Fourth, **tiles dwarf routes but are cacheable**: ~**579,000 tiles/sec** (~50× the route rate) sounds frightening until you remember tiles are static, immutable per map version, and served from a **CDN edge** — a delivery problem the edge absorbs, not a compute one. The capacity story: maps is hard because of the *per-query graph search*, which precomputation moves offline, not because of raw request volume.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core data entities including road segments, nodes, and the adjacency graph.
+The model centers on one thing: a **directed, weighted graph** of the road network. The most important idea is that the edge weight is **travel time**, not distance, and that there are *two* weights per edge — a static free-flow time and a live, traffic-adjusted time — because that duality is what the routing and traffic subsystems are built around. Everything else (the hierarchy, tiles, geocoding index) is derived from or supports this graph.
+
+<EntityModel
+  name="RoadSegment"
+  description="A directed edge in the road graph — one stretch of road between two intersections, in one direction. It holds the endpoints, the physical length, and the travel-time weights that routing optimizes over. The graph of RoadSegments (and the Nodes they connect) is the durable source of truth; the routing hierarchy is a derived acceleration structure built from it."
+  fields={[
+    { name: "segment_id", type: "uuid", notes: "stable identity" },
+    { name: "from_node", type: "node_id", notes: "tail intersection (directed)" },
+    { name: "to_node", type: "node_id", notes: "head intersection (directed)" },
+    { name: "length_m", type: "int", notes: "physical length in meters" },
+    { name: "base_time_sec", type: "int", notes: "free-flow traversal time — the static weight" },
+    { name: "road_class", type: "enum", notes: "highway | arterial | residential; drives the hierarchy" },
+    { name: "restrictions", type: "flags", notes: "one-way, turn restrictions, vehicle limits" },
+    { name: "live_time_sec", type: "int", notes: "current traffic-adjusted weight — changes constantly" },
+  ]}
+  keys="A RoadSegment is keyed by segment_id and stored as adjacency (each Node points to its outgoing segments) so the router can expand a node's neighbors in O(degree). A Node (intersection) carries an id and a lat/lng. The weight a router minimizes is time, not distance: base_time_sec is the static free-flow weight, live_time_sec is the dynamic traffic weight updated from GPS probes. The contraction hierarchy is a derived structure: it adds shortcut edges (each summarizing a path through a contracted node) on top of the base graph and is re-customized when live weights change. Map tiles are a separate, read-only rendering of the same geometry, addressed by zoom/x/y; the geocoding index maps addresses and place names to Nodes/coordinates. Source of truth: the directed weighted graph; everything else is derived."
+/>
+
+Four supporting ideas complete the picture. A **Node** is an intersection — an id plus a coordinate — and the graph is stored as **adjacency lists** so expanding a node's neighbors is cheap. **Turn restrictions** ("no left turn here") mean the cost of traversing a segment can depend on where you came from, which is modeled either with turn costs or by expanding intersections into a small per-turn subgraph. The **contraction hierarchy** is the derived acceleration structure: a node ordering plus **shortcut** edges that preserve shortest-path distances, built offline and re-customized when weights change. And the **tiles** and **geocoding index** are read-only projections — the map you see and the address-to-coordinate lookup — that ride alongside the routable graph rather than being part of it. The discipline: one authoritative weighted graph, two weights per edge (static and live), and a derived hierarchy that makes it fast.
 
 <h2 id="api-design">API Design</h2>
 
-This section specifies the public API contracts for routing, geocoding, and tile serving.
+The interface is small and overwhelmingly **read-only**: ask for a route, resolve an address, fetch a tile. Its defining features are that the route query is *traffic-sensitive* (so only weakly cacheable) while tiles are *static and pyramidal* (so aggressively cacheable), and that everything is a GET.
+
+<ApiContract
+  method="GET"
+  path="/route"
+  summary="Compute the fastest route between two coordinates, with a live ETA and turn-by-turn steps."
+  request={`GET /route?origin=37.7749,-122.4194&destination=37.3318,-122.0312&depart=now&mode=drive`}
+  response={`HTTP/1.1 200 OK
+{
+  "distance_m": 61240,
+  "eta_sec": 2735,
+  "polyline": "yzneF~vbjV...",          // encoded route geometry
+  "steps": [
+    { "instruction": "Head south on US-101", "distance_m": 14200, "eta_sec": 640 }
+  ],
+  "traffic": "live",
+  "alternates": [ { "eta_sec": 2880, "polyline": "..." } ]
+}`}
+  statusCodes={[
+    { code: "200", meaning: "Route found; ETA reflects live traffic when available" },
+    { code: "404", meaning: "No route exists (disconnected / unreachable)" },
+    { code: "422", meaning: "Origin or destination could not be snapped to a road" },
+  ]}
+  notes="Coordinates are snapped (map-matched) to the nearest routable segment before the search. The ETA accounts for predicted conditions at the time you'll reach each segment, not just current conditions. The response is only weakly cacheable because it depends on live traffic; alternates come from the same hierarchy query."
+/>
+
+<ApiContract
+  method="GET"
+  path="/geocode"
+  summary="Resolve an address or place name to a coordinate (and reverse-geocode a coordinate to an address)."
+  request={`GET /geocode?q=1600+Amphitheatre+Pkwy,+Mountain+View`}
+  response={`HTTP/1.1 200 OK
+{ "lat": 37.4221, "lng": -122.0841, "match": "1600 Amphitheatre Pkwy, Mountain View, CA", "confidence": 0.98 }`}
+  statusCodes={[
+    { code: "200", meaning: "Resolved to one or more ranked candidates" },
+    { code: "404", meaning: "No match for the query" },
+  ]}
+  notes="Geocoding is a geospatial + text-search problem distinct from routing: it turns human input into a coordinate, which is then snapped to the graph. Reverse geocoding (coordinate to address) uses the same spatial index."
+/>
+
+<ApiContract
+  method="GET"
+  path="/tiles/{z}/{x}/{y}"
+  summary="Fetch one map tile by zoom level and grid coordinates (the map imagery itself)."
+  request={`GET /tiles/14/2620/6334.mvt`}
+  response={`HTTP/1.1 200 OK
+Cache-Control: public, max-age=86400, immutable
+Content-Type: application/vnd.mapbox-vector-tile
+<binary vector tile>`}
+  statusCodes={[
+    { code: "200", meaning: "Tile returned (almost always from the CDN edge)" },
+    { code: "304", meaning: "Not modified — client/edge cache is current" },
+  ]}
+  notes="Tiles form a z/x/y pyramid: each zoom level quadruples the tile count. Tiles are static and immutable per map version, so they carry long cache lifetimes and are served from the CDN; only misses reach the origin tile service."
+/>
+
+The whole surface is: route (traffic-sensitive GET), geocode (text-to-coordinate GET), tile (static, cacheable GET). The split is deliberate — routes are computed on the in-memory hierarchy and only weakly cacheable, while tiles are pre-rendered and pushed to the edge — and it's why the architecture has two very different back ends behind one thin API.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the high-level system architecture connecting all major components.
+The architecture separates the three jobs the API implies: turning messy input into graph positions (map matching / geocoding), searching the precomputed graph fast (the route engine), and keeping that graph's weights current (the traffic pipeline) — with tile serving as a fourth, CDN-dominated path off to the side.
+
+<MapsNavigationArchitecture />
+
+- **Client.** A phone or car that asks for routes and renders the map from tiles.
+- **Routing Gateway.** The API edge: authenticates, rate-limits, and fans a request out to map matching and the route engine.
+- **Map Matcher / Geocoder.** Snaps raw coordinates (and resolves addresses) onto the nearest routable graph nodes — routing can't start until the endpoints are *on* the graph.
+- **Route Engine.** The compute core: it holds the **precomputed contraction hierarchy in memory** and answers a query with a bidirectional "upward" search settling a few hundred nodes. Stateless and horizontally replicated — each replica loads the same graph from the store.
+- **Graph / CH Store.** The durable road network plus the precomputed hierarchy (node ordering + shortcut edges). Built offline; loaded into every route-engine replica's RAM.
+- **Traffic Pipeline.** Ingests the firehose of **GPS probes**, aggregates them per segment, and fuses them with historical/predictive patterns into **live edge weights**.
+- **Live Weights store.** The current traffic-adjusted time for each segment, applied to the hierarchy via cheap **CRP metric customization** so routes reflect current conditions.
+- **Tile Service + CDN.** Pre-rendered map tiles served from the **CDN edge**; only cache misses reach the origin tile service.
+
+The decisive boundary is **precompute the graph offline and serve routing from an in-memory hierarchy, while traffic flows in as a separate stream that only re-weights it**. The Graph/CH store and the offline preprocessing make queries fast; the in-memory route engine makes them low-latency and horizontally scalable; the traffic pipeline keeps the weights honest without touching the graph's structure; and the CDN turns the high-volume tile traffic into someone else's caching problem. Every section that follows elaborates one piece: how the graph is modeled (road graph), why the naive search is too slow (shortest path), how precomputation fixes it (the centerpiece), how messy input gets onto the graph (map matching), how the weights stay current (traffic & ETA), and how the map itself is delivered (tiles).
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section traces the detailed request flows for routing, map matching, traffic updates, and tile fetches.
+Four flows cover the system: answering a route query, map-matching a GPS trace onto the graph, ingesting traffic to re-weight the graph, and fetching a map tile. The first is the latency-critical hot path; the others keep it fed and rendered.
+
+**Answer a route query.** The client asks for a route between two coordinates; the matcher snaps origin and destination to the nearest graph nodes; the route engine runs a bidirectional upward search over the in-memory hierarchy, reading shortcut edges, and returns the path plus ETA. This is the millisecond hot path precomputation exists to enable.
+
+<RouteQuerySequence />
+
+**Map-match a GPS trace.** Raw GPS is noisy — points scatter tens of meters off the road and can appear on the wrong street. The matcher pulls candidate nearby segments and runs a hidden Markov model that balances each point's GPS proximity against whether consecutive snapped points form a *plausible* drive, returning the most likely road path.
+
+<MapMatchSequence />
+
+**Ingest traffic and re-weight.** Devices stream GPS probes; the traffic pipeline aggregates them per segment and fuses them with historical patterns into updated live edge times; the route engine folds those new weights into the hierarchy via cheap **CRP metric customization**, so subsequent routes reflect current traffic without rebuilding the graph's structure.
+
+<TrafficUpdateSequence />
+
+**Fetch a map tile.** The client requests a tile by zoom/x/y; on a CDN edge hit it returns immediately; on a miss the CDN fetches from the origin tile service and caches the result. Because tiles are static and immutable per version, the hit rate is very high and the origin sees only a trickle.
+
+<TileFetchSequence />
 
 <h2 id="road-graph">The Road Network as a Graph</h2>
 
-This section models the road network as a directed weighted graph where edge weights represent travel time.
+The foundation is modeling roads as a **directed, weighted graph**: **nodes** are intersections, **edges** are road segments, and an edge's **weight is travel time**. Three modeling choices matter. The graph must be **directed**, because one-way streets and asymmetric travel times (uphill vs downhill, a ramp on vs off a highway) mean an edge from A to B is not the same as B to A. The weight must be **time, not distance**, because "fastest" is what users want and a longer highway routinely beats a shorter surface street — distance is just one input to time, alongside speed limit and congestion. And **turn restrictions** ("no left turn," "no U-turn") make cost depend on the *pair* of segments you traverse, not a single edge, which is handled either by attaching **turn costs** or by expanding each intersection into a small subgraph of per-movement nodes.
+
+The scale is what makes this interesting. A continental road network is tens of millions of nodes and over a hundred million directed edges, but — as the capacity model showed — that's only a few gigabytes when stored as compact adjacency, so the **entire graph fits in RAM**. That single fact shapes the architecture: routing is a CPU-and-memory problem solved by **stateless route-engine replicas each holding the whole graph**, not a database traversal that fetches neighbors over the network per hop (which would add a network round-trip to every one of the millions of node expansions a search performs). The graph is built offline from raw map data (OpenStreetMap, commercial map providers, municipal feeds), versioned, and shipped to the replicas. Get the model right — directed, time-weighted, turn-aware, in memory — and everything downstream is "search this graph quickly."
+
+<KnowledgeCheck
+  question="Why is an edge weight in a routing graph travel time rather than distance, and why must the graph be directed?"
+  options={[
+    "Distance is impossible to measure, so time is used as a proxy",
+    "Users want the fastest route, not the shortest, and a longer highway often beats a shorter surface street — so the weight is time (which folds in speed limits and congestion); the graph must be directed because one-way streets and asymmetric travel times mean an edge A→B differs from B→A",
+    "Time and distance are interchangeable, so it doesn't matter",
+    "Directed graphs are just faster to search than undirected ones",
+  ]}
+  answer={1}
+  explanation="The objective is the fastest trip, and travel time — not raw distance — captures speed limits, road class, and live congestion, so time is the weight Dijkstra/CH minimize. The graph must be directed because the road network is asymmetric: one-way streets exist, on-ramps and off-ramps aren't reversible, and travel time can differ by direction, so the cost of A→B is independent of B→A. Turn restrictions push this further, making cost depend on the pair of segments traversed."
+/>
 
 <h2 id="shortest-path">Shortest-Path Routing</h2>
 
-This section explains why Dijkstra and A-star do not scale to continental road graphs at query time.
+The classic answer to "shortest path in a weighted graph" is **Dijkstra's algorithm**: settle nodes in increasing order of distance from the source, relaxing each neighbor, until you reach the destination. It's correct and optimal, but it explores **outward in all directions** like a growing circle, so to reach a destination far across the graph it settles a huge fraction of all nodes in between — the capacity model's ~25 million per query. **`A*`** improves on this by adding a **heuristic**: it prioritizes nodes by distance-so-far *plus* an estimate of distance-remaining (the straight-line "as the crow flies" distance to the goal, which never overestimates and so keeps `A*` optimal). The heuristic pulls the search *toward* the goal, settling fewer nodes — but on a continental graph it's still far too many, because the straight-line estimate is weak around real road structure (mountains, water, limited-access highways). **Bidirectional search** — running two searches, one forward from the source and one backward from the target, until they meet — roughly halves the explored area, but "half of impossible" is still impossible.
+
+The key realization is structural, and it's the hinge of the entire design: **queries are numerous and the graph is (mostly) static**. You answer billions of routes against a road network that changes its *structure* rarely (new roads are infrequent) and its *weights* only on a slow cadence (traffic, every few minutes). That asymmetry is an invitation to **move work from query time to preprocessing time**: do expensive computation *once*, offline, over the static graph, to build a structure that makes every subsequent query cheap. Plain Dijkstra and `A*` do zero preprocessing and pay the full cost on every query; the scalable approach inverts that. This is the setup for precomputation — the recognition that the right place to spend CPU is *before* the queries arrive, not during each one.
+
+<KnowledgeCheck
+  question="Dijkstra and A* are both correct shortest-path algorithms. Why don't they scale to continental routing, and what insight points to the fix?"
+  options={[
+    "They return wrong answers on large graphs",
+    "Dijkstra explores outward in all directions and settles a large fraction of the graph per query; A* adds a goal-directed heuristic but still settles far too many nodes at continental scale. The fix comes from noticing queries are many while the graph is mostly static — so expensive work should move offline into preprocessing, making each query cheap",
+    "They use too much memory to fit the graph in RAM",
+    "They only work on undirected graphs, and roads are directed",
+  ]}
+  answer={1}
+  explanation="Both algorithms are optimal but explore too much: Dijkstra grows a circle that settles ~half a continental graph to reach a far destination, and A*'s straight-line heuristic helps only modestly against real road structure. The scalability insight is the query/graph asymmetry — you run enormous numbers of queries against a network whose structure barely changes — which means the expensive computation should happen once, offline, in preprocessing, leaving each online query to settle only a few hundred nodes."
+/>
 
 <h2 id="precomputation">Precomputation & Hierarchies</h2>
 
-This section covers contraction hierarchies and customizable route planning as the solution to per-query cost.
+This is the centerpiece. **Precomputation** trades expensive offline work for cheap online queries, and the dominant technique is **Contraction Hierarchies (CH)**. The idea: order all nodes by "importance" (roughly, how central they are to long routes — a highway interchange is important, a cul-de-sac is not), then **contract** nodes one at a time from least to most important. Contracting a node removes it and, wherever removing it would have destroyed a shortest path through it, adds a **shortcut edge** between its neighbors that preserves the exact distance. The result is the original graph plus a layer of shortcuts that summarize long stretches of road. A **query** then runs a bidirectional search that only ever moves *upward* in the importance order — forward from the source going up, backward from the target going up — and the two meet at a high-importance node. Because the search only climbs, it ignores the vast low-level detail and settles a few hundred nodes instead of millions: the ~**62,500×** reduction from the capacity model. Long-distance routes naturally ride the shortcuts (which correspond to highways), exactly as a human reads a map.
+
+The catch is **traffic**: CH bakes the edge weights into the shortcuts during contraction, so when weights change you'd have to re-contract — too slow to do every few minutes. **Customizable Route Planning (CRP)** solves this by **splitting preprocessing into two phases**. The first, **metric-independent** phase partitions the graph into a hierarchy of cells based only on its *structure* (which is stable) and is done rarely. The second, **metric customization** phase computes the shortcut weights for the *current* metric (the live travel times) and is **cheap and fast** — seconds, not hours — so it can re-run every time traffic updates. This separation is the key to a live system: you pay the heavy structural preprocessing once, then absorb constantly-changing traffic with a quick re-customization, never rebuilding the partition. The trade-off is explicit and worth stating: **heavy offline preprocessing (and ongoing customization) in exchange for millisecond queries**. You spend CPU and memory ahead of time, and a small amount continuously, so that the billions of latency-critical queries are nearly free — which is the only way the numbers close.
+
+<KnowledgeCheck
+  question="How does a contraction hierarchy make routing fast, and why is CRP's two-phase split important for live traffic?"
+  options={[
+    "It caches the most popular routes so repeats are instant",
+    "CH orders nodes by importance and contracts them, adding distance-preserving shortcut edges; a query is then a bidirectional search that only moves 'upward' in the hierarchy, settling a few hundred nodes instead of millions. CRP splits preprocessing into a rare, expensive metric-independent partition (structure) and a cheap, fast metric customization (current weights), so changing traffic is folded in by re-customizing — not rebuilding",
+    "It replaces Dijkstra with a database index on the graph table",
+    "It precomputes the distance between every pair of nodes",
+  ]}
+  answer={1}
+  explanation="Contraction hierarchies move work offline: node ordering plus shortcut edges let an online query climb upward bidirectionally and settle only a few hundred nodes, a ~10^4× reduction. Pure CH bakes weights into shortcuts, so it can't cheaply track traffic. CRP fixes that by separating the expensive structural preprocessing (metric-independent, stable, done rarely) from a fast metric customization that recomputes shortcut weights for the current travel times — so live traffic is absorbed in seconds without rebuilding the partition, while queries stay in the millisecond range. Precomputing all-pairs distances, by contrast, is infeasible at tens of millions of nodes."
+/>
 
 <h2 id="map-matching">Map Matching & Geocoding</h2>
 
-This section explains how noisy GPS traces are snapped to the road graph using a hidden Markov model.
+Routing operates on graph nodes, but the inputs to the system are not graph nodes — they're **noisy GPS coordinates** and **human addresses**. Two preprocessing steps bridge the gap. **Geocoding** turns an address or place name ("1600 Amphitheatre Pkwy") into a coordinate, and **reverse geocoding** does the opposite; both are a **geospatial + text-search** problem solved with a spatial index (a quadtree, geohash, or S2 cells) over places and address ranges, distinct from the routing graph. Once you have a coordinate, you still must get *onto* the graph by **snapping** it to the nearest routable segment — a GPS fix in a parking lot or on the wrong side of a divided highway has to be attached to the right edge before a search can begin.
+
+The hard version of snapping is **map matching**: reconciling a *sequence* of jittery GPS points (a driver's trace) onto the most plausible *path* through the road network. A naive "snap each point to its nearest road" fails badly — consecutive points can snap to different parallel streets, producing a physically impossible zig-zag. The standard solution is a **hidden Markov model**: each GPS point has several candidate nearby segments (emission probabilities favor closer roads), and transitions between consecutive candidates are scored by whether the road network actually connects them with a drive whose length matches the GPS movement (transition probabilities favor plausible motion). The most likely sequence — found with the Viterbi algorithm — is the matched path, robustly threading noisy points onto real roads. Map matching is what makes live traffic possible at all: it's how raw probe traces become "this car traversed *these* segments at *these* times," which is the input the traffic pipeline aggregates.
+
+<KnowledgeCheck
+  question="Why isn't 'snap each GPS point to the nearest road' good enough, and how does map matching solve it?"
+  options={[
+    "Nearest-road snapping is too slow; map matching is just a faster version",
+    "GPS is noisy, so independently snapping each point can attach consecutive points to different parallel streets and produce an impossible zig-zag path. Map matching uses a hidden Markov model: candidate segments per point (closer roads more likely) plus transitions scored by whether the network actually connects consecutive candidates with plausible motion, yielding the most likely connected path",
+    "Addresses must be geocoded first, which nearest-road snapping skips",
+    "Nearest-road snapping ignores one-way streets, which map matching encodes",
+  ]}
+  answer={1}
+  explanation="The problem is GPS noise across a sequence of points: independent nearest-road snapping has no notion of continuity, so it can hop between parallel or crossing streets and yield a path no car could drive. Map matching restores continuity by modeling it as an HMM — emission probabilities make nearer candidate segments more likely, and transition probabilities reward consecutive candidates that the road graph actually connects with a drive consistent with the observed movement — and the Viterbi most-likely sequence is the matched route. That clean trace is exactly what turns raw probes into per-segment traffic."
+/>
 
 <h2 id="traffic-eta">Live Traffic & ETA</h2>
 
-This section describes how GPS probe data is aggregated into live edge weights and applied to routing.
+What makes maps *alive* is that edge weights are travel times that change with congestion, and the system must track them. The raw signal is a **firehose of GPS probes** — anonymized location pings from millions of devices running navigation. The pipeline **map-matches** each trace onto segments (previous section), then **aggregates** per segment over a recent window to estimate current speed, and **fuses** that with **historical and predictive** models: traffic is highly periodic (rush hour every weekday, lighter on holidays), so a segment with few live probes right now can fall back on its typical speed for this time-of-day and day-of-week. The fused result is the **live travel time** per segment, which flows into the **CRP metric customization** so the hierarchy reflects current conditions — and because this is a re-customization, not a rebuild, it completes fast enough to run continuously.
+
+**ETA** is more subtle than summing live weights along the route, because of a time dimension: a long trip might take an hour, so the congestion on a segment you'll reach in 50 minutes is not today's *current* congestion but its *predicted* congestion at your arrival time. A good ETA therefore integrates **predicted** speeds along the route as a function of *when you'll get to each segment*, not a snapshot at departure. This is where historical/predictive models earn their keep: they let the ETA anticipate the rush hour you're driving into or out of. Two consistency notes make the design tractable. First, traffic is **eventually consistent** — a route computed against weights that are a minute or two old is fine, which is what lets the pipeline batch and aggregate rather than react to every probe. Second, the system must **degrade gracefully**: if the live feed stalls, routing falls back to historical or free-flow weights and keeps working, because a slightly-stale ETA is far better than an outage. Reliability of *some* answer beats freshness of a perfect one.
+
+<KnowledgeCheck
+  question="Why does ETA use predicted speeds along the route rather than just summing current live weights, and why is eventual consistency acceptable for traffic?"
+  options={[
+    "Predicted speeds are easier to compute than live weights",
+    "Because a trip takes time: the congestion on a segment you'll reach in 50 minutes is its predicted condition at your arrival, not the current snapshot — so ETA integrates predicted speeds as a function of when you'll reach each segment. Eventual consistency is fine because a route against weights a minute or two old is good enough, which lets the pipeline aggregate probes rather than react per-event; if the feed stalls, routing degrades to historical/free-flow weights",
+    "Live weights are unavailable, so prediction is the only option",
+    "Summing live weights would double-count segments shared by alternates",
+  ]}
+  answer={1}
+  explanation="ETA has a time dimension that a static sum ignores: you traverse a long route over many minutes, so the right weight for a distant segment is its predicted speed at the moment you'll arrive there — which is why historical/time-of-day models matter (you might be driving into or out of rush hour). Eventual consistency is acceptable because routing doesn't need second-fresh traffic; aggregating probes over a short window and re-customizing on an interval is enough, and graceful degradation to historical or free-flow weights keeps the system answering even when the live feed is impaired."
+/>
 
 <h2 id="tile-serving">Map Tile Serving</h2>
 
-This section covers the z/x/y tile pyramid and how CDN caching makes tile serving a distribution problem.
+The map you look at is delivered as **tiles**: the world is rendered into a **pyramid** of square images addressed by **zoom level and x/y grid coordinates**, where each zoom level quadruples the tile count (zoom *z* splits each tile into four at *z+1*). A client viewing an area fetches the handful of tiles covering the viewport at the current zoom, which is why — per the capacity model — tiles outnumber route requests ~50× yet are individually trivial. Tiles come in two flavors: **raster** (pre-rendered PNG/WebP images, simple to serve but heavy and fixed-style) and **vector** (compact geometry the client renders, enabling smooth zoom, rotation, and restyling), with vector tiles now dominant for their flexibility and smaller size.
+
+The decisive property is that tiles are **static and immutable per map version**: the tile for `z/x/y` doesn't change until the underlying map data is republished, so it can carry a long cache lifetime and an immutable marker. That turns tile serving into a **caching and delivery problem, not a compute problem** — the polar opposite of the route engine. Tiles are pre-rendered offline (or rendered once on first request and cached), pushed to a **CDN**, and served from the **edge** close to users; only a cache miss reaches the origin tile service, so origin load is a trickle and the user gets fast, local delivery. This reuses exactly the CDN intuition from the Pastebin and Video Streaming designs: immutable, addressable content fronted by an edge cache. When the map is republished, you bump a **version** in the tile path (or purge), so caches naturally fetch the new generation without serving stale geometry. The contrast is the lesson: one map service contains a compute-bound, in-memory graph search *and* a cache-bound static-delivery pipeline, and they scale by completely different means.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section discusses how the system scales horizontally and evolves over time.
+Don't build the globally-partitioned, CRP-customized system on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single-server Dijkstra", "A city-sized graph, low QPS", "Settles too much of the graph per query; falls over as the map and traffic grow"],
+    ["A* + in-memory graph", "Bigger graph, more queries", "Goal-directed search helps, but still settles far too many nodes at continental scale"],
+    ["Precomputed CH/CRP + replicated in-memory engines", "Continental graph, high QPS, live traffic", "Offline preprocessing + ongoing metric customization; an in-memory graph to load and version"],
+    ["Global multi-region + regional graph partitions + edge tile CDN", "Worldwide coverage and locality", "Cross-region/partition routing for long trips; partition ownership; more operational surface"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the pressure you're buying out of. A single-server Dijkstra is fine for a city and collapses as the graph and query rate grow. Adding `A*` and keeping the graph in memory buys headroom but doesn't change the fundamental "settles too much" problem. The center of gravity for any real system is **precomputed contraction hierarchies / CRP served from replicated in-memory route engines**, with live traffic folded in by metric customization — this is where queries become millisecond-cheap, the fleet scales horizontally (stateless replicas), and traffic stays current. Only planetary scale needs **multi-region deployment with regional graph partitions and edge tile CDNs**, which pays for locality and coverage with genuinely hard cross-partition routing (a trip spanning two regions must stitch partitions together). Most maps systems are well-served by "precomputed hierarchy, in-memory replicas, CRP customization for traffic, CDN for tiles."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section identifies the key failure modes and the mitigations that keep the system available.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. A maps system's guiding rule is **always return a usable answer, even a slightly stale one**: a route on historical weights beats no route, and a cached tile beats a blank map.
+
+<FailureMatrix
+  rows={[
+    { failure: "Route-engine replica dies", impact: "Some routing capacity lost", detection: "Health checks; latency/error spike", mitigation: "Stateless replicas behind a load balancer; replicas reload the graph from the store", recovery: "Replaced replica reloads the in-memory graph and rejoins" },
+    { failure: "Live traffic feed stalls or lags", impact: "Routes/ETAs go stale", detection: "Probe-ingestion lag; customization age metric", mitigation: "Fall back to historical/free-flow weights; keep serving; flag traffic as stale", recovery: "Feed resumes; next customization refreshes live weights" },
+    { failure: "Bad map data / faulty graph build", impact: "Wrong or broken routes", detection: "Canary diffs vs current; route-quality checks", mitigation: "Versioned graph; canary new builds; instant rollback to the prior version", recovery: "Roll back to the last good graph version" },
+    { failure: "Map matching fails on poor GPS", impact: "Can't snap origin/probe to a road", detection: "Low match confidence; 422 rate", mitigation: "Snap to nearest plausible segment; widen candidate search; degrade gracefully", recovery: "Better fix or more points restores a confident match" },
+    { failure: "Tile CDN/origin issue", impact: "Map tiles slow or missing", detection: "Edge hit-rate drop; origin error rate", mitigation: "Serve stale-while-revalidate from edge; multi-CDN; immutable long TTLs", recovery: "Origin recovers; edges refill on demand" },
+    { failure: "Traffic pipeline overload (probe spike)", impact: "Ingestion backs up", detection: "Queue depth; consumer lag", mitigation: "Sample/aggregate probes; shed load; the graph still routes on last-good weights", recovery: "Backlog drains; customization catches up" },
+    { failure: "Region / zone outage", impact: "Local routing + tiles degraded", detection: "Regional health; failover signals", mitigation: "Multi-region replicas; route users to a healthy region", recovery: "Region returns; traffic rebalances" },
+  ]}
+/>
+
+The theme: **everything degrades to a graceful fallback rather than an outage.** A dead route engine is just a stateless replica swap; a stalled traffic feed falls back to historical weights; a bad graph build is rolled back by version; poor GPS degrades to nearest-segment snapping; a tile CDN hiccup serves stale-while-revalidate from the edge; a probe spike sheds load while routing continues on last-good weights; and a region outage fails over to another region. Because the routable graph is precomputed, versioned, and held in memory, recovery is almost always "reload the last good graph and resume," and because traffic is a separate, eventually-consistent stream, losing it briefly costs freshness, not availability. The one outcome the design refuses is a hard failure that returns nothing — there is almost always a slightly-staler answer to fall back to.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares key design decisions and the alternative approaches considered.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Model the roads as a directed, time-weighted graph; precompute a contraction hierarchy (with a CRP-style split of metric-independent preprocessing from cheap metric customization) and serve routing from stateless, in-memory route-engine replicas that answer a bidirectional upward search in milliseconds; keep weights current with a GPS-probe traffic pipeline that map-matches, aggregates, and re-customizes the hierarchy; map-match and geocode inputs onto the graph; and serve the map itself as static z/x/y tiles from a CDN."
+  rationale="Naive Dijkstra/A* settle a large fraction of a continental graph per query and are impossible at the required QPS, so the keystone is precomputation: move the expensive work offline into a hierarchy so each online query is a few-hundred-node lookup. CRP's two-phase split is what makes that compatible with live traffic — heavy structural preprocessing once, cheap customization continuously. The graph fits in RAM, so stateless in-memory replicas give horizontal scale and low latency. Tiles are static and cacheable, so a CDN absorbs the highest-volume traffic. Eventual consistency and graceful degradation keep the system answering through failures."
+  alternatives="Plain Dijkstra/A* per query — correct but impossibly slow at scale; precomputing all-pairs shortest paths — infeasible storage at tens of millions of nodes; pure contraction hierarchies without CRP — fast queries but weights baked into shortcuts, so re-contracting for every traffic update is too slow; raster-only tiles — simpler but heavier and fixed-style versus flexible vector tiles; a single global graph — simpler than regional partitions but doesn't localize or scale to planetary coverage; reacting to every probe synchronously — needless load versus aggregating with eventual consistency."
+  revisitWhen="Multi-modal routing (transit/walking/cycling) is required (different graphs and cost models), sub-minute traffic freshness is demanded (tighter customization cadence and probe pipeline), planetary scale forces regional graph partitions with cross-partition stitching, or routes must satisfy complex constraints (truck restrictions, time-windows) that strain the hierarchy's assumptions."
+/>
+
+Four axes capture the real tension:
+
+- **Naive search vs precomputed hierarchies.** Dijkstra/`A*` need no preprocessing but settle too much per query; CH/CRP pay heavy offline (and ongoing customization) cost to make queries millisecond-cheap. At scale, precomputation always wins — the only question is CH vs CRP.
+- **CH vs CRP.** Pure contraction hierarchies give the fastest static queries but bake weights into shortcuts, so live traffic forces slow re-contraction; CRP separates structure from metric so traffic is absorbed by fast customization. Choose CRP when weights change often.
+- **Freshness vs query cost.** Fresher traffic means more frequent (costlier) customization and a heavier probe pipeline; eventual consistency on the order of minutes is the sweet spot for driving.
+- **Vector vs raster tiles.** Raster is dead-simple to serve but heavy and fixed-style; vector tiles are compact and client-rendered (smooth zoom/rotate/restyle) at the cost of client complexity. Vector is the modern default; both ride a CDN.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section provides a concise summary of the key points to communicate in an interview setting.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"Maps looks like 'run Dijkstra on the road graph,' but Dijkstra settles half a continent per query and the weights change with traffic, so the real design is precomputation. I model the roads as a directed, time-weighted graph — nodes are intersections, edges are road segments weighted by travel time — and because that graph is only a few gigabytes, it lives entirely in RAM on stateless route-engine replicas. The trick that makes queries fast is a contraction hierarchy: offline, I order nodes by importance and add distance-preserving shortcut edges, so an online query is a bidirectional search that only climbs upward and settles a few hundred nodes instead of twenty-five million — a ~10,000× reduction that turns routing into a millisecond lookup. To keep it compatible with live traffic, I use the CRP split: a rare, expensive metric-independent preprocessing of the graph's structure, plus a cheap metric customization that recomputes shortcut weights for the current travel times, so traffic is folded in by re-customizing, not rebuilding. Traffic itself comes from a firehose of GPS probes that I map-match onto segments, aggregate, and fuse with historical patterns; ETA integrates predicted speeds at the time I'll reach each segment, and it's all eventually consistent, degrading to historical weights if the feed stalls. Inputs get onto the graph via geocoding and HMM map matching. And the map imagery is a separate problem entirely — static z/x/y tiles served from a CDN edge — so the system is a compute-bound in-memory graph search next to a cache-bound delivery pipeline. The one thing I never do is return nothing: there's always a slightly-staler route or a cached tile to fall back on."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why does Dijkstra fail at scale, and what does A\* add? How does a contraction hierarchy actually speed up a query? Why CRP over plain CH for a live system? How does traffic get from a phone into an edge weight? Why is ETA more than summing weights? How are tiles different from routes? How do you keep routing up when the traffic feed dies?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section contains review questions and frequently asked questions about the design.
+<KnowledgeCheck
+  question="Why is the entire road graph held in memory on each route-engine replica instead of queried from a database per request?"
+  options={[
+    "Databases can't store graph data",
+    "A continental graph is only a few gigabytes as compact adjacency, so it fits in RAM — and a single query expands millions of nodes, so fetching neighbors over the network per hop would add a round-trip to each expansion and make routing impossibly slow. In-memory replicas are stateless (they load the same versioned graph) so they also scale horizontally",
+    "Memory is cheaper than disk at this scale",
+    "It guarantees strong consistency of traffic weights",
+  ]}
+  answer={1}
+  explanation="Routing is latency-critical and expands enormous numbers of nodes per query, so each neighbor lookup must be a memory access, not a network/database call — a per-hop round-trip would dominate and blow the latency budget. Conveniently, the graph is only a few GB, so it fits in RAM, and because replicas just load the same versioned graph they're stateless and scale out horizontally behind a load balancer. The database/offline store builds and versions the graph; the engines serve it from memory."
+/>
+
+<KnowledgeCheck
+  question="A navigation service's live traffic pipeline goes down. What should happen to routing?"
+  options={[
+    "Routing should return errors until traffic is restored",
+    "Routing should degrade gracefully: fall back to historical or free-flow edge weights and keep answering, flagging traffic as stale, because a slightly-stale route is far better than no route — traffic is an eventually-consistent enhancement, not a hard dependency",
+    "Routing should switch to plain Dijkstra without the hierarchy",
+    "Routing should serve only previously cached routes",
+  ]}
+  answer={1}
+  explanation="Traffic is a freshness enhancement layered onto a graph that already has static free-flow weights and historical patterns, so losing the live feed costs accuracy, not availability. The system keeps routing on historical/free-flow weights (and can flag the ETA as not-live), then refreshes when the feed and the next CRP customization resume. This is the design's guiding rule — always return a usable answer — and it's why the live weights are a separate, eventually-consistent stream rather than a synchronous dependency of every query."
+/>
+
+<Faq
+  items={[
+    { question: "What is a maps and navigation system, at its core?", answer: "A service that computes driving routes and live ETAs over a road network and serves the map to render them. Under the hood it's a directed, time-weighted graph of roads searched for shortest paths, made fast by precomputation, kept current by a live-traffic pipeline, and accompanied by map-tile delivery. Google Maps, Apple Maps, Waze, and the routing APIs behind ride-hailing and delivery apps are all this system." },
+    { question: "Why can't you just run Dijkstra for each route?", answer: "Dijkstra is correct but explores outward in all directions, settling a large fraction of the graph to reach a far destination — roughly 25 million nodes on a 50-million-node continental graph. At tens of thousands of routes per second that's hundreds of billions of node-settles per second across the fleet, which is physically impossible. The fix is precomputation: build a hierarchy offline so each query settles only a few hundred nodes." },
+    { question: "What is a contraction hierarchy?", answer: "A precomputed acceleration structure for shortest-path queries. You order nodes by importance and 'contract' them from least to most important, adding shortcut edges that preserve shortest-path distances wherever a contracted node lay on one. Queries then run a bidirectional search that only moves upward in importance, riding shortcuts (which correspond to highways) and settling a few hundred nodes instead of millions — about a 62,500× reduction in this model." },
+    { question: "Why is travel time the edge weight, not distance?", answer: "Users want the fastest route, and time folds in speed limit, road class, and congestion — so a longer highway often beats a shorter surface street. Distance is just one input to time. The graph is also directed and turn-aware because one-way streets, asymmetric travel times, and turn restrictions mean the cost of going A→B isn't the cost of B→A, and can depend on which segment you arrived from." },
+    { question: "What is CRP and why use it over plain contraction hierarchies?", answer: "Customizable Route Planning splits preprocessing into two phases: a rare, expensive metric-independent partition of the graph's structure (which is stable), and a cheap, fast metric customization that computes edge weights for the current metric (live travel times). Pure contraction hierarchies bake weights into shortcuts, so updating for traffic means re-contracting — too slow. CRP lets you absorb constantly-changing traffic by re-customizing in seconds, without rebuilding the partition." },
+    { question: "How does live traffic get into the system?", answer: "From a firehose of anonymized GPS probes sent by devices running navigation. The pipeline map-matches each trace onto road segments, aggregates probes per segment over a recent window to estimate current speed, and fuses that with historical/predictive patterns (time-of-day, day-of-week). The result is a live travel time per segment, which is folded into the routing hierarchy via CRP metric customization." },
+    { question: "Why is an ETA more than summing the current segment weights?", answer: "Because a trip takes time. The congestion on a segment you'll reach in 50 minutes is its predicted condition at your arrival, not the current snapshot — you might be driving into or out of rush hour. A good ETA integrates predicted speeds along the route as a function of when you'll reach each segment, which is why historical and predictive traffic models matter alongside the live snapshot." },
+    { question: "What is map matching, and why is it needed?", answer: "Map matching snaps a noisy sequence of GPS points onto the most plausible path through the road network. Raw GPS scatters tens of meters and can appear on the wrong street, so naive per-point nearest-road snapping yields impossible zig-zags between parallel roads. A hidden Markov model — candidate segments per point, transitions scored by whether the network actually connects them — finds the most likely connected path. It's both how a route's endpoints get onto the graph and how probe traces become per-segment traffic." },
+    { question: "What is geocoding?", answer: "Turning a human address or place name into a coordinate (and reverse geocoding turns a coordinate into an address). It's a geospatial plus text-search problem solved with a spatial index over places and address ranges — distinct from the routing graph. Geocoding produces the coordinate, which is then snapped onto the graph so routing can begin." },
+    { question: "How are map tiles served, and why are they different from routes?", answer: "Tiles are a pyramid of images addressed by zoom level and x/y grid coordinates; each zoom level quadruples the tile count. They're static and immutable per map version, so they carry long cache lifetimes and are served from a CDN edge — only misses reach the origin tile service. That makes tiles a caching/delivery problem, the opposite of the compute-bound, in-memory route engine. Tiles outnumber routes ~50× but are individually trivial." },
+    { question: "Why does the routable graph fit in memory, and why does that matter?", answer: "Stored as compact adjacency, tens of millions of nodes and ~120 million directed edges are only a few gigabytes. That lets each route-engine replica hold the whole graph in RAM and expand neighbors with memory accesses rather than per-hop network/database round-trips, which is essential because a query expands huge numbers of nodes. It also makes the engines stateless — they just load the same versioned graph — so they scale horizontally." },
+    { question: "What happens when map data or a new graph build is wrong?", answer: "The graph is versioned and new builds are canaried — compared against the current version and checked for route-quality regressions — before full rollout. If a bad build slips through, you roll back to the last good version instantly, since the engines just load whichever version you point them at. This is the same versioned, reversible deploy discipline that keeps a slightly-stale-but-correct graph serving rather than a broken new one." },
+    { question: "How does the system scale globally?", answer: "Routing runs on stateless in-memory replicas behind a load balancer, scaled horizontally; live traffic flows through a separate pipeline and re-customizes the hierarchy; tiles ride a CDN at the edge. For planetary coverage you partition the graph into regions and route within a region directly, stitching partitions together for long cross-region trips — which is the main added complexity, paid for locality and to keep any single graph a manageable size." },
+  ]}
+/>
