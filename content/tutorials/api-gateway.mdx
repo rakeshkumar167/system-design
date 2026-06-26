@@ -1,71 +1,387 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section frames the API Gateway as an interview problem, setting scope and clarifying what interviewers expect.
+An API gateway is the single front door to a fleet of backend services. Instead of letting clients call dozens of microservices directly — each having to implement its own authentication, rate limiting, TLS, logging, and routing — you put one service at the edge that every request passes through, and it handles those **cross-cutting concerns** once, for everyone. Kong, NGINX, Envoy, AWS API Gateway, and Apigee are all this. From the outside it looks like the most ordinary thing in infrastructure — a reverse proxy that forwards a request to the right backend — and that framing produces a design that works fine until you notice it's now on the critical path of *every* request in the system, which makes it simultaneously the most trafficked, most latency-sensitive, and most dangerous-to-fail component you own.
+
+The hard part is being a **transparent, low-latency, always-on control point**. Four problems fall out of "every request goes through it." First, **latency is a tax on the whole platform**: whatever the gateway does — verify a token, check a limit, match a route — it adds to every single call, so its overhead has to be single-digit milliseconds or it slows down everything at once. Second, it must be **stateless and horizontally scalable**: it holds no per-request state, so any instance can serve any request and you scale by adding boxes behind a load balancer — and shared state like rate-limit counters lives in a fast external store, not in the proxy. Third, you must **separate the control plane from the data plane**: the data plane forwards traffic at high throughput while a separate control plane manages the configuration — routes, API keys, rate-limit policies — and **pushes** it out, so an operator can change routing without redeploying the proxies. Fourth, because **if the gateway is down, everything is down**, it must be replicated, degrade gracefully (fail-open or fail-closed per concern), and protect the backends behind it with timeouts, retries, and circuit breakers. The reframe to lead with: *it looks like a reverse proxy, but the hard part is being a stateless, single-digit-millisecond control point on the path of every request — centralizing auth, routing, and rate limiting without becoming a latency tax or a single point of failure, which forces a stateless data plane that scales horizontally, a separate control plane that pushes config without redeploys, cached auth and limit state, and graceful degradation.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What does the gateway own versus the backends — auth, rate limiting, TLS, routing, transformation, all of it? This sets the filter chain.
+- How many services and how much total traffic does it front? The gateway is sized for *aggregate* load, not one service.
+- North-south (client-to-service) only, or also east-west (service-to-service)? East-west is usually a **service mesh**, a different shape.
+- What's the latency budget the gateway is allowed to add? This decides how much you cache and how much work you do inline.
+- How do auth and tokens work — JWTs the gateway can verify locally, or opaque tokens needing introspection? This drives the auth design.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "reverse proxy, but a control point on every request" reframe · **5 min** requirements (low added latency, stateless scale, no SPOF) · **5 min** capacity (the gateway carries aggregate traffic; latency overhead is the budget) · **5 min** entity model (Route, Consumer) and the admin vs proxied API · **10 min** the filter chain + routing + edge auth · **8 min** rate limiting and the control-plane/data-plane split — the centerpiece · **5 min** resilience, observability, failure modes, wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for statelessness, a control/data-plane split, and cached edge auth, not whether you can name a proxy product.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the request lifecycle / filter chain, routing and service discovery, authentication and authorization at the edge, rate limiting and quotas, the control-plane/data-plane split, and resilience + observability — plus scaling, failure modes, and trade-offs. **Out of scope:** the backend services' own business logic (the gateway routes to them; what they do is theirs), building a full identity provider or OAuth authorization server (we *verify* tokens, we don't mint them), the service-mesh sidecar model beyond a comparison, GraphQL federation / response aggregation beyond a mention, and the developer portal — name them so the interviewer sees the boundary, then set them aside. This problem reuses the rate-limiting algorithms from the **Rate Limiter** tutorial and read-path caching intuition from earlier ones, but centers them on a *shared edge control point* rather than a single application.
 
 <h2 id="requirements">Requirements</h2>
 
-This section covers functional and non-functional requirements for an API Gateway, including routing, authentication, rate limiting, and observability.
+Separate what the system must *do* from how *well* it must do it. The functional list for a gateway is a checklist of cross-cutting concerns; the difficulty, as always, lives in the non-functional column — and here it's dominated by latency and availability, because the gateway is in the path of everything.
+
+<RequirementsTable
+  functional={[
+    "Route each request to the correct upstream service",
+    "Authenticate and authorize requests at the edge",
+    "Rate-limit and enforce per-consumer quotas",
+    "Terminate TLS and transform requests/responses",
+    "Emit logs, metrics, and traces for every request",
+    "Manage routes and policies via an admin API",
+  ]}
+  nonFunctional={[
+    { goal: "Added latency", target: "single-digit ms over the backend" },
+    { goal: "Throughput", target: "fronts all platform traffic" },
+    { goal: "Scalability", target: "stateless; scale horizontally" },
+    { goal: "Availability", target: "no single point of failure" },
+    { goal: "Configurability", target: "change routes/policy without redeploy" },
+    { goal: "Security", target: "secure by default; fail safe" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **low added latency**: the gateway runs on every request, so its own work must be a small fraction of total latency — which is why auth and rate-limit state are cached locally and the proxy path is kept lean. Second, **statelessness for horizontal scale and availability**: the gateway keeps no per-request state, so any instance serves any request, the fleet scales by adding replicas, and losing one instance loses nothing — the shared state it does need (rate counters, a token cache) lives in a fast external store. Third, **configurability without redeploys**: routes, keys, and policies change constantly, and you cannot redeploy the whole proxy fleet every time a team adds an endpoint — so a **control plane** owns the config and pushes it to the data plane live. Note what's *relaxed*: the gateway doesn't need its own durable storage on the request path (it's a pass-through), and it can tolerate *eventually* consistent config propagation (a new route appearing a second or two later across the fleet is fine). The system trades durable per-request state for speed, and strict config consistency for live updatability.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the capacity model for an API Gateway handling aggregate traffic across all fronted services.
+Estimates here make one point that reframes the whole problem: the gateway's difficulty isn't computation, it's that it does a little work for *everyone* on the critical path — so the metrics that matter are aggregate throughput and, above all, the **latency overhead** it adds.
+
+<ApiGatewayCapacity
+  assumptions={{
+    requestsPerDay: 10000000000,
+    peakFactor: 3,
+    gatewayOverheadMs: 4,
+    avgBackendLatencyMs: 80,
+    instanceCapacityRps: 5000,
+    authCacheHitRate: 0.95,
+    authStoreLatencyMs: 10,
+  }}
+/>
+
+The takeaways. First, **the gateway sees the sum of all traffic**: ~**116,000 requests/sec** on average and ~**347,000/sec** at peak, because every client call to every fronted service passes through it — so it's sized for *aggregate* platform load, not any one service. Second, **statelessness turns that into a simple scaling story**: at ~5,000 RPS per instance, peak needs only ~**70 gateway instances** behind a load balancer, and because no instance holds request state you add or remove boxes freely. Third — the defining constraint — **latency overhead must stay tiny**: the gateway's ~4 ms of work is ~**4.8%** of a typical 84 ms request, which is acceptable, but it's a tax paid on *every* call, so anything heavier (a synchronous auth lookup per request, an un-cached policy fetch) would slow the entire platform at once. Fourth, **caching is what keeps edge work cheap**: a 95%-hit local token cache turns a 10 ms introspection into ~**0.5 ms** average and drops load on the central auth store from peak RPS to ~**17,000/sec** — a ~20× offload. The capacity story: a gateway is hard not because any single operation is expensive, but because it must do cross-cutting work for everyone at almost no added latency — which is why it caches aggressively and stays stateless.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section describes the core entities in an API Gateway: routes, consumers, API keys, rate-limit counters, and service-registry entries.
+The model centers on the **Route** — the rule that maps an incoming request to an upstream service plus the policies to apply. The most important idea is that this configuration is owned by the **control plane** (the durable source of truth) and held as a **cached, in-memory copy** by every data-plane instance, compiled into a structure that matches a request in microseconds. Everything else — consumers, counters, registry entries — supports applying a Route to a request.
+
+<EntityModel
+  name="Route"
+  description="A rule mapping incoming requests to an upstream service and the policies to enforce. It holds the match criteria, the target upstream, the ordered filters (auth, rate-limit, transform), and resilience settings. Routes are owned by the control plane (the source of truth) and pushed to every data-plane instance, which holds them in memory compiled into a fast match structure."
+  fields={[
+    { name: "route_id", type: "uuid", notes: "stable identity" },
+    { name: "match", type: "host+path+method", notes: "e.g. GET api.x.com/orders/*" },
+    { name: "upstream", type: "service_ref", notes: "target service (resolved via discovery)" },
+    { name: "filters", type: "ordered list", notes: "authN, authZ, rate-limit, transform" },
+    { name: "rate_limit", type: "policy", notes: "requests per window, per consumer/plan" },
+    { name: "auth_policy", type: "enum", notes: "none | api-key | jwt | oauth" },
+    { name: "timeout_ms", type: "int", notes: "upstream timeout" },
+    { name: "retries", type: "int", notes: "budgeted retry count" },
+  ]}
+  keys="A Route is keyed by route_id and matched at request time by (host, path, method). The data plane compiles all routes into a radix/trie on the path so matching is microseconds, not a linear scan. A Consumer (API key / client) carries an identity, a credential, and a plan with quotas — it's who a request is rate-limited and authorized against. The rate-limit counter is transient state (current usage per consumer per window) kept in a fast shared store so all gateway instances agree. A service-registry entry lists the healthy upstream instances for a service and their health, used by routing to pick a target. Source of truth: the control-plane config (Routes, Consumers, policies); the data plane holds a cached in-memory copy and never owns durable request state."
+/>
+
+Three supporting entities complete the picture. A **Consumer** (an API key, client app, or authenticated principal) is the identity a request is attributed to — it carries the credential the gateway authenticates and the **plan/quota** it's rate-limited and authorized against. The **rate-limit counter** is the only mutable per-request state, and it deliberately lives *outside* the stateless gateway in a fast shared store (so every instance sees the same count). And the **service-registry entry** is how routing finds a live target: a list of healthy upstream instances for each service, kept current by health checks. The discipline: the control plane owns durable config, the data plane holds a cached copy and is otherwise stateless, and the one piece of shared mutable state (counters) is externalized.
 
 <h2 id="api-design">API Design</h2>
 
-This section covers the data-plane proxy API and the control-plane admin API for managing routes and consumers.
+A gateway has *two* APIs, and distinguishing them is the point. The **data-plane API** is whatever the backends expose — the gateway proxies arbitrary client calls, applying policy — so its "contract" is really the behavior it adds (auth, limits) around a forwarded request. The **control-plane (admin) API** is the gateway's *own* contract: how operators declare routes, consumers, and policies.
+
+<ApiContract
+  method="GET"
+  path="/orders/{id}"
+  summary="A proxied data-plane request: the gateway authenticates, rate-limits, routes, and forwards to the orders service."
+  request={`GET /orders/42
+Host: api.example.com
+Authorization: Bearer eyJhbGciOiJSUzI1NiIs...`}
+  response={`HTTP/1.1 200 OK              // forwarded from the orders service
+X-RateLimit-Remaining: 4997
+X-Request-Id: 7f3c...            // correlation id injected at the edge
+{ "order_id": "42", "status": "shipped" }`}
+  statusCodes={[
+    { code: "200", meaning: "Authenticated, within limit, routed and forwarded to the upstream" },
+    { code: "401", meaning: "Missing/invalid credentials — rejected at the edge" },
+    { code: "429", meaning: "Rate limit / quota exceeded — rejected before the backend" },
+    { code: "503", meaning: "Upstream unhealthy / circuit open — failed fast" },
+  ]}
+  notes="The client calls the backend's API; the gateway is transparent on success, injecting headers (rate-limit info, a correlation id) and enforcing policy. 401/429/503 are produced by the gateway itself without ever touching the backend."
+/>
+
+<ApiContract
+  method="PUT"
+  path="/admin/routes/{id}"
+  summary="Control-plane: declare or update a route (match → upstream + policies)."
+  request={`PUT /admin/routes/orders-v1
+{
+  "match": { "host": "api.example.com", "path": "/orders/*", "methods": ["GET","POST"] },
+  "upstream": "orders-service",
+  "auth_policy": "jwt",
+  "rate_limit": { "limit": 5000, "window": "1m", "per": "consumer" },
+  "timeout_ms": 800,
+  "retries": 1
+}`}
+  response={`HTTP/1.1 200 OK
+{ "route_id": "orders-v1", "version": 47, "status": "validated; rollout pending" }`}
+  statusCodes={[
+    { code: "200", meaning: "Route validated and queued for push to the data plane" },
+    { code: "400", meaning: "Invalid match or policy" },
+    { code: "409", meaning: "Conflicting match with an existing route" },
+  ]}
+  notes="The control plane validates and versions the change, then pushes it to the data-plane instances, which hot-reload it. The route does not take effect by redeploying proxies — it propagates as config."
+/>
+
+<ApiContract
+  method="POST"
+  path="/admin/consumers"
+  summary="Control-plane: register a consumer (client) with a credential and a rate-limit plan."
+  request={`POST /admin/consumers
+{ "name": "mobile-app", "credential": { "type": "jwt", "issuer": "https://idp.example.com" }, "plan": "gold" }`}
+  response={`HTTP/1.1 201 Created
+{ "consumer_id": "csr_91", "plan": "gold", "quota": "100000/day" }`}
+  statusCodes={[
+    { code: "201", meaning: "Consumer registered; quota and credential bound" },
+    { code: "409", meaning: "Consumer already exists" },
+  ]}
+  notes="Consumers tie an identity to a plan/quota the gateway enforces. Credentials are verified at the edge (JWT signature, API key, or token introspection); the plan drives rate limiting and authorization."
+/>
+
+The whole surface is: a transparent proxied request (with the gateway adding auth, limits, and headers), and an admin API to declare routes and consumers. The split is the lesson — clients use the backends' APIs through the gateway, while operators configure the gateway through its own control-plane API, and that configuration propagates to the data plane as versioned, pushed config rather than a deploy.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the high-level architecture of an API Gateway, showing the data-plane fleet, control plane, auth service, rate-limit store, service registry, and telemetry sink.
+The architecture separates the fast path (the data plane forwarding requests through a filter chain) from the slow path (the control plane managing and pushing config), with shared supporting services for auth, rate limiting, discovery, and telemetry.
+
+<ApiGatewayArchitecture />
+
+- **Client.** Every client of every fronted service; all traffic enters here.
+- **Gateway (data plane).** The stateless proxy fleet. Each instance runs the **filter chain** — authN, authZ, rate-limit, transform, route — and forwards to an upstream, holding the route/policy config in memory. Scaled horizontally behind a load balancer.
+- **Auth Service.** Verifies credentials at the edge: validates JWT signatures (locally) or introspects opaque tokens (a cached lookup). Offloads auth from every backend.
+- **Rate Limiter.** A fast shared counter store so all gateway instances agree on per-consumer usage; the gateway pre-checks locally to avoid a round-trip per request.
+- **Backends.** The upstream microservices the gateway routes to — the gateway is transparent to them on success.
+- **Service Registry.** Discovery: the set of healthy upstream instances per service, kept current by health checks, used by routing and load balancing.
+- **Control Plane + Config Store.** Owns routes, keys, and policies; validates and versions changes; **pushes** config to the data plane so it updates without a redeploy.
+- **Telemetry.** The sink for structured logs, RED metrics, and distributed traces emitted for every request.
+
+The decisive boundary is **a stateless data plane that forwards traffic fast, and a separate control plane that configures it live**. The data plane stays simple and quick because it just runs a filter chain over an in-memory config; the control plane carries the complexity of managing and safely rolling out that config; auth and rate-limit state are cached/externalized so the per-request overhead stays in single-digit milliseconds; and the registry, telemetry, and resilience logic let the gateway centralize cross-cutting concerns for every service at once. Every section that follows elaborates one piece: how a request flows through the chain (request lifecycle), how it's matched to a target (routing), how identity is verified (auth), how traffic is throttled (rate limiting), how config is distributed (control/data plane), and how backends are protected and observed (resilience & observability).
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section walks through the key request flows: the happy-path proxy, an auth rejection at the edge, a config push from the control plane, and a circuit-breaker trip.
+Four flows cover the system: proxying a request on the happy path, rejecting a bad one at the edge, pushing new config to the data plane, and tripping a circuit breaker when an upstream fails. The first two are the request path; the last two are how the gateway is managed and how it protects what's behind it.
+
+**Proxy a request.** The client sends a request with a token; the gateway runs the filter chain — verify the token (from cache), check the rate limit, match the route — then forwards to the upstream and relays the response, adding only a few milliseconds and a correlation id. This is the hot path the whole design optimizes.
+
+<ProxyRequestSequence />
+
+**Reject at the edge.** A request arrives with a missing or invalid token (or over its rate limit). The gateway's filter chain **short-circuits**: it returns 401 or 429 immediately, without ever touching a backend. Rejecting early is how the gateway shields upstreams from unauthenticated and abusive traffic.
+
+<AuthRejectSequence />
+
+**Push config.** An operator changes a route or policy through the admin API; the control plane validates it, persists a new **version**, and pushes it to the data-plane instances, which **hot-reload** it without dropping connections. Routing and policy change live — no proxy redeploy.
+
+<ConfigPushSequence />
+
+**Trip the circuit breaker.** Requests to an upstream start timing out or erroring; the gateway's failure counter crosses a threshold and the **circuit opens**, so subsequent requests **fail fast** (or return a fallback) instead of piling onto the sick backend; after a cooldown the gateway sends a trial request to see if it can **close** the circuit again. This protects both the failing service and the gateway's own resources.
+
+<CircuitBreakSequence />
 
 <h2 id="request-lifecycle">Request Lifecycle & the Filter Chain</h2>
 
-This section details the ordered filter chain each request traverses: authN, authZ, rate-limit check, request transformation, route matching, upstream forwarding, and response relay.
+The heart of the data plane is the **filter chain** (a chain-of-responsibility / middleware pipeline): a request flows through an ordered sequence of filters, each doing one cross-cutting job, and any one of them can short-circuit the request. A typical order is **TLS termination → authentication → authorization → rate limiting → request transformation → route matching → forward to upstream → response transformation**, with observability hooks wrapping the whole thing. Filters split into **pre-filters** (run before the upstream call: auth, limits, routing) and **post-filters** (run on the response: header rewriting, metrics, caching). The design elegance is that each concern is an independent, composable filter — you add a new policy by inserting a filter, not by rewriting the proxy — and a route declares *which* filters apply.
+
+**Ordering matters**, and getting it wrong is a classic bug. Authentication must come before authorization (you can't check permissions for an unknown caller) and before rate limiting (you rate-limit *a consumer*, so you must know who they are — and you don't want to spend a limit-check on an unauthenticated request). Cheap, decisive rejections should come early so the gateway does the *least* work for traffic it's going to refuse: a request that fails auth should be rejected before any routing, transformation, or backend call happens. This **short-circuiting** is what makes the gateway an effective shield — most abusive or malformed traffic is bounced at the first failing filter, never reaching an upstream. The principle: a request is a pipeline of small, ordered, independently-testable filters; put the cheap rejections first, know the caller before you authorize or limit them, and only touch the backend once the request has earned it.
+
+<KnowledgeCheck
+  question="Why does an API gateway process requests as an ordered filter chain, and why does the order matter?"
+  options={[
+    "To make the code look modular; the order is arbitrary",
+    "Each cross-cutting concern (authN, authZ, rate-limit, transform, route) is an independent filter in a chain-of-responsibility, so policies compose by adding filters rather than rewriting the proxy. Order matters because authentication must precede authorization and rate limiting (you limit/authorize a known consumer), and cheap rejections should come first so the gateway does the least work for traffic it will refuse — short-circuiting before any backend is touched",
+    "Because filters must run alphabetically by name",
+    "So that every request always runs every filter to completion",
+  ]}
+  answer={1}
+  explanation="The filter chain makes cross-cutting concerns composable and independently testable: a route declares which filters apply, and you add a capability by inserting a filter. Ordering is semantic, not cosmetic — you must authenticate before you can authorize or rate-limit a specific consumer, and you want decisive, cheap rejections (bad token, over limit) to short-circuit early so the gateway spends nothing routing or calling a backend for a request it's going to refuse. That early rejection is exactly how the gateway shields upstreams."
+/>
 
 <h2 id="routing-discovery">Routing & Service Discovery</h2>
 
-This section explains how the gateway matches requests to routes and discovers healthy upstream instances via a service registry.
+Once a request passes the early filters, the gateway must **match it to an upstream**. Matching is on **host + path + method**, and because it happens on every request it has to be fast: gateways compile all routes into a **radix tree (trie)** on the path so a match is a few microseconds regardless of how many routes exist, rather than a linear scan through a rule list. A route can also carry predicates (headers, query params) and rewrite the path before forwarding. The output of matching is a target *service*, not a specific server — which is where discovery comes in.
+
+**Service discovery** turns "the orders service" into "one of these healthy instances at these addresses." Backends scale and move, so the gateway can't hardcode IPs; instead a **service registry** (Consul, etcd, Kubernetes endpoints) holds the live set of instances per service, kept current by **health checks** that add new instances and evict failed ones. The gateway then **load-balances** across the healthy set — round-robin, least-connections, or latency-weighted — and stops sending traffic to instances that fail health checks. This same machinery enables progressive delivery: **canary** and **blue-green** routing send a fraction of traffic (or traffic matching a rule) to a new version, so rollouts are gradual and reversible at the edge. The principle: match fast with a compiled structure, resolve the target through a live registry rather than static addresses, and balance only across instances currently passing health checks — so routing automatically follows the fleet as it scales, heals, and deploys.
+
+<KnowledgeCheck
+  question="How does a gateway route efficiently, and why does it resolve targets through a service registry instead of fixed addresses?"
+  options={[
+    "It scans the route list linearly and connects to hardcoded backend IPs",
+    "It compiles routes into a radix/trie on the path so matching is microseconds regardless of route count, then resolves the matched service to a live instance via a service registry kept current by health checks — so it load-balances only across healthy instances and automatically follows backends as they scale, move, and deploy (enabling canary/blue-green at the edge)",
+    "It asks each backend whether the request belongs to it",
+    "It caches the full response so routing only happens once per path",
+  ]}
+  answer={1}
+  explanation="Routing runs on every request, so the match must be near-constant-time — a compiled radix tree on the path achieves that no matter how many routes exist. Targets are resolved through a registry because backends are dynamic: instances scale up and down, fail, and get replaced, so hardcoded addresses would rot. The registry plus health checks gives the gateway the current healthy set to load-balance across, and the same indirection lets it shift a slice of traffic to a new version for canary or blue-green rollouts, reversibly, from the edge."
+/>
 
 <h2 id="auth">Authentication & Authorization</h2>
 
-This section covers offloaded edge authentication using local JWT verification and cached token introspection, followed by scope- and role-based authorization.
+Offloading **authentication** to the edge is one of the gateway's biggest wins: verify identity once, at the front door, so backends can trust the request and not each re-implement auth. There are two dominant token styles, and the distinction drives the design. A **JWT** is a signed, self-contained token: the gateway **verifies the signature locally** using the issuer's public key, reads the claims, and is done — **no network call**, so it's extremely fast, which matters on the critical path. The cost is **revocation**: because the token is self-contained and valid until it expires, revoking it early is hard (you need short lifetimes plus a revocation list). The alternative is an **opaque token** validated by **introspection** — the gateway calls the auth service to ask "is this token valid, and who is it?" This is **authoritative** (instant revocation, central control) but adds a lookup per request, so you **cache** the result for the token's short lifetime to keep the cost near zero (the capacity model's 95%-hit cache turning 10 ms into 0.5 ms).
+
+Once identity is established, **authorization** decides whether this caller may do this. The gateway enforces coarse-grained authZ at the edge — **scopes** (an OAuth token granting `orders:read`), **roles**, or per-route ACLs — rejecting forbidden requests before they reach a backend, while fine-grained, data-dependent authorization ("can *this* user edit *that* order?") stays in the service that owns the data. The trade-off to state explicitly: **local JWT verification is fast but revocation-weak; introspection is authoritative but adds a cached lookup** — most systems use short-lived JWTs for speed and accept the revocation window, or introspect with caching when central revocation is required. Either way, the gateway turns "every service must implement auth" into "auth happens once at the edge," which is both faster and more secure because there's one place to get it right.
+
+<KnowledgeCheck
+  question="What's the trade-off between validating a JWT locally and introspecting an opaque token, and how is each made fast?"
+  options={[
+    "JWTs are always more secure, so introspection is never used",
+    "Local JWT verification checks the signature with the issuer's public key — no network call, so it's fast, but the self-contained token is hard to revoke before it expires. Introspection calls the auth service so it's authoritative and revocable, but adds a per-request lookup, which is cached for the token's lifetime to keep it cheap. Short-lived JWTs trade a small revocation window for speed; introspection-with-cache trades a cached lookup for central revocation",
+    "Introspection is faster because it avoids cryptography",
+    "There is no difference; both require a database call per request",
+  ]}
+  answer={1}
+  explanation="The two token styles sit on a speed-versus-control trade-off. A JWT is self-contained, so the gateway verifies the signature locally with no network round-trip — ideal for the critical path — but that same self-containment makes early revocation hard, so you lean on short lifetimes (and possibly a denylist). An opaque token must be introspected against the auth service, which is authoritative and instantly revocable but costs a lookup; caching the result for the token's short lifetime makes the amortized cost near zero (95% hits → ~0.5 ms). Edge authorization then enforces coarse scopes/roles, leaving data-dependent checks to the owning service."
+/>
 
 <h2 id="rate-limiting">Rate Limiting & Quotas</h2>
 
-This section describes distributed rate limiting with local pre-checks and shared counters, and cross-references the Rate Limiter tutorial for algorithm details.
+Rate limiting at the gateway serves two goals: **protecting backends** from overload and abuse, and **enforcing per-consumer plans** (the "gold tier gets 100k requests/day" quota). The algorithms are the ones from the **Rate Limiter** tutorial — **token bucket** for smooth rates with bursts, **sliding window** for accuracy — but the gateway adds a distributed twist: there are ~70 stateless gateway instances, and a consumer's requests can hit any of them, so the **counter must be shared**. The limit state lives in a fast central store (Redis-style) that all instances increment against, so the limit is enforced globally rather than per-instance (70 instances each allowing N would let through 70×N).
+
+The tension is **accuracy versus latency**: a strict global counter means a round-trip to the shared store on *every* request, which is exactly the kind of per-request overhead the gateway must avoid. The common resolution is to **pre-check locally** and reconcile: each instance keeps a small local view (or a leased batch of tokens) and only consults the shared store periodically or when near the limit, trading a little precision for far less latency and load. A second decision is **fail-open vs fail-closed**: if the counter store is unavailable, do you let requests through (fail-open — favor availability, risk overload) or reject them (fail-closed — favor protection, risk an outage)? For most gateways rate limiting **fails open** — a brief inability to count is better than dropping all traffic — while security-critical limits may fail closed. The principle: enforce limits on a shared counter so the stateless fleet agrees, pre-check locally to keep the per-request cost down, and decide deliberately whether each limit fails open or closed when its store is down. (This is the Rate Limiter tutorial's machinery, deployed at the edge for every service at once.)
+
+<KnowledgeCheck
+  question="Why can't each gateway instance just keep its own rate-limit counter, and what's the latency trade-off in fixing it?"
+  options={[
+    "It can; per-instance counters are exactly correct",
+    "Requests from one consumer hit any of the many stateless instances, so per-instance counters would let through (instances × limit) — the count must be shared in a fast central store so the fleet enforces one global limit. But consulting it on every request adds a round-trip, so instances pre-check locally (or lease token batches) and reconcile periodically, trading a little precision for much lower latency; you also choose fail-open vs fail-closed if the store is down",
+    "Counters must be per-instance for security reasons",
+    "The gateway should rate-limit by IP only, which needs no shared state",
+  ]}
+  answer={1}
+  explanation="Because the gateway is a stateless horizontal fleet, a consumer's traffic is spread across instances, so independent local counters would multiply the effective limit by the instance count. Enforcing one global limit means a shared counter store all instances increment against. The catch is that a strict per-request round-trip to that store is the per-request latency the gateway exists to minimize, so the practical design pre-checks locally and reconciles with the store periodically or near the threshold. And since the store is a dependency, you decide per-limit whether to fail open (keep serving, risk overload) or fail closed (protect the backend, risk rejecting) when it's unavailable."
+/>
 
 <h2 id="control-data-plane">Control Plane & Data Plane</h2>
 
-This section explains the control-plane and data-plane split: the control plane owns routes, keys, and policies and pushes versioned config to the stateless data-plane proxies, which hot-reload it without dropping connections.
+This is the architectural centerpiece: separating the **data plane** from the **control plane**. The **data plane** is the fleet of proxies that actually handles traffic — it runs the filter chain, matches routes, and forwards requests, optimized for raw throughput and low latency, holding all its configuration **in memory**. The **control plane** is the management brain — it owns the routes, API keys, rate-limit policies, and upstream definitions, exposes the admin API, **validates** changes, and **distributes** the resulting config to every data-plane instance. The two are deliberately decoupled: the data plane can keep serving even if the control plane is down (it runs on its last-known config), and the control plane can be a richer, slower, more careful system because it's off the request path.
+
+The reason this split exists is **config changes without redeploying the data plane**. Teams add endpoints, rotate keys, and tune limits constantly; you cannot redeploy ~70 proxy instances every time. Instead the control plane **pushes** versioned config to the data plane, which **hot-reloads** it — updating routing and policy live, with no dropped connections. Two design choices matter here. **Push vs poll**: the control plane can push updates to instances (fast propagation, more coordination) or instances can poll for the latest version (simpler, slightly laggier) — most systems push for speed with a poll as a fallback. And **versioning + safe rollout**: every config change is a new immutable version, validated before distribution and **rolled out gradually** (canary the new config to a few instances first), so a bad route can be caught and **rolled back to the previous version** instantly rather than breaking the whole fleet. The principle: keep the data plane dumb, fast, and stateless-but-for-cached-config; put all the management intelligence in a control plane that validates and versions changes and pushes them out — so the system is both blazing fast on the request path and safely, continuously reconfigurable off it.
+
+<KnowledgeCheck
+  question="Why do API gateways separate the control plane from the data plane?"
+  options={[
+    "To run them on different programming languages",
+    "The data plane is a fast, stateless proxy fleet that forwards traffic using config held in memory, while the control plane manages routes/keys/policies, validates changes, and pushes versioned config to the data plane. The split lets operators change routing and policy live — without redeploying the proxies — keeps the request path lean, lets the data plane keep serving on last-known config if the control plane is down, and enables versioned, canaried, instantly-rollback-able config rollout",
+    "Because the data plane needs a database and the control plane doesn't",
+    "To make the gateway stateful so it can remember requests",
+  ]}
+  answer={1}
+  explanation="The two planes have opposite design goals. The data plane must be simple and fast — run the filter chain over in-memory config and forward — so it stays on the critical path with minimal latency and scales horizontally. The control plane carries the management complexity: it owns and validates the configuration and distributes versioned updates. Decoupling them means config changes propagate as pushed, hot-reloaded versions rather than proxy redeploys, the request path is unaffected by control-plane slowness or outages, and rollouts are gradual and reversible — a bad config is rolled back to the prior version, not shipped to the whole fleet at once."
+/>
 
 <h2 id="resilience-observability">Resilience & Observability</h2>
 
-This section covers timeouts, budgeted retries, circuit breaking, and the gateway as the central home for RED metrics, structured logs, and distributed tracing with an edge-injected correlation ID.
+Because the gateway sits in front of every backend, it's the right place to **protect** them and to **see** what's happening. Protection is a small toolkit. **Timeouts** cap how long the gateway waits on an upstream, so a slow service doesn't tie up gateway resources indefinitely. **Retries** paper over transient blips, but only with a **budget** — retrying everything amplifies load on an already-struggling backend, so you cap retries (often "retry at most once," only on idempotent methods, with backoff). **Circuit breakers** watch an upstream's failure rate and, when it crosses a threshold, **open** — failing fast (or serving a fallback) instead of sending more traffic to a sick service, then probing after a cooldown to close again. **Bulkheading** isolates resources per upstream (separate connection pools), so one failing backend can't exhaust the gateway and take down healthy routes with it. Together these make the gateway a shock absorber: a degraded backend degrades *its* routes, not the whole platform.
+
+**Observability** is the other half, and the gateway is the one place that sees every request, so it's where you instrument. Three pillars: **structured logs** (one record per request with route, consumer, status, latency), the **RED metrics** (Rate, Errors, Duration — per route and per upstream, the vital signs of the platform), and **distributed tracing** — the gateway injects a **correlation/trace id** at the edge and propagates it downstream, so a single request can be followed across every service it touches. This is enormously valuable precisely because it's centralized: instead of stitching together logs from dozens of services, you get a uniform, platform-wide view of traffic, errors, and latency at the front door, and the trace id ties the distributed call graph back to one originating request. The principle: the gateway is the natural home for both protecting backends (timeouts, budgeted retries, circuit breakers, bulkheads) and observing them (RED metrics, structured logs, edge-injected traces), because every request already flows through it.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section discusses how the stateless data plane scales horizontally and how the system evolves from a simple reverse proxy to a full-featured edge platform.
+Don't build the multi-region, control-plane-driven gateway on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Per-service libraries (no gateway)", "A few services, simple needs", "Every service re-implements auth/limits/TLS; inconsistent, hard to change globally"],
+    ["Single gateway instance", "Want one front door for cross-cutting concerns", "A single point of failure and a throughput bottleneck"],
+    ["Stateless replicated data plane + control plane", "Real traffic; config must change without redeploys", "Run a control plane; externalize counters/auth cache; manage config rollout"],
+    ["Multi-region edge gateways (+ mesh for east-west)", "Global low latency; service-to-service scale", "Regional config distribution; a service mesh for internal traffic; more operational surface"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the pain you're buying out of. Starting with **per-service libraries** is fine for a handful of services but means every team re-implements auth and rate limiting inconsistently, and changing a global policy means changing N codebases. A **single gateway** centralizes that but is an obvious single point of failure and bottleneck. The center of gravity for most platforms is a **stateless, replicated data plane behind a load balancer, driven by a control plane**, with counters and the auth cache externalized — this is where the gateway becomes highly available, horizontally scalable, and reconfigurable without redeploys. Only global products need **multi-region edge gateways**, which pay for locality with regional config distribution, and they often pair the north-south gateway with a **service mesh** for east-west (service-to-service) traffic — a related but distinct shape (sidecars instead of a central edge). Most systems are well-served by "stateless data plane, control-plane-managed config, externalized shared state."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section catalogs the failure modes of an API Gateway and the mitigations for each, including fail-open versus fail-closed decisions for auth and rate limiting.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. The gateway's guiding rules: **never become the single point of failure it was meant to prevent**, and **degrade gracefully** — a partial failure should narrow the blast radius, not widen it.
+
+<FailureMatrix
+  rows={[
+    { failure: "Gateway instance dies", impact: "Lost capacity on that node", detection: "Health checks; LB removes it", mitigation: "Stateless replicas behind a load balancer; instances hold no request state", recovery: "Replacement instance loads config and rejoins the pool" },
+    { failure: "Control plane outage", impact: "Can't change config", detection: "Control-plane health; push-lag metric", mitigation: "Data plane keeps serving on last-known config; config is cached locally", recovery: "Control plane returns; pending config pushes resume" },
+    { failure: "Auth service / IdP down", impact: "Can't verify new tokens", detection: "Introspection error rate; latency", mitigation: "Serve cached token validations; fail-closed for sensitive routes, fail-open for low-risk by policy", recovery: "Auth recovers; cache refills; verifications resume" },
+    { failure: "Rate-limit store down", impact: "Can't count usage", detection: "Counter-store errors", mitigation: "Fail-open with local approximate limits to keep serving (or fail-closed for protected routes)", recovery: "Store recovers; counters reconcile" },
+    { failure: "Upstream service down / slow", impact: "Its routes fail or hang", detection: "Timeouts; rising error rate", mitigation: "Timeouts + circuit breaker fail fast; bulkheads isolate it from other routes", recovery: "Breaker probes and closes when the upstream is healthy" },
+    { failure: "Bad config pushed (broken route)", impact: "Misrouted / failing requests", detection: "Canary metrics on the new version", mitigation: "Validate before push; canary to a few instances; instant rollback to prior version", recovery: "Roll back to the last good config version" },
+    { failure: "Traffic spike / thundering herd", impact: "Gateway + backends overload", detection: "RPS surge; saturation metrics", mitigation: "Autoscale the stateless fleet; load-shed and rate-limit at the edge; protect backends", recovery: "Spike subsides or capacity catches up; shed traffic resumes" },
+  ]}
+/>
+
+The theme: **statelessness makes the gateway itself trivially recoverable, and graceful degradation keeps a partial failure partial.** A dead instance is just removed from the pool and replaced — no state lost — because the gateway holds none. A control-plane outage costs *configurability*, not *availability*: the data plane runs on its cached config. Dependency failures are met with deliberate fail-open/fail-closed policies (serve cached auth, approximate limits) so the gateway keeps working in a degraded but safe mode. A sick upstream is contained by timeouts, circuit breakers, and bulkheads so it can't take down healthy routes. And the gateway's own riskiest action — a config change — is made safe by validation, canarying, and versioned rollback. Because the data plane is stateless and runs on cached config, recovery is almost always "replace the instance" or "roll back the config," and the design's whole point — one front door — is protected by making that front door a replicated, gracefully-degrading fleet rather than a single box.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares design trade-offs and alternatives, including self-hosted versus managed gateways, sidecar proxies, and service-mesh overlaps.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Put a stateless, horizontally-scaled data plane at the edge that runs an ordered filter chain (authN → authZ → rate-limit → transform → route → forward) over in-memory config, with shared state (rate counters, token cache) externalized; manage it with a separate control plane that validates, versions, and pushes config so routing and policy change without redeploys; offload auth to the edge (local JWT verification or cached introspection); rate-limit on a shared counter with local pre-checks; and protect backends with timeouts, budgeted retries, and circuit breakers while emitting RED metrics, logs, and edge-injected traces."
+  rationale="The gateway is on the critical path of every request, so its overhead must be minimal and it must never be a single point of failure — which forces statelessness (horizontal scale, trivial recovery) and aggressive caching of auth/limit state. The control/data-plane split is what lets a fast, dumb data plane be safely and continuously reconfigured by a richer control plane without redeploys. Filter ordering and short-circuiting make the gateway an efficient shield. Circuit breakers and bulkheads keep one bad backend from cascading. And because every request flows through it, the gateway is the one place to centralize cross-cutting concerns and observability."
+  alternatives="Per-service libraries (no gateway) — no extra hop, but every service re-implements auth/limits inconsistently and global changes are N deploys; a monolithic gateway with config baked in — simpler but every change is a redeploy and there's no safe rollout; a single instance — no horizontal scale and a single point of failure; strict per-request global rate-counter checks — exact but adds a round-trip to every call; a service mesh instead of a gateway — great for east-west service-to-service traffic but not the north-south client edge (often used together); failing closed everywhere — safe but turns a dependency blip into a full outage versus deliberate fail-open for low-risk concerns."
+  revisitWhen="East-west (service-to-service) traffic dominates (add a service mesh), global users need regional edges (multi-region config distribution), a single gateway team becomes a bottleneck for many services (federated/per-team gateways), or extreme latency requirements make even a few milliseconds of edge overhead unacceptable (push concerns into the mesh/sidecar or the client)."
+/>
+
+Four axes capture the real tension:
+
+- **Centralized gateway vs per-service libraries.** A gateway centralizes cross-cutting concerns (consistent, one place to change) at the cost of an extra hop and a critical shared component; libraries avoid the hop but scatter and duplicate the logic. At more than a few services, the gateway wins.
+- **Control/data-plane split vs monolithic gateway.** The split enables live, safe reconfiguration and a fast data plane, at the cost of running a control plane; a monolith is simpler but every change is a redeploy. Split once config changes often.
+- **Local JWT verification vs token introspection.** Local is fast (no network call) but revocation-weak; introspection is authoritative but adds a cached lookup. Short-lived JWTs for speed, introspection-with-cache when central revocation matters.
+- **Fail-open vs fail-closed.** When a dependency (auth, counter store) is down, fail-open favors availability and fail-closed favors protection. Choose per concern — usually open for low-risk limits, closed for security-critical checks.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section provides a concise 60-second interview answer covering the key design decisions for an API Gateway.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"An API gateway looks like a reverse proxy, but the hard part is that it's a control point on the critical path of every request, so it has to add auth, routing, and rate limiting in single-digit milliseconds without becoming a latency tax or a single point of failure. I make the data plane stateless — a fleet of proxies behind a load balancer, each running an ordered filter chain: terminate TLS, authenticate, authorize, rate-limit, transform, match the route, forward — and any filter can short-circuit, so bad or over-limit requests are rejected at the edge before any backend is touched. Because it's stateless it scales horizontally and any instance recovers trivially; the shared state it needs, like rate-limit counters, lives in a fast external store so all instances agree, with local pre-checks to avoid a round-trip per request. Auth is offloaded to the edge — I verify JWTs locally for speed, or introspect opaque tokens with a cache, so backends just trust the request. The architectural key is splitting the data plane from a control plane that owns routes, keys, and policies and pushes versioned config out, so routing and policy change live without redeploying the proxies, and a bad config canaries and rolls back instead of breaking the fleet. I route by matching host-path-method against a compiled radix tree and resolve the target through a service registry of healthy instances. And since it's in front of everything, the gateway is where I protect backends with timeouts, budgeted retries, and circuit breakers, and where I centralize observability — RED metrics, structured logs, and a trace id injected at the edge. The thing I never allow is for the gateway to become the single point of failure it was meant to prevent, so it's replicated and degrades gracefully."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why a filter chain, and why does order matter? How do you keep the gateway stateless with rate limiting? Local JWT verification or introspection? Why split control and data planes? How does config reach the data plane without a redeploy? How do you protect a backend that's failing? How is the gateway not a single point of failure?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section contains knowledge-check questions and a FAQ covering the most common interview follow-ups on API Gateway design.
+<KnowledgeCheck
+  question="Why must an API gateway be stateless, and where does the state it does need (like rate-limit counters) live?"
+  options={[
+    "It doesn't need to be stateless; each instance owns its sessions",
+    "Statelessness means any instance can serve any request, so the fleet scales horizontally behind a load balancer and a dead instance loses nothing — essential for a component on every request's path. The shared mutable state it needs, like rate-limit counters and a token cache, is externalized to a fast store (with local pre-checks) so all instances agree without the gateway itself holding per-request state",
+    "It must be stateless so it can store data in the backends",
+    "Statelessness is only about not using TLS",
+  ]}
+  answer={1}
+  explanation="Because the gateway fronts all traffic, it must scale out and tolerate instance loss without disruption — which requires that no request depends on state pinned to a particular instance. So the proxies are stateless: routing/policy config is a cached in-memory copy of control-plane data, and genuinely shared mutable state (rate counters, token validations) is pushed to a fast external store all instances read, with local pre-checks to avoid a per-request round-trip. That keeps the fleet horizontally scalable and instances disposable."
+/>
+
+<KnowledgeCheck
+  question="An operator needs to add a new route and tighten a rate limit. How does that change reach the gateway fleet without downtime?"
+  options={[
+    "Every gateway instance is redeployed with the new config",
+    "The control plane validates and versions the change, then pushes it to the stateless data-plane instances, which hot-reload the new config in memory without dropping connections — routing and policy change live, with no proxy redeploy, and a bad change can be canaried and rolled back to the prior version",
+    "The change only takes effect after the next nightly restart",
+    "Each instance independently guesses the new configuration",
+  ]}
+  answer={1}
+  explanation="This is the payoff of the control/data-plane split. Config isn't compiled into the proxies; it's data the control plane owns, validates, and distributes as immutable versions. The data plane receives the push (or polls) and hot-reloads it, so changes propagate in seconds without redeploying or restarting the fleet. Because each change is a version, the control plane can canary it to a few instances and roll back instantly if metrics regress — making continuous, safe reconfiguration possible on a component that's serving all traffic."
+/>
+
+<Faq
+  items={[
+    { question: "What is an API gateway, and why use one?", answer: "It's a single entry point that fronts a fleet of backend services and handles cross-cutting concerns — routing, authentication, authorization, rate limiting, TLS termination, transformation, and observability — so each service doesn't re-implement them. It gives you one consistent, centrally-managed place to enforce policy and see traffic, at the cost of an extra hop and a critical shared component. Kong, NGINX, Envoy, AWS API Gateway, and Apigee are examples." },
+    { question: "How is an API gateway different from a load balancer?", answer: "A load balancer distributes traffic across instances at L4/L7 and largely stops there. A gateway is application-aware: it routes by host/path/method, authenticates and authorizes, rate-limits per consumer, transforms requests/responses, and emits per-request telemetry. A gateway typically sits behind a load balancer (the LB spreads traffic across gateway instances) and adds the policy and cross-cutting logic a plain balancer doesn't." },
+    { question: "What is the difference between an API gateway and a service mesh?", answer: "A gateway handles north-south traffic — clients entering the platform from outside — as a centralized edge. A service mesh handles east-west traffic — service-to-service calls inside the platform — usually via sidecar proxies next to each service rather than a central hop. They solve related problems (routing, auth, resilience, observability) at different boundaries and are often used together: a gateway at the edge, a mesh internally." },
+    { question: "What is the control plane vs data plane split?", answer: "The data plane is the fleet of proxies that forwards traffic and runs the filter chain over config held in memory — optimized for throughput and low latency. The control plane manages the configuration (routes, keys, policies), validates changes, and pushes versioned config to the data plane. The split lets you change routing and policy live without redeploying the proxies, keeps the request path fast, and lets the data plane keep serving on last-known config even if the control plane is down." },
+    { question: "Why must the gateway add so little latency?", answer: "Because it's on the critical path of every request, any latency it adds is paid by the entire platform at once. If the gateway adds 4 ms to an 84 ms request that's a tolerable ~5%, but a heavier operation — like a synchronous auth lookup or policy fetch on every request — would slow everything. That's why auth validations and rate-limit state are cached locally and the proxy path is kept lean: the per-request overhead has to stay in single-digit milliseconds." },
+    { question: "How does the gateway authenticate requests?", answer: "It verifies a credential at the edge so backends don't have to. With JWTs it validates the signature locally using the issuer's public key — no network call, very fast, but revocation is harder so tokens are short-lived. With opaque tokens it introspects against the auth service (authoritative and revocable) and caches the result for the token's lifetime to keep the cost near zero. It then enforces coarse authorization (scopes/roles) at the edge, leaving data-dependent checks to the owning service." },
+    { question: "How is rate limiting done across many gateway instances?", answer: "Since a consumer's requests can hit any of the stateless instances, the counter must be shared in a fast central store so the limit is global — per-instance counters would multiply the effective limit by the instance count. To avoid a round-trip per request, instances pre-check locally (or lease token batches) and reconcile with the store periodically or near the threshold. The algorithms (token bucket, sliding window) come from the Rate Limiter design; the gateway twist is the distributed shared counter." },
+    { question: "What happens when a backend service is failing?", answer: "The gateway protects both the backend and itself with timeouts (don't wait forever), budgeted retries (retry transient errors but cap them so you don't amplify load), and a circuit breaker that opens when the failure rate crosses a threshold — failing fast or serving a fallback instead of piling onto a sick service, then probing after a cooldown to recover. Bulkheading (separate connection pools per upstream) keeps one bad backend from exhausting the gateway and harming healthy routes." },
+    { question: "How does the gateway find which backend instance to call?", answer: "Routing matches the request to a target service (via a compiled radix tree on host/path/method), then service discovery resolves that service to a live instance. A registry — Consul, etcd, Kubernetes endpoints — holds the healthy instances per service, kept current by health checks, and the gateway load-balances across them, evicting any that fail health checks. This indirection lets backends scale and move freely and enables canary/blue-green rollouts from the edge." },
+    { question: "Is the gateway a single point of failure?", answer: "It would be if run as one instance, which is why it's deployed as a stateless, replicated fleet behind a load balancer: any instance serves any request, a dead one is removed and replaced with no state lost, and it's spread across availability zones (and regions for global scale). It also degrades gracefully — serving cached auth, failing rate limits open or closed by policy, and running on last-known config if the control plane is down — so a partial failure stays partial." },
+    { question: "What observability does the gateway provide?", answer: "Because every request passes through it, the gateway is the natural place to instrument: structured logs (one record per request with route, consumer, status, latency), RED metrics (Rate, Errors, Duration per route and upstream — the platform's vital signs), and distributed tracing via a correlation/trace id injected at the edge and propagated downstream. This gives a uniform, platform-wide view of traffic and errors and ties a distributed call graph back to one originating request, without stitching together each service's logs." },
+    { question: "What does fail-open vs fail-closed mean for a gateway?", answer: "It's the policy for when a dependency is unavailable. Fail-open means letting requests through (favoring availability — e.g. if the rate-limit counter store is down, keep serving rather than reject everyone). Fail-closed means rejecting them (favoring protection/security — e.g. if auth can't be verified for a sensitive route, deny). The choice is made per concern: low-risk limits often fail open so a dependency blip doesn't become an outage, while security-critical checks fail closed." },
+    { question: "Why route requests through a filter chain?", answer: "It makes cross-cutting concerns composable and independently testable: each filter (authN, authZ, rate-limit, transform, route) does one job, a route declares which filters apply, and you add a capability by inserting a filter rather than rewriting the proxy. Ordering is semantic — authenticate before authorizing or rate-limiting a consumer, and put cheap, decisive rejections first so the gateway short-circuits bad traffic before spending work on routing or a backend call." },
+  ]}
+/>
