@@ -123,6 +123,13 @@ import {
   ConfigPushSequence,
   CircuitBreakSequence,
 } from "@/components/diagrams/api-gateway-flows";
+import { WebCrawlerArchitecture } from "@/components/diagrams/web-crawler-architecture";
+import {
+  FetchPageSequence,
+  DedupCheckSequence,
+  PolitenessSequence,
+  RecrawlSequence,
+} from "@/components/diagrams/web-crawler-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -227,6 +234,11 @@ const teachingComponents = {
   AuthRejectSequence,
   ConfigPushSequence,
   CircuitBreakSequence,
+  WebCrawlerArchitecture,
+  FetchPageSequence,
+  DedupCheckSequence,
+  PolitenessSequence,
+  RecrawlSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

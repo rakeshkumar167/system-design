@@ -418,3 +418,34 @@ describe("api gateway flow sequences", () => {
     expect(screen.getByRole("img", { name: /circuit/i })).toBeInTheDocument();
   });
 });
+
+import { WebCrawlerArchitecture } from "@/components/diagrams/web-crawler-architecture";
+import {
+  FetchPageSequence,
+  DedupCheckSequence,
+  PolitenessSequence,
+  RecrawlSequence,
+} from "@/components/diagrams/web-crawler-flows";
+
+describe("WebCrawlerArchitecture", () => {
+  it("exposes the web crawler architecture to non-visual readers", () => {
+    render(<WebCrawlerArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /web crawler architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/bloom filter/i)).toBeInTheDocument();
+  });
+});
+
+describe("web crawler flow sequences", () => {
+  it("renders the fetch, dedup, politeness, and recrawl sequences", () => {
+    render(<FetchPageSequence />);
+    expect(screen.getByRole("img", { name: /fetch/i })).toBeInTheDocument();
+    render(<DedupCheckSequence />);
+    expect(screen.getByRole("img", { name: /dedup/i })).toBeInTheDocument();
+    render(<PolitenessSequence />);
+    expect(screen.getByRole("img", { name: /polite/i })).toBeInTheDocument();
+    render(<RecrawlSequence />);
+    expect(screen.getByRole("img", { name: /recrawl/i })).toBeInTheDocument();
+  });
+});
