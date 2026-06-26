@@ -24,6 +24,7 @@ import { DistributedJobSchedulerCapacity } from "@/components/learning/distribut
 import { MapsNavigationCapacity } from "@/components/learning/maps-navigation-capacity";
 import { ApiGatewayCapacity } from "@/components/learning/api-gateway-capacity";
 import { WebCrawlerCapacity } from "@/components/learning/web-crawler-capacity";
+import { SearchAutocompleteCapacity } from "@/components/learning/search-autocomplete-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -163,6 +164,7 @@ const teachingComponents = {
   MapsNavigationCapacity,
   ApiGatewayCapacity,
   WebCrawlerCapacity,
+  SearchAutocompleteCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
