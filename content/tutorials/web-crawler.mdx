@@ -1,73 +1,373 @@
-# Design a Web Crawler
-
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section frames the web crawler as a system design interview problem, covering scope, constraints, and what interviewers expect.
+A web crawler systematically downloads the web. Starting from a set of **seed URLs**, it fetches each page, extracts the links it contains, and follows them — fanning out across the web graph to build a corpus of pages for a search index, an archive, or a dataset. Googlebot, Bingbot, the Internet Archive's crawler, and the bots behind every search engine are this system. From the outside it's the textbook graph traversal: a queue of URLs, a loop that pops one, downloads it, parses out links, and pushes the new ones back. That framing produces a crawler that works on a thousand pages and then becomes a menace at a billion — hammering servers it shouldn't, re-downloading pages it already has, drowning in a queue it can't fit in memory, and getting trapped in infinite link mazes.
+
+The hard part is doing this **at web scale, politely, without redoing work**. Three problems dominate, and none of them is the downloading. First, the **URL frontier** — the queue of what to crawl next — is the whole design: it can't be a simple FIFO, because it must enforce **politeness** (never more than one in-flight request to a host, with a delay between them, so the crawler doesn't look like a denial-of-service attack) *and* **priority** (crawl important and fresh pages before obscure ones), across a distributed fleet of fetchers. Second, **deduplication at scale**: most links you extract point to pages you've already seen, so you need a **seen-URL set** of tens of billions of entries — and storing that exactly is terabytes, so it has to be a probabilistic **bloom filter**; separately, the same page is reachable by many URLs, so you also dedup **content**. Third, **robustness and freshness**: the web is hostile (infinite calendars, session-id explosions, malformed pages — **crawler traps**) and it changes, so you must bound traps and **re-crawl** on a freshness schedule. The reframe to lead with: *it looks like BFS with a queue, but the queue is the entire problem — a priority-and-politeness URL frontier across a distributed fleet, a seen-set too large to store exactly so it's a bloom filter, content dedup so the same page isn't stored twice, and trap-survival plus freshness re-crawling. Fetching a page is trivial; choosing which URL to fetch, when, politely, without repeating yourself, at web scale, is the design.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What's the crawl for — a search index, archiving, a research dataset? It shapes what you store and how fresh it must be.
+- How big and how fresh — one pass of N billion pages, or continuous re-crawling? Continuous adds the freshness/scheduling dimension.
+- Must we render JavaScript, or is fetching raw HTML enough? Headless rendering is far more expensive and is often a separate tier.
+- How polite must we be — strict robots.txt and per-host limits? (Almost always yes — politeness is non-negotiable.)
+- Single data center or globally distributed? Scale drives how the frontier and seen-set are sharded.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "the queue is the problem" reframe · **5 min** requirements (scale, politeness, dedup, freshness) · **5 min** capacity (the seen-set: bloom filter vs exact) · **5 min** entity model (CrawlUrl) and the interfaces · **10 min** the URL frontier (priority + politeness) — the centerpiece · **8 min** dedup (bloom filter + content fingerprints) and politeness/robots · **5 min** freshness, traps, failure modes, wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for a priority/politeness frontier, a bloom-filter seen-set, and trap bounding, not whether you can write a fetch loop.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the URL frontier (priority + politeness queues), robots.txt and per-host politeness, URL and content deduplication, DNS resolution and fetching at scale, freshness / re-crawl scheduling, and crawler traps / robustness — plus scaling, failure modes, and trade-offs. **Out of scope:** the search index and ranking that *consume* the corpus (a separate system), JavaScript rendering / headless-browser crawling beyond a mention, the boilerplate-removal / content-extraction pipeline internals, and focused/topical crawling policy beyond prioritization — name them so the interviewer sees the boundary, then set them aside. This problem reuses the queue/worker pattern and hashing intuition from earlier tutorials and the time-triggered re-enqueue idea from the **Distributed Job Scheduler**, but centers them on *politely traversing the web graph at scale*.
 
 <h2 id="requirements">Requirements</h2>
 
-This section establishes the functional and non-functional requirements for a web crawler at internet scale.
+Separate what the system must *do* from how *well* it must do it. The functional list is a short loop; the difficulty is entirely in the non-functional column — scale, politeness, dedup, and freshness — which is what turns a fetch loop into a distributed system.
+
+<RequirementsTable
+  functional={[
+    "Crawl the web starting from seed URLs",
+    "Download pages and extract their links",
+    "Store fetched page content",
+    "Respect robots.txt and per-host crawl delays",
+    "Re-crawl pages to keep the corpus fresh",
+    "Deduplicate URLs and content",
+  ]}
+  nonFunctional={[
+    { goal: "Scale", target: "tens of billions of pages" },
+    { goal: "Politeness", target: "never overload any host" },
+    { goal: "Dedup efficiency", target: "seen-set fits in memory" },
+    { goal: "Freshness", target: "re-crawl by change rate" },
+    { goal: "Robustness", target: "survive traps, bad pages, failures" },
+    { goal: "Extensibility", target: "pluggable parsers / policies" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **politeness is a hard constraint, not a nicety**: a crawler that ignores robots.txt or floods a server is indistinguishable from an attack and will get blocked (and is unethical), so politeness — one request per host at a time, a crawl delay, obeying robots — is built into the **structure** of the frontier, not bolted on. Second, **dedup must be space-efficient**: at tens of billions of URLs the seen-set can't be an exact in-memory hash table (terabytes), so it's a **bloom filter**, trading rare false positives for a ~40× space saving — without this the crawler simply can't run. Third, **freshness with bounded work**: the web changes constantly but you can't re-crawl everything equally often, so re-crawl frequency is **tuned to each page's change rate** and importance. Note what's *relaxed*: coverage is **best-effort** (you'll never crawl "all" of an effectively infinite web), and the corpus is **eventually consistent** with the live web (a page crawled yesterday is fine). The system trades completeness and instant freshness for politeness, scale, and bounded, prioritized work.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the capacity math for crawling tens of billions of pages, estimating crawl rate, bandwidth, fleet size, and storage needs.
+Estimates here separate the ordinary part (downloading) from the signature part (the seen-set). The fetching is a real but unremarkable throughput problem; the thing that *forces* a specific data structure is tracking which of tens of billions of URLs you've already crawled.
+
+<WebCrawlerCapacity
+  assumptions={{
+    pagesToCrawl: 30000000000,
+    crawlDays: 30,
+    avgPageSizeKb: 100,
+    pagesPerSecPerCrawler: 100,
+    bytesPerUrlExact: 50,
+    bloomBitsPerUrl: 10,
+  }}
+/>
+
+The takeaways. First, **fetching is ordinary throughput**: crawling 30 billion pages in 30 days is ~**11,574 pages/sec**, needing ~**116 fetcher nodes** and ~**9.26 Gbps** of sustained bandwidth — large, but a straightforward matter of parallel async I/O and enough network. Second — the signature lesson — **the seen-set is the real problem**: to avoid re-crawling, you must remember every URL you've encountered, and at 30 billion URLs an *exact* set costs ~**1.5 TB** (too big to hold in RAM on a node), while a **bloom filter** holds the same set in ~**37.5 GB** — a ~**40× reduction** — at the cost of rare false positives, where a hash collision makes you wrongly think you've seen a page and skip it. That trade (occasionally missing a page versus needing terabytes of RAM) is overwhelmingly worth it, and it's *the* reason crawlers use bloom filters. Third, **the corpus is multi-petabyte**: ~**3 PB** of page content, which lives in a distributed blob store, not the crawler's memory. The capacity story: the crawler is hard because of the **frontier and the seen-set** — managing and deduplicating an enormous URL space — not because downloading a page is difficult.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core data entities: the crawl URL record, robots.txt cache entry, page content record, and per-host crawl state.
+The model centers on the **CrawlUrl** — a URL and everything the crawler needs to decide *whether*, *when*, and *with what priority* to fetch it. The most important ideas are that URLs are **deduped by a hash** (held in a bloom filter, not stored in full) and **partitioned by host** (so one worker owns a host and politeness is enforced locally), and that the fetched *content* is a separate record with its own fingerprint for content dedup.
+
+<EntityModel
+  name="CrawlUrl"
+  description="A URL the crawler knows about, plus the metadata that governs crawling it: a normalized form, a hash for dedup, the host (for politeness partitioning), a priority, and freshness timestamps. The set of CrawlUrls is the frontier's working set; the seen-set (a bloom filter over url_hash) records which have ever been discovered so links aren't re-processed."
+  fields={[
+    { name: "url", type: "string", notes: "normalized/canonical form (lowercased host, sorted params)" },
+    { name: "url_hash", type: "hash", notes: "fingerprint; the dedup key (bloom-filter membership)" },
+    { name: "host", type: "string", notes: "partition key — politeness is per host" },
+    { name: "priority", type: "int", notes: "crawl order in the frontier's front queues" },
+    { name: "status", type: "enum", notes: "pending | fetched | failed | disallowed" },
+    { name: "last_crawled", type: "datetime", notes: "for freshness / re-crawl decisions" },
+    { name: "next_crawl", type: "datetime", notes: "scheduled re-crawl time" },
+    { name: "depth", type: "int", notes: "hops from a seed — bounds traps" },
+  ]}
+  keys="A CrawlUrl is deduped by url_hash: the seen-set is a bloom filter over these hashes, so checking 'have I seen this?' is a few hash probes, not a lookup in a terabyte table. URLs are partitioned by host so that a single worker owns all of a host's URLs and can enforce one-request-at-a-time politeness locally (no cross-node coordination to avoid hammering a server). A Robots record per host caches the parsed robots.txt rules and Crawl-delay with a TTL. A Page/Content record holds the fetched bytes plus a content fingerprint — an exact content hash for identical duplicates and a simhash/minhash for near-duplicates — so the same page reached by many URLs isn't stored or re-indexed repeatedly. Per-host crawl state tracks the last fetch time to space requests. Source of truth: the frontier's CrawlUrls and the seen-set; content lives in a separate blob store."
+/>
+
+Three supporting entities complete the picture. The **Robots record** caches a host's parsed `robots.txt` (which paths are disallowed, the `Crawl-delay`) with a TTL, so the crawler checks politeness rules without re-fetching them every request. The **Page/Content record** is the fetched page plus its **fingerprint** — a content hash to catch exact duplicates and a **simhash/minhash** to catch near-duplicates — kept in the petabyte-scale content store. And the **per-host crawl state** (the last time this host was hit) is what the frontier consults to honor the crawl delay. The discipline: dedup URLs by hash in a bloom filter, partition by host so politeness is local, and fingerprint content so the same page isn't stored twice.
 
 <h2 id="api-design">API Design</h2>
 
-This section specifies the key APIs for seeding the crawler, pulling the next URL from the frontier, and retrieving crawled pages.
+A crawler isn't a request/response service, so its "API" is mostly **internal component contracts** plus a way to seed and inspect a crawl. Three interfaces capture it: submitting seeds, a fetcher pulling the next polite URL from the frontier, and inspecting a crawled page.
+
+<ApiContract
+  method="POST"
+  path="/seeds"
+  summary="Submit seed URLs to bootstrap (or extend) a crawl."
+  request={`POST /seeds
+{ "urls": ["https://example.com/", "https://news.example.org/"], "priority": "high" }`}
+  response={`HTTP/1.1 202 Accepted
+{ "accepted": 2, "deduped": 0, "frontier_size": 184203117 }`}
+  statusCodes={[
+    { code: "202", meaning: "Seeds normalized, deduped against the seen-set, and enqueued" },
+    { code: "400", meaning: "Malformed or non-crawlable URL" },
+  ]}
+  notes="Seeds are the roots of the traversal. Each is normalized and checked against the seen-set before being added to the frontier, so re-submitting a known URL is a no-op."
+/>
+
+<ApiContract
+  method="GET"
+  path="/frontier/next"
+  summary="Internal: a fetcher requests the next URL that is allowed to be crawled right now (politeness-aware)."
+  request={`GET /frontier/next?worker_id=fetcher-7&host_affinity=true`}
+  response={`HTTP/1.1 200 OK
+{ "url": "https://example.com/page", "url_hash": "9f2c...", "host": "example.com", "crawl_after": "2026-06-26T09:00:03Z" }`}
+  statusCodes={[
+    { code: "200", meaning: "Returns the next URL whose host is due (crawl delay elapsed)" },
+    { code: "204", meaning: "Nothing is politely crawlable yet — back off and retry" },
+  ]}
+  notes="The frontier only hands out a URL whose host isn't currently being crawled and whose crawl-delay has elapsed — politeness is enforced here, structurally, not by the fetcher sleeping. A 204 means every ready host is busy or throttled."
+/>
+
+<ApiContract
+  method="GET"
+  path="/pages/{url_hash}"
+  summary="Inspect a crawled page's metadata and status."
+  request={`GET /pages/9f2c...`}
+  response={`HTTP/1.1 200 OK
+{ "url": "https://example.com/page", "status": "fetched", "fetched_at": "2026-06-25T22:10:04Z",
+  "content_hash": "ab19...", "links_found": 73, "next_crawl": "2026-07-02T00:00:00Z" }`}
+  statusCodes={[
+    { code: "200", meaning: "Returns the page's crawl status, fingerprint, and re-crawl time" },
+    { code: "404", meaning: "URL not in the corpus" },
+  ]}
+  notes="Reads come from the crawl metadata; the content_hash ties to the stored page and is how content dedup is checked. next_crawl is set by the freshness scheduler."
+/>
+
+The whole surface is: seed the crawl, pull the next polite URL (internal, where politeness lives), and inspect a page. There's no high-QPS public endpoint — the "traffic" is the crawler talking to itself as it traverses the graph, which is why the interesting contracts are internal.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the high-level architecture showing seeds, the URL frontier, the fetcher fleet, DNS cache, robots cache, parser, seen-set, content store, and scheduler.
+The architecture is a **loop**: the frontier hands a URL to a fetcher, which downloads the page and stores it, a parser extracts links, dedup filters out ones already seen, and the survivors go back into the frontier — with a scheduler re-injecting pages for freshness.
+
+<WebCrawlerArchitecture />
+
+- **Seeds.** The starting URLs that bootstrap the traversal.
+- **URL Frontier.** The heart: a priority-and-politeness queue that decides what to crawl next, handing out only URLs whose host is currently free to be crawled. Sharded by host across the fleet.
+- **Fetcher.** Downloads pages — resolves DNS (cached), checks robots.txt, makes one polite request per host, handles timeouts and redirects. Massively concurrent async I/O.
+- **DNS resolver.** Resolves hostnames to IPs, **cached** aggressively because a lookup per host is otherwise a bottleneck.
+- **Robots cache.** Per-host `robots.txt` rules and crawl-delay, cached with a TTL.
+- **Parser.** Extracts and normalizes links from fetched pages.
+- **Seen-Set.** The bloom-filter dedup structure — checks whether a discovered URL has been encountered before, so the crawler doesn't loop forever.
+- **Content Store.** The petabyte-scale blob store of fetched pages, with content fingerprints for dedup.
+- **Scheduler.** Re-enqueues pages for re-crawl on a freshness cadence.
+
+The decisive boundary is **the frontier governs what to crawl and when (priority + politeness), and the seen-set governs whether to crawl it at all (dedup)** — everything else is the mechanical fetch-parse-store loop around them. The frontier's per-host structure makes politeness automatic; the bloom-filter seen-set makes dedup fit in memory; DNS and robots caches keep the per-fetch overhead low; and the scheduler closes the loop for freshness. Every section that follows elaborates one piece: how the frontier balances priority and politeness, how politeness/robots work, how dedup stays space-efficient, how DNS and fetching scale, how freshness is scheduled, and how the crawler survives the hostile web.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section walks through the four core flows: fetching a page, deduplication checks, politeness enforcement, and re-crawl scheduling.
+Four flows cover the system: the core fetch-and-extract loop, the dedup check on a discovered URL, the politeness check before hitting a host, and the freshness re-crawl. The first is the main loop; the others are the guards and the refresh that keep it correct and current.
+
+**Fetch a page.** The frontier hands the fetcher the next URL; the fetcher downloads the page, stores it in the content store, and the parser extracts its links — which then head toward the dedup check before any re-enter the frontier. This is the loop that traverses the web.
+
+<FetchPageSequence />
+
+**Dedup a discovered URL.** Each extracted link is checked against the **bloom-filter seen-set**. If it's already seen, it's dropped (the common case — most links are re-discoveries). If it's new, it's added to the set and enqueued in the frontier. This is what keeps the crawler from looping forever over the same pages.
+
+<DedupCheckSequence />
+
+**Apply politeness.** Before contacting a host, the fetcher loads its cached `robots.txt`, confirms the URL is allowed and the per-host crawl delay has elapsed, and only then makes a single request. Disallowed or too-soon URLs are skipped or deferred — the crawler stays a good citizen.
+
+<PolitenessSequence />
+
+**Re-crawl for freshness.** The scheduler reads a page's last-crawled time and its estimated change rate, decides it's due for a refresh, and re-enqueues it into the frontier — fast-changing pages (news) come back often, static ones rarely.
+
+<RecrawlSequence />
 
 <h2 id="url-frontier">The URL Frontier</h2>
 
-This section explains the Mercator-style URL frontier with front queues for priority and per-host back queues for politeness, ensuring one in-flight request per host at any time.
+The frontier is the centerpiece, and the key insight is that **a plain FIFO queue is wrong** on two counts: it has no notion of **priority** (it would crawl a trivial page before an important one just because it was discovered first) and no notion of **politeness** (it would hand a fetcher ten URLs for the same host back-to-back, hammering it). The classic solution is the **Mercator two-level design**. A set of **front queues**, one per priority level, handles prioritization: a URL is routed to a front queue by its importance (PageRank-ish signals, freshness, depth), and the selector pulls from higher-priority front queues more often. A set of **back queues**, each dedicated to a **single host**, handles politeness: every URL for a host goes to that host's back queue, and the rule is that only one URL per back queue (per host) is in flight at a time, with a **heap** tracking the earliest time each host may next be contacted (its last-fetch time plus its crawl delay). A fetcher asks the heap for the next host whose time has come, takes one URL from that host's back queue, and crawls it — so politeness is **structural**, a consequence of the queue layout, not a sleep statement scattered in the fetcher.
+
+At scale the frontier is **sharded across the fleet by host**: a given host's URLs (and thus its politeness state) live on one shard, so no cross-node coordination is needed to avoid two fetchers hitting the same server simultaneously. The frontier is also **huge and persistent** — hundreds of millions to billions of pending URLs — so it's backed by disk/distributed storage with in-memory front/back queue heads, not held entirely in RAM. The principle: the frontier reconciles two competing goals — crawl the *right* pages (priority) and crawl *nicely* (politeness) — with a two-level queue where front queues encode priority and per-host back queues encode politeness, sharded by host so the politeness invariant holds without coordination.
+
+<KnowledgeCheck
+  question="Why can't the URL frontier be a simple FIFO queue, and how does the Mercator two-level design solve it?"
+  options={[
+    "A FIFO is too slow; the fix is just a faster queue",
+    "A FIFO has no priority (it would crawl trivial pages before important ones) and no politeness (it would hand a fetcher many URLs for one host at once). The Mercator design uses front queues (one per priority level) to choose what's important, and per-host back queues with a time heap to enforce one in-flight request per host with a crawl delay — so politeness is structural. Sharding by host keeps the invariant without cross-node coordination",
+    "FIFOs can't store enough URLs; the fix is a database",
+    "Because URLs must be crawled in reverse order of discovery",
+  ]}
+  answer={1}
+  explanation="The frontier must satisfy two goals a FIFO ignores: crawl important/fresh pages first, and never overload a host. Mercator separates them — front queues encode priority (the selector favors higher-priority queues), while back queues each pinned to one host encode politeness, with a heap timing when each host may next be hit so only one request per host is in flight. Sharding the frontier by host means a host's politeness state lives on one node, so two fetchers never independently hammer the same server. Politeness becomes a property of the structure, not ad-hoc sleeps."
+/>
 
 <h2 id="politeness">Politeness & robots.txt</h2>
 
-This section covers how the crawler respects robots.txt rules, enforces per-host crawl delays, and identifies itself via a User-Agent header to remain a good citizen.
+Politeness is what separates a legitimate crawler from an attack, and it's non-negotiable. The first rule is **robots.txt**: before crawling a host, the crawler fetches `/robots.txt`, parses which paths are **disallowed** for its user-agent, and honors any **`Crawl-delay`** directive — then **caches** those rules per host (with a TTL) so it isn't re-fetched every request. URLs that robots disallows are never crawled. The second rule is **rate limiting per host**: at most one in-flight request to a host at a time and a minimum delay between requests (a default like a few seconds, or the host's stated crawl-delay), so a small site isn't overwhelmed by the crawler's firepower. The third is **identification**: a descriptive `User-Agent` with a contact URL, so site owners know who's crawling and can reach you — and so you can be a good web citizen.
+
+The important design point is that politeness is enforced **structurally**, by the frontier's per-host back queues (previous section), not by hopeful `sleep()` calls in the fetcher. Because all of a host's URLs live in one back queue on one shard, and the heap won't release that host until its delay has elapsed, the *only* way the system can issue a request to a host is the polite way — there's no path that bypasses it. This matters because a distributed fleet makes ad-hoc politeness fragile: two fetchers that independently decide "I'll wait two seconds" can still hit the same server at the same instant. Centralizing a host's scheduling in one place removes that race. The principle: obey robots.txt (cached), cap to one request per host with a crawl delay, identify yourself — and make all of that a property of where URLs live, so politeness can't be accidentally violated by a distributed fleet.
+
+<KnowledgeCheck
+  question="How does a distributed crawler guarantee it never hits the same host too fast, and why isn't a per-fetcher delay enough?"
+  options={[
+    "Each fetcher sleeps a few seconds between requests",
+    "All of a host's URLs are routed to one back queue on one shard, and a heap releases that host only after its crawl-delay (and robots rules) allow — so there's exactly one place that schedules a host and at most one in-flight request to it. A per-fetcher sleep isn't enough because two fetchers in a distributed fleet can independently decide to crawl the same host at the same instant",
+    "It crawls each host only once, ever",
+    "It relies on the host's server to rate-limit it",
+  ]}
+  answer={1}
+  explanation="Politeness has to be structural in a distributed crawler. By pinning every URL of a host to a single back queue on a single shard, with a heap that won't surface that host until its delay has elapsed, the system makes the polite path the only path — there's no way to issue a second concurrent request to the host. Per-fetcher sleeps fail because independent fetchers don't coordinate: each could wait its delay and still collide on the same server. Centralizing a host's scheduling (plus cached robots.txt rules and a clear User-Agent) is what makes politeness reliable at scale."
+/>
 
 <h2 id="dedup">URL & Content Deduplication</h2>
 
-This section explains URL deduplication via a bloom filter seen-set and content deduplication using exact content hashes plus simhash and minhash for near-duplicate detection.
+There are **two** dedup problems, and conflating them is a common mistake. The first is **URL dedup**: as you extract links, the overwhelming majority point to URLs you've already discovered, so you need a **seen-set** to answer "have I encountered this URL before?" — otherwise the crawl loops forever. At tens of billions of URLs, an exact set (a hash table of the URL strings or their hashes) is **terabytes** and won't fit in a node's memory, so the standard structure is a **bloom filter**: a bit array with several hash functions that answers set-membership in ~10 bits per URL (the capacity model's 37.5 GB versus 1.5 TB). The cost is **false positives** — occasionally the filter says "seen" for a URL you haven't actually crawled, so you skip a page you should have fetched — but never false negatives, so you never re-crawl something you've already done. For a crawler, rarely missing a page is a perfectly acceptable price for fitting the seen-set in memory.
+
+The second is **content dedup**: many distinct URLs serve the **same or nearly the same content** (mirror sites, print/mobile variants, session-id URLs, syndicated articles). Crawling and storing each separately wastes bandwidth, storage, and index space. **Exact** duplicates are caught with a **content hash** (e.g. an MD5/SHA of the normalized body): identical bytes, identical hash, store once. **Near**-duplicates — pages that differ only in a timestamp, an ad, or boilerplate — are caught with a **similarity fingerprint** like **simhash** or **minhash**, where similar documents produce similar fingerprints, so you can detect "this is 98% the same as a page I already have" and skip it. The principle: dedup URLs with a space-efficient bloom filter (accepting rare false positives to fit in memory) so the traversal terminates, and dedup content with exact hashes plus near-duplicate fingerprints so the same page isn't stored and processed many times.
+
+<KnowledgeCheck
+  question="Why is the URL seen-set a bloom filter, and how does it differ from content deduplication?"
+  options={[
+    "A bloom filter stores URLs compressed; content dedup is the same thing",
+    "URL dedup answers 'have I seen this URL?' for tens of billions of URLs — exact storage is terabytes, so a bloom filter holds it in ~40× less space, accepting rare false positives (skipping a page) but never false negatives. Content dedup is a separate problem: many URLs serve the same page, caught with an exact content hash, and near-duplicates with a similarity fingerprint like simhash/minhash",
+    "Both use the same hash table; the difference is just the key",
+    "A bloom filter guarantees no page is ever skipped",
+  ]}
+  answer={1}
+  explanation="The two dedup problems are distinct. URL dedup keeps the traversal finite by remembering every URL ever discovered; at web scale the exact set is terabytes, so a bloom filter trades a small false-positive rate (occasionally skipping an unseen page) for a ~40× space saving and fits in RAM — and crucially it has no false negatives, so nothing is re-crawled. Content dedup tackles a different waste: distinct URLs serving identical or near-identical pages, caught with exact content hashes and, for near-duplicates, similarity fingerprints (simhash/minhash) so the same content isn't stored or indexed repeatedly."
+/>
 
 <h2 id="dns-fetching">DNS Resolution & Fetching</h2>
 
-This section addresses DNS as a bottleneck, covering asynchronous resolution, DNS caching, and massively concurrent async I/O fetching across the crawler fleet.
+Two parts of the fetch path are surprisingly load-bearing. The first is **DNS**: every host you crawl must be resolved to an IP, and a naive crawler that does a synchronous DNS lookup per URL discovers that DNS — not bandwidth — is its bottleneck, because resolution can take tens to hundreds of milliseconds and public resolvers rate-limit. The fixes are to **cache** DNS results aggressively (hosts are hit many times, and records have TTLs) and to resolve **asynchronously**, often with a dedicated local resolver or a pre-resolved cache, so DNS never blocks the fetchers. The second is **fetching** itself: downloading at ~11,000+ pages/sec means **thousands of concurrent connections**, which only works with **non-blocking async I/O** (an event loop or async runtime), not a thread per request. The fetcher must also handle the messy realities of HTTP — **timeouts** (a slow server can't be allowed to tie up a worker), **redirects** (followed up to a limit), **content-type and size limits** (don't download a 2 GB file or a video when you want HTML), and compression.
+
+These details are where a crawler's real throughput is won or lost. A crawler is fundamentally an **I/O-bound** system: each fetcher spends almost all its time waiting on the network, so the design maximizes concurrency (many simultaneous in-flight requests per node) rather than CPU work. That's why the fetch fleet is sized by how many concurrent connections each node sustains, and why DNS caching matters so much — an un-cached DNS lookup injects a synchronous stall into an otherwise asynchronous pipeline. The principle: treat DNS as a first-class, cached, asynchronous concern rather than an afterthought, and build fetching as massively concurrent non-blocking I/O with strict timeouts and size limits, because the crawler's speed comes from overlapping thousands of slow network waits, not from doing any one fetch quickly.
+
+<KnowledgeCheck
+  question="Why is DNS a notorious bottleneck for crawlers, and what makes fetching scale?"
+  options={[
+    "DNS is encrypted, which is slow; fetching scales by using more CPU",
+    "A naive synchronous DNS lookup per URL stalls the pipeline — resolution is slow and resolvers rate-limit — so DNS is cached aggressively (hosts repeat, records have TTLs) and resolved asynchronously. Fetching scales because it's I/O-bound: thousands of concurrent connections via non-blocking async I/O, with timeouts and size limits, so the crawler overlaps many slow network waits rather than speeding up any single fetch",
+    "DNS must be re-resolved per request for correctness; fetching scales with threads",
+    "DNS is irrelevant; bandwidth is the only limit",
+  ]}
+  answer={1}
+  explanation="Because a crawler hits enormous numbers of hosts, a synchronous DNS lookup on each URL injects a slow, rate-limited stall into the pipeline and becomes the bottleneck before bandwidth does — so DNS is cached (hosts recur, records carry TTLs) and resolved asynchronously off the fetch path. Fetching scales by embracing that the workload is I/O-bound: each fetcher keeps thousands of connections in flight with non-blocking async I/O, plus timeouts so a slow server doesn't pin a worker and size/type limits so it doesn't download the wrong thing. Throughput comes from overlapping waits, not from any fetch being fast."
+/>
 
 <h2 id="freshness-scheduling">Freshness & Re-crawl Scheduling</h2>
 
-This section describes how the scheduler assigns re-crawl cadences based on a page's observed change rate and importance, ensuring fast-changing pages are revisited more often.
+A one-time crawl is stale the moment it finishes — the web changes constantly — so a real crawler **re-crawls**, and the question is *how often* to revisit each page. You can't crawl everything equally frequently (that's a fixed budget spread infinitely thin), so re-crawl frequency is **tuned per page to its change rate and importance**. A news homepage changes minute-to-minute and is important, so it's re-crawled very often; an archived document hasn't changed in years and is re-crawled rarely. The crawler **estimates each page's change rate** from history — comparing successive fetches (did the content hash change?) to learn how volatile a page is — and schedules `next_crawl` accordingly, often weighting by importance so high-value pages get more freshness budget. This is exactly a time-triggered re-enqueue, the same shape as the **Distributed Job Scheduler**: a scheduler holds pages by their `next_crawl` time and re-injects them into the frontier when due.
+
+The trade-off is **freshness versus coverage** under a fixed crawl budget: every re-crawl of a known page is a fetch you're *not* spending discovering a new one. Crawl too aggressively for freshness and you stop growing the corpus; crawl too little and your index goes stale. Production crawlers tune this balance continuously, and it's a great thing to name in an interview — the budget is finite, so freshness and coverage are in direct competition, and the scheduler's job is to spend each fetch where it has the most value (a likely-changed important page, or a promising new one). The principle: re-crawl on a per-page cadence learned from each page's observed change rate and weighted by importance, implemented as a time-triggered re-enqueue into the frontier, while consciously balancing the finite budget between refreshing known pages and discovering new ones.
+
+<KnowledgeCheck
+  question="How does a crawler decide how often to re-crawl a page, and what's the core tension?"
+  options={[
+    "It re-crawls every page on a fixed daily schedule",
+    "Re-crawl frequency is tuned per page to its estimated change rate (learned by comparing successive fetches) and importance — fast-changing important pages often, static ones rarely — implemented as a time-triggered re-enqueue into the frontier. The core tension is freshness vs coverage under a fixed budget: every re-crawl of a known page is a fetch not spent discovering a new one",
+    "It re-crawls only when a user requests a page",
+    "It re-crawls pages in the order they were first discovered",
+  ]}
+  answer={1}
+  explanation="Uniform re-crawling wastes the budget — most pages rarely change, a few change constantly. So the crawler estimates each page's volatility from its history (did the content hash change between fetches?) and weights by importance, setting a per-page next-crawl time and re-injecting due pages into the frontier, much like a distributed job scheduler. The unavoidable tension is that the crawl budget is finite: spending a fetch refreshing a known page is a fetch not spent finding a new one, so the scheduler continuously balances freshness against coverage by directing each fetch to where it adds the most value."
+/>
 
 <h2 id="traps-robustness">Crawler Traps & Robustness</h2>
 
-This section covers defenses against crawler traps, including depth limits, URL-pattern caps, per-host budget limits, and handling dynamic or infinitely generating pages.
+The web is full of hostile and degenerate structures, and a naive crawler walks straight into them. **Crawler traps** are URL spaces that are effectively infinite: a calendar with "next month" links forever, faceted-search or filter combinations that explode into billions of URLs, session-ids or tracking parameters that mint a "new" URL on every visit, or deliberately generated link mazes. A crawler that follows links blindly will pour its entire budget into one trap and never escape. The defenses are **bounds**: a **maximum crawl depth** (hops from a seed), **per-host URL budgets** (don't take more than N pages from one site), **URL-pattern detection** (spot and cap parameter-explosion patterns; strip known tracking/session params during normalization), and limiting the number of URLs queued per host. Many traps are also defused for free by **URL normalization** (canonicalizing so `?utm_source=...` variants collapse to one URL) and by content dedup (a trap often serves near-identical pages, which the fingerprint catches).
+
+Beyond traps, **robustness** means surviving the ordinary hostility of real pages: **malformed HTML** (parse defensively, never crash a fetcher on bad markup), **huge pages** (size limits so a fetcher isn't tarpitted by a multi-gigabyte response), **soft-404s** (pages that return 200 but are really "not found" — detected by content patterns), slow servers (timeouts), and transient failures (retry with backoff, then give up and mark failed). The principle: assume the web is adversarial — bound the traversal with depth limits, per-host budgets, and pattern caps so no trap can consume the crawl; normalize URLs and dedup content to collapse degenerate spaces; and parse and fetch defensively so no single bad page can take down a fetcher. A crawler's robustness is mostly the discipline of never trusting what's on the other end of a link.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section discusses how the crawler scales horizontally across fetcher nodes, partitions work by host, and evolves from a single-machine to a distributed fleet.
+Don't build the globally-distributed, sharded crawler on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single-threaded crawler", "A few thousand pages, one site", "I/O-bound and serial — hopelessly slow; no politeness structure"],
+    ["Multi-threaded single box", "Millions of pages", "Concurrency helps, but one box caps throughput and the seen-set RAM"],
+    ["Distributed fetchers + sharded frontier + bloom-filter seen-set", "Billions of pages; politeness at scale", "Run a sharded frontier; partition by host; operate a distributed seen-set and content store"],
+    ["Globally distributed, politeness-partitioned, tiered storage", "Continuous web-scale crawling", "Cross-region coordination; geo-distributed fetching; tiered/cold storage of the corpus"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the wall you're hitting. A **single-threaded** crawler is I/O-bound and serial — fine for a demo, useless at scale. **Multi-threading on one box** overlaps the network waits but caps out on a single machine's connections and can't hold a multi-terabyte seen-set. The center of gravity for a real crawler is **distributed fetchers with a host-sharded frontier and a bloom-filter seen-set**, plus a distributed content store — this is where politeness holds across the fleet (host-sharding), dedup fits in memory (bloom filter), and throughput scales horizontally. Only continuous web-scale operations need **global distribution with tiered storage**, which pays for geographic reach and a petabyte corpus with cross-region coordination and storage tiering. Most crawlers are well-served by "distributed fetchers, host-sharded priority/politeness frontier, bloom-filter seen-set, distributed content store."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section analyzes failure modes including fetcher crashes, frontier data loss, DNS failures, and storage unavailability, and describes the recovery strategies for each.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. A crawler's guiding rules: **never violate politeness**, **never lose the seen-set's guarantee** (don't re-crawl forever), and **never let one bad page or trap consume the crawl**.
+
+<FailureMatrix
+  rows={[
+    { failure: "Fetcher node dies mid-crawl", impact: "In-flight URLs interrupted", detection: "Heartbeat / lease expiry", mitigation: "URLs are leased from the frontier; an expired lease returns them to be re-handed out", recovery: "Another fetcher picks up the returned URLs; at-least-once crawl" },
+    { failure: "Frontier / seen-set shard lost", impact: "Part of the URL space stalls", detection: "Shard health checks", mitigation: "Replicate shards; persist the frontier; the bloom filter is rebuildable from the crawl log", recovery: "Replica takes over; seen-set restored from snapshot/log" },
+    { failure: "Politeness violation risk", impact: "Could overload a host", detection: "Per-host request-rate monitor", mitigation: "Per-host back queues + crawl delay make over-fast requests structurally impossible", recovery: "Throttle/back off; host-sharding prevents recurrence" },
+    { failure: "Crawler trap (infinite URLs)", impact: "Budget drained into one space", detection: "Per-host URL count / depth spike", mitigation: "Depth limits, per-host budgets, URL-pattern caps, normalization, content dedup", recovery: "Cap trips; trap is bounded; budget redirected" },
+    { failure: "DNS outage / slowness", impact: "Can't resolve hosts", detection: "Resolution error rate / latency", mitigation: "DNS cache serves known hosts; async resolve; retry", recovery: "Resolver recovers; cache refills" },
+    { failure: "Poison / huge / malformed page", impact: "Could hang or crash a fetcher", detection: "Timeout; size threshold; parse error", mitigation: "Timeouts, size/content-type limits, defensive parsing", recovery: "Page marked failed; fetcher continues unharmed" },
+    { failure: "Content store outage", impact: "Can't persist fetched pages", detection: "Write error rate", mitigation: "Buffer/queue fetched content; retry; the frontier holds the URL until stored", recovery: "Store recovers; buffered pages flush" },
+  ]}
+/>
+
+The theme: **lease the work, replicate the state, and bound everything.** A dead fetcher is harmless because URLs are *leased* from the frontier, so an expired lease just returns them to be re-handed out (an at-least-once crawl, where the bloom filter and content dedup absorb the occasional repeat). The frontier and seen-set are **replicated and rebuildable** — the bloom filter can be reconstructed from the crawl log if a shard is lost. Politeness can't be violated because it's structural (per-host back queues), and traps can't drain the crawl because depth, budget, and pattern caps **bound** every host. Bad pages are contained by timeouts and size limits, and content-store hiccups are ridden out by buffering while the frontier holds the URL. Because the frontier is persistent and the seen-set is rebuildable, recovery is almost always "re-lease the URLs and restore the set" — and the crawler's three cardinal sins (impoliteness, infinite re-crawling, trap capture) are each designed out structurally rather than patched reactively.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares key design decisions such as exact vs. approximate URL dedup, push vs. pull frontier models, and centralized vs. distributed scheduling.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Traverse the web from seeds with a host-sharded URL frontier that balances priority (front queues) and politeness (per-host back queues with a crawl-delay heap, so only one request per host is in flight); dedup URLs with a bloom-filter seen-set (accepting rare false positives to fit tens of billions of URLs in memory) and content with exact hashes plus simhash near-duplicate fingerprints; fetch with cached async DNS and massively concurrent non-blocking I/O under timeouts and size limits; re-crawl on a per-page freshness schedule; and bound traps with depth limits, per-host budgets, and URL-pattern caps."
+  rationale="The hard parts are the frontier and dedup, not fetching. A two-level frontier makes politeness structural (impossible to violate) while still prioritizing important pages, and host-sharding keeps the politeness invariant without coordination. The seen-set must fit in memory at web scale, which only a probabilistic structure achieves, so a bloom filter's rare false positives are a worthwhile trade. DNS caching and async I/O turn fetching into an overlap-the-waits throughput problem. Freshness scheduling spends a finite budget where it's most valuable, and trap bounding keeps any single hostile space from consuming the crawl."
+  alternatives="A FIFO frontier — simple but no priority and no politeness (it would hammer hosts and crawl junk first); an exact seen-set (hash table) — precise but terabytes, won't fit in memory; per-fetcher politeness sleeps — fragile in a distributed fleet (independent fetchers collide on a host); synchronous DNS per URL — makes DNS the bottleneck; crawl everything at one frequency — wastes the budget versus change-rate-tuned re-crawling; unbounded link-following — guarantees capture by the first calendar/parameter trap; storing every URL's content — wasteful versus content dedup."
+  revisitWhen="JavaScript-heavy sites require headless rendering (a far more expensive fetch tier), the crawl must be globally distributed for locality, the corpus needs tiered/cold storage as it grows to many petabytes, or focused/topical crawling changes prioritization from breadth to a relevance model."
+/>
+
+Four axes capture the real tension:
+
+- **Priority crawling vs plain BFS.** BFS is simple but crawls by discovery order; a priority frontier crawls important/fresh pages first, at the cost of computing priorities and a more complex frontier. At scale, priority wins.
+- **Exact seen-set vs bloom filter.** Exact never skips a page but costs terabytes; a bloom filter fits in memory with rare false positives (skipped pages). At web scale, the bloom filter is the only option.
+- **Politeness vs throughput.** Strict per-host limits cap how fast you can crawl any one site, reducing raw throughput, but they're mandatory — impoliteness gets you blocked and is unethical. You scale throughput by crawling *many* hosts in parallel, not any one host faster.
+- **Freshness vs coverage.** A finite budget must split between re-crawling known pages (freshness) and discovering new ones (coverage); the right balance depends on the crawl's purpose and is tuned continuously.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section gives a 60-second interview answer summarizing the end-to-end design: frontier, politeness, bloom-filter dedup, async fetching, and freshness scheduling.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A web crawler looks like BFS over the web graph, but the queue is the whole problem. I start from seed URLs and the heart of the system is the URL frontier, which isn't a FIFO — it's a two-level structure: front queues order by priority so important and fresh pages go first, and per-host back queues enforce politeness, with a heap that releases a host only after its crawl-delay, so at most one request per host is in flight. I shard the frontier by host, so politeness holds across the fleet without coordination — it's structural, not a sleep in the fetcher. Fetchers download pages with cached, async DNS and thousands of concurrent non-blocking connections, because crawling is I/O-bound; they obey cached robots.txt, follow timeouts and size limits, and store pages in a petabyte content store. Every link they extract is checked against the seen-set, which has to fit in memory at tens of billions of URLs, so it's a bloom filter — about forty times smaller than exact storage, at the cost of rarely skipping a page, never re-crawling one. I also dedup content with hashes and simhash near-duplicate fingerprints, since many URLs serve the same page. A scheduler re-crawls pages on a freshness cadence tuned to how often each changes, trading freshness against discovering new pages under a fixed budget. And because the web is hostile, I bound traps with depth limits, per-host budgets, and URL-pattern caps. The three things I never allow: overloading a host, re-crawling forever, and letting one trap eat the whole crawl."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why isn't the frontier a FIFO? How do you enforce politeness across a distributed fleet? Why a bloom filter for the seen-set, and what's the cost? URL dedup vs content dedup? Why is DNS a bottleneck? How do you decide re-crawl frequency? How do you avoid crawler traps?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section contains knowledge check questions and a FAQ covering the most common web crawler interview questions and gotchas.
+<KnowledgeCheck
+  question="A fetcher node crashes while it has several URLs checked out from the frontier. How is that handled without losing or duplicating work harmfully?"
+  options={[
+    "The URLs are lost permanently with the dead node",
+    "URLs are leased from the frontier, so when the crash makes the lease expire they return to be re-handed to another fetcher — an at-least-once crawl. The bloom-filter seen-set and content dedup absorb the rare repeat, so a URL might occasionally be fetched twice but the corpus isn't corrupted and nothing is permanently lost",
+    "Every URL is crawled on two nodes at once to be safe",
+    "The whole crawl restarts from the seeds",
+  ]}
+  answer={1}
+  explanation="The frontier hands out URLs as time-bounded leases rather than fire-and-forget, so a crashed fetcher's URLs simply become re-claimable when its lease lapses and another fetcher picks them up — the crawl is at-least-once. Occasional duplication is harmless because the seen-set and content fingerprints catch repeats, and because the frontier is persistent the work isn't lost. This is the same leasing pattern a distributed job scheduler uses to survive worker crashes."
+/>
+
+<KnowledgeCheck
+  question="Why does crawling scale by crawling many hosts in parallel rather than crawling individual hosts faster?"
+  options={[
+    "Because servers are all the same speed",
+    "Politeness caps how fast you may hit any single host (one request at a time, with a crawl delay), so per-host throughput is deliberately limited — you can't speed that up without becoming abusive. Total throughput therefore comes from crawling a huge number of different hosts concurrently, which is also why the frontier shards by host and fetching is massively concurrent async I/O",
+    "Because DNS only allows one host at a time",
+    "Because the bloom filter only works on parallel hosts",
+  ]}
+  answer={1}
+  explanation="Politeness is the binding constraint per host: at most one in-flight request and a mandatory delay, which intentionally limits how fast any one site is crawled. So you can't scale by hammering a host harder — that's exactly what you must not do. Instead you exploit the breadth of the web, crawling tens of thousands of hosts at once, each politely, which is why the frontier is sharded by host and each fetcher keeps thousands of connections to *different* hosts in flight. Throughput is horizontal across hosts, not vertical within one."
+/>
+
+<Faq
+  items={[
+    { question: "What is a web crawler?", answer: "A system that systematically downloads the web: starting from seed URLs, it fetches pages, extracts their links, and follows them to traverse the web graph, building a corpus of pages for a search index, archive, or dataset. Googlebot, Bingbot, and the Internet Archive's crawler are examples. The interesting engineering is not downloading a page but managing — at web scale, politely, without repetition — which URLs to crawl and when." },
+    { question: "Why isn't the URL frontier just a queue?", answer: "A plain FIFO has no priority (it would crawl trivial pages before important ones, in discovery order) and no politeness (it would hand a fetcher many URLs for the same host at once, overloading it). The Mercator design uses front queues to order by priority and per-host back queues, with a time heap, to ensure only one request per host is in flight with a crawl delay — making politeness a structural property of the frontier rather than an afterthought." },
+    { question: "What does politeness mean for a crawler?", answer: "Being a good web citizen: obey each site's robots.txt (which paths are disallowed, the Crawl-delay), keep at most one in-flight request per host with a minimum delay between them so you don't overload a server, and identify yourself with a descriptive User-Agent and contact info. A crawler that ignores this is indistinguishable from a denial-of-service attack, gets blocked, and behaves unethically — so politeness is built into the frontier's structure." },
+    { question: "Why is the seen-set a bloom filter instead of a hash table?", answer: "To avoid re-crawling, the crawler must remember every URL it has ever discovered — tens of billions of them. An exact set (hash table) costs terabytes and won't fit in a node's memory. A bloom filter stores the same membership in roughly 10 bits per URL (about 40× smaller), at the cost of rare false positives — occasionally reporting a URL as 'seen' when it isn't, so a page is skipped — but never false negatives, so nothing is re-crawled. That trade is well worth it." },
+    { question: "What's the difference between URL dedup and content dedup?", answer: "URL dedup answers 'have I already discovered this URL?' using the bloom-filter seen-set, so the traversal terminates. Content dedup tackles a different waste: many different URLs serve the same or nearly the same page (mirrors, print/mobile variants, session-id URLs). Exact duplicates are caught by a content hash; near-duplicates by a similarity fingerprint like simhash or minhash, so the same content isn't stored or indexed many times." },
+    { question: "Why is DNS a bottleneck, and how is it handled?", answer: "Every host must be resolved to an IP, and a synchronous DNS lookup per URL is slow (tens to hundreds of ms) and rate-limited by resolvers, so it stalls the pipeline before bandwidth does. Crawlers cache DNS results aggressively (hosts recur and records carry TTLs) and resolve asynchronously, often with a dedicated resolver, so DNS never blocks the fetchers. It's a classic surprise bottleneck in crawler design." },
+    { question: "How does a crawler fetch pages fast?", answer: "Crawling is I/O-bound — each fetch spends almost all its time waiting on the network — so throughput comes from concurrency, not CPU. Fetchers use non-blocking async I/O to keep thousands of connections in flight at once, to many different hosts (politeness limits each single host). They enforce timeouts so a slow server can't tie up a worker, follow redirects up to a limit, and cap content size and type so they don't download a huge file or non-HTML content." },
+    { question: "How does a crawler decide what to re-crawl, and how often?", answer: "The web changes, but you can't crawl everything equally often under a finite budget, so re-crawl frequency is tuned per page to its estimated change rate (learned by comparing successive fetches — did the content hash change?) and its importance. A news homepage is re-crawled very often; an archived document rarely. It's implemented as a time-triggered re-enqueue into the frontier, like a job scheduler, and balances freshness against discovering new pages." },
+    { question: "What are crawler traps and how do you avoid them?", answer: "Traps are effectively infinite URL spaces — calendars with endless 'next month' links, faceted-search or filter combinations, session-id/tracking parameters that mint a new URL every visit, or generated link mazes. A naive crawler pours its whole budget into one and never escapes. Defenses are bounds: maximum crawl depth, per-host URL budgets, URL-pattern caps, and URL normalization (collapsing tracking-parameter variants), plus content dedup, which catches the near-identical pages traps often serve." },
+    { question: "How is politeness enforced across a distributed fleet of fetchers?", answer: "Structurally, by sharding the frontier by host: all of a host's URLs live in one back queue on one shard, and a heap won't release that host until its crawl-delay has elapsed, so there is exactly one place scheduling each host and at most one in-flight request to it. Per-fetcher sleeps don't work because independent fetchers can decide to crawl the same host at the same instant; centralizing a host's scheduling removes that race." },
+    { question: "How big is the seen-set and the corpus, roughly?", answer: "For a 30-billion-page crawl, an exact seen-set of URLs is about 1.5 TB, while a bloom-filter version is about 37.5 GB — which is why the bloom filter is essential. The downloaded content itself is multi-petabyte (around 3 PB at 100 KB per page), stored in a distributed blob store, not in the crawler's memory. Fetching that in a month needs roughly 11.6k pages/sec, ~116 fetcher nodes, and ~9 Gbps of bandwidth." },
+    { question: "What happens to a crawler when a fetcher crashes?", answer: "URLs are leased from the frontier rather than removed outright, so when a fetcher dies and its lease expires, its in-flight URLs return to the frontier and another fetcher re-claims them — an at-least-once crawl. A URL might occasionally be fetched twice, but the bloom-filter seen-set and content dedup make repeats harmless, and because the frontier is persistent no work is lost. It's the same leasing pattern used by distributed job schedulers." },
+    { question: "Does a crawler run JavaScript?", answer: "Basic crawlers fetch raw HTML, which is far cheaper and covers most of the link graph. Pages that build their content with JavaScript require rendering them in a headless browser, which is much more expensive (CPU and memory per page) and is usually a separate, smaller tier reserved for sites that need it. Whether to render JS is a scope decision driven by how much of the target corpus is client-rendered." },
+  ]}
+/>
