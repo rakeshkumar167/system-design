@@ -383,6 +383,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "api-gateway": {
+    slug: "api-gateway",
+    title: "Design an API Gateway",
+    description:
+      "An interview-grade walkthrough of an API gateway: the single edge that fronts a fleet of microservices — request routing and service discovery, offloaded authentication and authorization, rate limiting and quotas, the control-plane/data-plane split for config distribution, resilience (timeouts, retries, circuit breaking) and observability, scaling, and failure modes.",
+    difficulty: "Intermediate",
+    readingMinutes: 34,
+    concepts: ["Routing", "AuthN/AuthZ", "Rate limiting", "Observability"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "request-lifecycle", label: "Request Lifecycle & the Filter Chain", depth: "advanced" },
+      { id: "routing-discovery", label: "Routing & Service Discovery", depth: "advanced" },
+      { id: "auth", label: "Authentication & Authorization", depth: "advanced" },
+      { id: "rate-limiting", label: "Rate Limiting & Quotas", depth: "advanced" },
+      { id: "control-data-plane", label: "Control Plane & Data Plane", depth: "advanced" },
+      { id: "resilience-observability", label: "Resilience & Observability", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

@@ -16,6 +16,7 @@ import PaymentSystemContent from "@/content/tutorials/payment-system.mdx";
 import DistributedLoggingContent from "@/content/tutorials/distributed-logging.mdx";
 import DistributedJobSchedulerContent from "@/content/tutorials/distributed-job-scheduler.mdx";
 import MapsNavigationContent from "@/content/tutorials/maps-navigation.mdx";
+import ApiGatewayContent from "@/content/tutorials/api-gateway.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -32,6 +33,7 @@ const content: Record<string, ComponentType> = {
   "distributed-logging": DistributedLoggingContent,
   "distributed-job-scheduler": DistributedJobSchedulerContent,
   "maps-navigation": MapsNavigationContent,
+  "api-gateway": ApiGatewayContent,
 };
 
 export function generateStaticParams() {

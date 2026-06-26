@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section frames the API Gateway as an interview problem, setting scope and clarifying what interviewers expect.
+
+<h2 id="requirements">Requirements</h2>
+
+This section covers functional and non-functional requirements for an API Gateway, including routing, authentication, rate limiting, and observability.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the capacity model for an API Gateway handling aggregate traffic across all fronted services.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section describes the core entities in an API Gateway: routes, consumers, API keys, rate-limit counters, and service-registry entries.
+
+<h2 id="api-design">API Design</h2>
+
+This section covers the data-plane proxy API and the control-plane admin API for managing routes and consumers.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the high-level architecture of an API Gateway, showing the data-plane fleet, control plane, auth service, rate-limit store, service registry, and telemetry sink.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section walks through the key request flows: the happy-path proxy, an auth rejection at the edge, a config push from the control plane, and a circuit-breaker trip.
+
+<h2 id="request-lifecycle">Request Lifecycle & the Filter Chain</h2>
+
+This section details the ordered filter chain each request traverses: authN, authZ, rate-limit check, request transformation, route matching, upstream forwarding, and response relay.
+
+<h2 id="routing-discovery">Routing & Service Discovery</h2>
+
+This section explains how the gateway matches requests to routes and discovers healthy upstream instances via a service registry.
+
+<h2 id="auth">Authentication & Authorization</h2>
+
+This section covers offloaded edge authentication using local JWT verification and cached token introspection, followed by scope- and role-based authorization.
+
+<h2 id="rate-limiting">Rate Limiting & Quotas</h2>
+
+This section describes distributed rate limiting with local pre-checks and shared counters, and cross-references the Rate Limiter tutorial for algorithm details.
+
+<h2 id="control-data-plane">Control Plane & Data Plane</h2>
+
+This section explains the control-plane and data-plane split: the control plane owns routes, keys, and policies and pushes versioned config to the stateless data-plane proxies, which hot-reload it without dropping connections.
+
+<h2 id="resilience-observability">Resilience & Observability</h2>
+
+This section covers timeouts, budgeted retries, circuit breaking, and the gateway as the central home for RED metrics, structured logs, and distributed tracing with an edge-injected correlation ID.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section discusses how the stateless data plane scales horizontally and how the system evolves from a simple reverse proxy to a full-featured edge platform.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section catalogs the failure modes of an API Gateway and the mitigations for each, including fail-open versus fail-closed decisions for auth and rate limiting.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares design trade-offs and alternatives, including self-hosted versus managed gateways, sidecar proxies, and service-mesh overlaps.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section provides a concise 60-second interview answer covering the key design decisions for an API Gateway.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section contains knowledge-check questions and a FAQ covering the most common interview follow-ups on API Gateway design.

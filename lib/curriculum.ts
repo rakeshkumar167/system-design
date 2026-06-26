@@ -62,7 +62,7 @@ export const problems: readonly Problem[] = [
       "Route, authenticate, rate-limit, and observe traffic to many backend services from one edge.",
     difficulty: "Intermediate",
     concepts: ["Routing", "AuthN/AuthZ", "Rate limiting", "Observability"],
-    status: "coming-soon",
+    status: "available",
     sequence: 6,
   },
   {
