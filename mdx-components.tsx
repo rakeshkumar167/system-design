@@ -22,6 +22,7 @@ import { PaymentSystemCapacity } from "@/components/learning/payment-system-capa
 import { DistributedLoggingCapacity } from "@/components/learning/distributed-logging-capacity";
 import { DistributedJobSchedulerCapacity } from "@/components/learning/distributed-job-scheduler-capacity";
 import { MapsNavigationCapacity } from "@/components/learning/maps-navigation-capacity";
+import { ApiGatewayCapacity } from "@/components/learning/api-gateway-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -145,6 +146,7 @@ const teachingComponents = {
   DistributedLoggingCapacity,
   DistributedJobSchedulerCapacity,
   MapsNavigationCapacity,
+  ApiGatewayCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
