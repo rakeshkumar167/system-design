@@ -115,6 +115,13 @@ import {
   TrafficUpdateSequence,
   TileFetchSequence,
 } from "@/components/diagrams/maps-navigation-flows";
+import { ApiGatewayArchitecture } from "@/components/diagrams/api-gateway-architecture";
+import {
+  ProxyRequestSequence,
+  AuthRejectSequence,
+  ConfigPushSequence,
+  CircuitBreakSequence,
+} from "@/components/diagrams/api-gateway-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -213,6 +220,11 @@ const teachingComponents = {
   MapMatchSequence,
   TrafficUpdateSequence,
   TileFetchSequence,
+  ApiGatewayArchitecture,
+  ProxyRequestSequence,
+  AuthRejectSequence,
+  ConfigPushSequence,
+  CircuitBreakSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

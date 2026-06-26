@@ -387,3 +387,34 @@ describe("maps and navigation flow sequences", () => {
     expect(screen.getByRole("img", { name: /tile/i })).toBeInTheDocument();
   });
 });
+
+import { ApiGatewayArchitecture } from "@/components/diagrams/api-gateway-architecture";
+import {
+  ProxyRequestSequence,
+  AuthRejectSequence,
+  ConfigPushSequence,
+  CircuitBreakSequence,
+} from "@/components/diagrams/api-gateway-flows";
+
+describe("ApiGatewayArchitecture", () => {
+  it("exposes the api gateway architecture to non-visual readers", () => {
+    render(<ApiGatewayArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /api gateway architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/cross-cutting/i)).toBeInTheDocument();
+  });
+});
+
+describe("api gateway flow sequences", () => {
+  it("renders the proxy, auth-reject, config, and circuit sequences", () => {
+    render(<ProxyRequestSequence />);
+    expect(screen.getByRole("img", { name: /proxy/i })).toBeInTheDocument();
+    render(<AuthRejectSequence />);
+    expect(screen.getByRole("img", { name: /reject/i })).toBeInTheDocument();
+    render(<ConfigPushSequence />);
+    expect(screen.getByRole("img", { name: /config/i })).toBeInTheDocument();
+    render(<CircuitBreakSequence />);
+    expect(screen.getByRole("img", { name: /circuit/i })).toBeInTheDocument();
+  });
+});
