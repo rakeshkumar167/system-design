@@ -1,71 +1,374 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section sets the context for how to approach the search autocomplete problem in a system design interview.
+Search autocomplete — *typeahead* — is the dropdown of suggested queries that appears the instant you start typing into a search box. Type "ne" and it offers "netflix", "news", "nearby restaurants"; each additional keystroke refines the list. Google, Bing, Amazon, YouTube, and every app with a search bar runs this system. From the outside it's a textbook prefix lookup: hold all known queries in a **trie** (a prefix tree), walk down the characters the user typed, and return everything underneath. That framing produces something that works on a dictionary of a thousand words and then falls apart in two ways at real scale — it returns *millions* of completions for a one-letter prefix with no idea which ten matter, and it tries to compute that answer fresh on every keystroke of a million-QPS firehose.
+
+The hard part is **ranking the suggestions and serving them instantly, per keystroke, at enormous read volume**. Three things dominate, and prefix matching is the easy one. First, **ranking**: "a" prefixes millions of queries, you have ~10 slots and a sub-100 ms budget, so the design isn't "find the matches" but "have the **top-k best completions already computed** at every node of the trie" — a query becomes an O(prefix-length) walk plus reading a tiny cached list, never a scan of the subtree. Second, **read amplification**: because the suggestions update on *every character typed*, autocomplete QPS is a large multiple of the actual search QPS — over a million requests per second — so nothing can be computed per query; the ranked index must live **in memory, replicated, and cached**. Third, **building and refreshing that ranked index**: the popularity scores come from aggregating **billions of past search-query logs** in a batch pipeline that rebuilds the trie periodically, plus a **real-time layer** that injects **trending** queries the hours-old batch misses — and a **safety** filter that keeps harmful completions out. The reframe to lead with: *it looks like a trie walk, but the trie is the easy part — the design is precomputed top-k at every node (ranking, not matching), a read-amplified in-memory serving tier absorbing a million-plus QPS, a query-log aggregation pipeline that builds the ranked index, a trending layer for freshness, and safety filtering. Matching a prefix is trivial; choosing and serving the best ten completions instantly, per keystroke, at scale, is the design.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What are we completing — full past search queries, or product names / entities? It shapes where the candidate phrases come from.
+- How many suggestions, and how fast must they appear? (Usually ~5–10, within a few tens of milliseconds so the dropdown keeps up with typing.)
+- How fresh must suggestions be — is same-day popularity fine, or must breaking/trending queries show within minutes? Freshness drives whether you need a real-time layer.
+- Personalized or global? Personalization adds per-user signals on top of global popularity.
+- Do we need typo tolerance, and multiple languages/regions? Both widen the matching problem.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "matching is easy, ranking + read-amplification is the problem" reframe · **5 min** requirements (latency, read scale, freshness, safety) · **5 min** capacity (the read amplification: ~1M+ QPS, and the index fits in RAM) · **5 min** entity model (Suggestion / trie node) and the API · **8 min** the trie + precomputed top-k — the centerpiece · **8 min** ranking, the query-log pipeline, and in-memory serving · **5 min** freshness/trending, typo tolerance, failure modes, wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for precomputed top-k, an in-memory replicated tier, and a log-aggregation pipeline, not whether you can describe a trie.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the trie with precomputed top-k, ranking/scoring (popularity + recency, with safety filtering), the query-log aggregation pipeline that builds the ranked index, the in-memory sharded-and-replicated serving tier and its latency budget, freshness / trending, and typo tolerance + personalization — plus scaling, failure modes, and trade-offs. **Out of scope:** the full **search engine** and result ranking that autocomplete sits in front of — a separate system (the **Web Crawler** builds that corpus; this only completes the *query*) — the ML models behind relevance and personalization beyond the signals they consume, voice/handwriting input, and spelling-correction linguistics beyond edit-distance prefix expansion. Name them so the interviewer sees the boundary, then set them aside. This problem reuses the caching and aggregation-pipeline intuition from earlier tutorials — the query log resembles the **Distributed Logging** firehose and the batch index rebuild echoes the **Web Crawler**'s corpus pipeline — but centers them on *serving ranked prefix suggestions instantly*.
 
 <h2 id="requirements">Requirements</h2>
 
-This section covers the functional and non-functional requirements for a production-grade search autocomplete system.
+Separate what the system must *do* from how *well* it must do it. The functional list is short; the difficulty is almost entirely in the non-functional column — latency, read scale, freshness, and safety — which is what turns a prefix lookup into a distributed system.
+
+<RequirementsTable
+  functional={[
+    "Return the top-k completions for a typed prefix",
+    "Rank suggestions by popularity and recency",
+    "Refresh suggestions as the index is rebuilt",
+    "Surface trending queries quickly",
+    "Filter unsafe or offensive suggestions",
+    "Tolerate typos in the prefix",
+  ]}
+  nonFunctional={[
+    { goal: "Latency", target: "suggestions feel instant (tens of ms)" },
+    { goal: "Scale", target: "~1M+ QPS, read-dominated" },
+    { goal: "Freshness", target: "trending queries appear in minutes" },
+    { goal: "Availability", target: "degrade gracefully — never block typing" },
+    { goal: "Relevance", target: "the best ~10 of millions of matches" },
+    { goal: "Safety", target: "no harmful/offensive completions" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **latency is the whole point**: the dropdown has to keep up with a person typing, so each per-keystroke response must come back in low tens of milliseconds — which rules out computing anything expensive at query time and forces **precomputed top-k served from memory**. Second, **the load is overwhelmingly read and amplified**: every keystroke is a request, so the system runs at a large multiple of the search rate (the capacity section puts it at ~1M+ QPS), which means the ranked index must be **small, in-memory, replicated, and cached**, not queried out of a database per request. Third, **freshness with safety**: popularity data is aggregated in a batch that's hours stale, so a **real-time layer** must surface trending queries promptly, while a **filter** keeps harmful, offensive, or manipulated completions out — because autocomplete *publishes* suggestions to users and that carries responsibility. Note what's *relaxed*: the index is **eventually consistent** (a suggestion appearing minutes late is fine), and autocomplete is **best-effort and optional** — if it fails, the user must still be able to type and submit their search. The system trades perfect freshness and completeness for instant, ranked, safe suggestions at massive read scale.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the capacity math, showing how keystroke-level read amplification drives the serving design.
+Estimates here separate the ordinary part (storing the phrases) from the signature part (the read load). The index itself is surprisingly small; what's enormous is the request rate, because the suggestions refresh on every character typed.
+
+<SearchAutocompleteCapacity
+  assumptions={{
+    dailySearches: 5000000000,
+    keystrokesPerSearch: 20,
+    phrasesIndexed: 500000000,
+    bytesPerPhrase: 40,
+    perNodeQps: 10000,
+    logBytesPerEvent: 200,
+  }}
+/>
+
+The takeaways. First — the signature lesson — **autocomplete is read-amplified**: at 5 billion searches a day and ~20 characters typed each, the service answers ~**1,157,407 requests/sec** (~**1.16M QPS**), roughly **20×** the ~**57,870** actual searches/sec, because *every keystroke is a query*. That makes it one of the most read-dominated systems in the curriculum, and it's exactly why you **precompute the top-k and serve from memory** rather than computing anything per request — at a million QPS there is no budget to traverse a subtree or hit a database. Second, **the ranked index is tiny relative to that load**: 500 million indexed phrases at ~40 bytes each is only ~**20 GB**, small enough to **replicate in full into the RAM of every serving node** — so reads scale by simply adding identical stateless replicas (no fan-out, no cross-node coordination to answer one prefix), and ~**116 nodes** carry the QPS. Contrast this with the **Web Crawler**'s multi-petabyte corpus: autocomplete deliberately indexes only the *popular* phrases, keeping the structure that must be fast small enough to live in memory. Third, **the ranking data is a firehose**: ~**1 TB/day** of query-log events feed the batch pipeline that computes popularity. The capacity story: autocomplete is hard because of the **read amplification and ranking**, not because storing prefixes is difficult — the index fits in RAM precisely so a million-plus QPS can be served in milliseconds.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section describes the core data entities: the Suggestion record, the trie node with cached top-k, and the QueryEvent.
+The model centers on the **Suggestion** — a candidate completion phrase and the score that decides whether it makes the top-k for the prefixes that lead to it. The most important ideas are that suggestions are **keyed by prefix** (their path through the trie) and that each trie node **caches its top-k by score**, so a read never scans a subtree; the raw popularity comes from a separate stream of logged search events.
+
+<EntityModel
+  name="Suggestion"
+  description="A candidate completion phrase plus the metadata that governs whether and where it appears: a normalized form, a ranking score, the raw aggregated frequency it was derived from, a language/region, and when it was last refreshed. The set of Suggestions is materialized into the trie; each node along a phrase's path holds that phrase in its top-k if the score is high enough."
+  fields={[
+    { name: "phrase", type: "string", notes: "the completion shown to the user (a full query)" },
+    { name: "normalized", type: "string", notes: "lowercased, trimmed, accent-folded — the trie key" },
+    { name: "score", type: "float", notes: "ranking score: popularity blended with recency decay" },
+    { name: "frequency", type: "int", notes: "aggregated query count from the logs (raw popularity)" },
+    { name: "language", type: "string", notes: "language/region the phrase belongs to" },
+    { name: "last_updated", type: "datetime", notes: "when the score was last recomputed" },
+    { name: "safe", type: "bool", notes: "passed the safety/blocklist filter" },
+  ]}
+  keys="A Suggestion is keyed for lookup by its prefixes: the normalized phrase defines a path through the trie, and each node on that path caches the top-k phrases (by score) that pass through it, so answering a prefix is a walk to the node plus reading its cached list — never a scan of all descendants. The source of popularity is the QueryEvent stream, not the trie: the trie is a derived, periodically rebuilt read structure. A QueryEvent records one submitted search (phrase, timestamp, optional user/context) and is appended to the query log; the batch pipeline aggregates QueryEvents into frequency, applies time-decay to get score, filters unsafe phrases, and rebuilds the trie with fresh top-k lists. Personalization signals (per-user history, location, language) live separately and re-rank a candidate set at query time rather than being baked into the global trie."
+/>
+
+Two supporting entities complete the picture. The **QueryEvent** is the atomic input to ranking: one logged search — its phrase, a timestamp, and optionally an anonymized user or context — appended to the query-log firehose and later aggregated into the `frequency` that drives `score`. The **trie node** is the served structure: it isn't an "entity" you store individually so much as the materialized index, where every node caches the **top-k** completions (by `score`) that pass through it, which is what makes a read O(prefix length). And **personalization signals** — a user's recent searches, location, language — are kept apart from the global trie and applied as a lightweight re-rank at query time, because baking a separate trie per user doesn't scale. The discipline: the trie is a **derived, rebuildable read-optimized structure** with top-k cached per node; the source of truth for popularity is the append-only QueryEvent log.
 
 <h2 id="api-design">API Design</h2>
 
-This section defines the autocomplete, event ingestion, and blocklist management APIs.
+Autocomplete's surface is dominated by a single, extremely hot read endpoint, plus an internal event sink that feeds ranking and an admin control for safety. Essentially all the traffic is one `GET`, called on every keystroke, so it must be cacheable, cheap, and impossible to make slow.
+
+<ApiContract
+  method="GET"
+  path="/autocomplete"
+  summary="The hot path: return the top-k ranked completions for a typed prefix."
+  request={`GET /autocomplete?q=ne&limit=10&lang=en`}
+  response={`HTTP/1.1 200 OK
+Cache-Control: private, max-age=60
+{ "prefix": "ne", "suggestions": [
+  { "phrase": "netflix", "score": 0.98 },
+  { "phrase": "news", "score": 0.91 },
+  { "phrase": "nearby restaurants", "score": 0.77 } ] }`}
+  statusCodes={[
+    { code: "200", meaning: "Returns the precomputed top-k for the prefix (possibly empty)" },
+    { code: "204", meaning: "No suggestions for this prefix — render nothing, never an error" },
+    { code: "400", meaning: "Missing/oversized prefix" },
+  ]}
+  notes="Called per keystroke, so it's read-only, side-effect-free, and cacheable. The server walks the trie to the prefix node and returns its cached top-k — no computation, no database. A 204/empty result must degrade silently: the dropdown simply doesn't appear, never blocking the user from typing or submitting."
+/>
+
+<ApiContract
+  method="POST"
+  path="/events"
+  summary="Internal: log a submitted search (or a selected suggestion) to feed the ranking pipeline."
+  request={`POST /events
+{ "phrase": "netflix", "ts": "2026-06-27T10:00:00Z", "selected": true }`}
+  response={`HTTP/1.1 202 Accepted`}
+  statusCodes={[
+    { code: "202", meaning: "Event appended to the query log for asynchronous aggregation" },
+  ]}
+  notes="Fire-and-forget into the query-log firehose (~1 TB/day). These events are the raw popularity signal the batch pipeline aggregates into scores and the trending layer watches for velocity spikes. It never blocks the read path."
+/>
+
+<ApiContract
+  method="POST"
+  path="/blocklist"
+  summary="Admin: suppress an unsafe, offensive, or manipulated phrase from suggestions."
+  request={`POST /blocklist
+{ "phrase": "<harmful phrase>", "reason": "safety" }`}
+  response={`HTTP/1.1 200 OK
+{ "blocked": true, "effective": "next-build + live-filter" }`}
+  statusCodes={[
+    { code: "200", meaning: "Phrase added to the blocklist; filtered at build and query time" },
+    { code: "403", meaning: "Caller not authorized" },
+  ]}
+  notes="Safety is an operational control, not just a build-time step: a blocked phrase is removed from the next index build and also filtered live at query time so a takedown is immediate rather than waiting hours for the next rebuild."
+/>
+
+The whole surface is: query for suggestions (the million-QPS read), log events (the internal popularity feed), and manage safety (admin). There's no high-QPS write path — the "writes" are asynchronous log events, which is why the read endpoint can be made trivially fast and cacheable while ranking happens entirely offline.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the overall architecture: the serving tier, suggestion cache, trie index, query log, and batch pipeline.
+The architecture is two planes that meet at the index: a **read plane** that answers prefixes from an in-memory trie in milliseconds, and a **build plane** that aggregates query logs into that trie offline — with a real-time layer bridging the freshness gap.
+
+<SearchAutocompleteArchitecture />
+
+- **Client.** The search box; debounces keystrokes and calls `/autocomplete` as the user types.
+- **Autocomplete Service.** Stateless; walks the in-memory trie to the prefix node and returns its precomputed top-k. Sized to the read load; each replica holds a full index copy.
+- **Suggestion Cache.** A cache (often at the edge/CDN) in front of the service that absorbs the hottest prefixes, so most keystrokes never touch a serving node.
+- **Trie Index.** The ranked structure held **in memory** on every serving node — a trie with the top-k cached at each node. Small (~20 GB), replicated, swapped atomically when a new version is built.
+- **Query Log.** The append-only firehose of search events (`/events`), the raw popularity signal.
+- **Aggregator.** A batch job that consumes the log and counts per-phrase frequencies over a window.
+- **Index Builder.** Turns aggregated, decayed, filtered scores into a new trie with fresh top-k lists and publishes it as an immutable version.
+- **Trending.** A real-time layer that watches recent events for velocity spikes and injects hot phrases into the served top-k between batch rebuilds.
+
+The decisive boundary is **the read plane serves precomputed answers from memory, and the build plane computes those answers offline from logs** — the two are deliberately decoupled by the immutable index. The trie's per-node top-k makes a read O(prefix length); the small index size lets every node hold a full replica so reads scale horizontally; the cache absorbs the hottest prefixes; the batch pipeline does all the heavy ranking where latency doesn't matter; and the trending layer patches the freshness gap the batch leaves. Every section that follows elaborates one piece: how the trie + top-k works, how ranking and safety score the suggestions, how the pipeline builds the index, how the serving tier hits its latency budget, how trending keeps it fresh, and how typo tolerance and personalization refine matches.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section walks through the four key flows: serving a query, building the index, surfacing trending phrases, and correcting typos.
+Four flows cover the system: the hot read path, the offline index build, the real-time trending injection, and typo correction. The first is what runs a million times a second; the others build and refresh the index behind it.
+
+**Serve an autocomplete query.** The client sends the prefix as the user types; the service checks the suggestion cache, and on a miss walks the trie to the prefix node, reads its precomputed top-k, populates the cache, and returns the ranked suggestions. This is the per-keystroke path, and it does no computation beyond a short walk and a list read.
+
+<AutocompleteQuerySequence />
+
+**Build the index from search logs.** The aggregator consumes a batch of logged events, counts phrase frequencies, and emits a ranked list; the index builder constructs a trie with the top-k cached at every node and publishes it as a new immutable version that serving nodes load atomically. This is where all the expensive ranking happens — offline, where latency is irrelevant.
+
+<AutocompleteIndexBuildSequence />
+
+**Surface a trending phrase in real time.** A real-time layer streams recent events, detects a velocity spike (a phrase whose rate is rising sharply), and injects that phrase into the served top-k — covering the freshness the hours-old batch index misses, like a breaking-news query that didn't exist at the last rebuild.
+
+<TrendingUpdateSequence />
+
+**Correct a typo and personalize.** A mistyped prefix has no exact match in the trie, so the service expands it to edit-distance variants, looks up the corrected prefix, and returns "did-you-mean" suggestions — optionally re-ranked by the user's context. This keeps a single wrong keystroke from emptying the dropdown.
+
+<TypoCorrectionSequence />
 
 <h2 id="trie-topk">The Trie & Precomputed Top-K</h2>
 
-This section explains the trie data structure and why precomputing top-k at every node is the key insight that makes sub-100ms latency achievable.
+The trie is the centerpiece, and the key insight is that **the trie alone solves matching, not ranking**. A trie (prefix tree) stores phrases by their characters: the path "n" → "e" → "t" leads to every phrase starting "net", and finding the node for a prefix is an O(prefix-length) walk — fast and simple. The trouble is *which* completions to return. The prefix "a" has millions of descendants; the naive approach is to traverse the entire subtree under the prefix node, collect every phrase, sort by score, and take the top ten — which is enormous work for short prefixes and blows the latency budget instantly. You cannot do a subtree scan on the hot path at a million QPS.
+
+The fix is to **precompute and store the top-k completions at every node**. At index-build time, each node is annotated with the k highest-scoring phrases that pass through it (computed bottom-up: a node's top-k is the merge of its children's top-k lists plus any phrase ending there). Then a query is just: walk to the prefix node, **read its cached top-k list, done** — constant work regardless of how many descendants the prefix has. This trades **memory for latency**: storing k entries at every node enlarges the structure (k is small, ~5–10, so it's bounded), and the top-k is only as fresh as the last build (which the trending layer compensates for). Memory can be reined in with a **compressed trie** — a radix/PATRICIA tree that collapses single-child chains, a ternary search tree, or a finite-state transducer (FST) that shares suffixes — but the central idea is unchanged. The principle: a trie makes *matching* a prefix cheap, but serving the *best* completions cheaply requires precomputing the top-k at every node so a read is a walk plus a list read, never a scan — paying memory and a rebuild cadence to buy a constant-time hot path.
+
+<KnowledgeCheck
+  question="Why store a precomputed top-k at every trie node instead of finding matches at query time?"
+  options={[
+    "To save memory — the top-k lists make the trie smaller",
+    "A plain trie finds the node for a prefix quickly, but returning the best completions would require scanning the entire subtree under the prefix and sorting — far too slow for a short prefix with millions of descendants, at a million QPS. Precomputing the top-k at each node (bottom-up, at build time) turns a query into a walk to the node plus reading a small cached list — constant work regardless of subtree size — trading extra memory and rebuild-bounded freshness for a constant-time hot path",
+    "Because tries cannot store more than one phrase per node",
+    "To guarantee suggestions are always perfectly fresh",
+  ]}
+  answer={1}
+  explanation="The trie solves matching (an O(prefix-length) walk), not ranking. Returning the top completions naively means traversing all descendants of the prefix node and sorting them — catastrophic for short prefixes that have millions of descendants, especially at a million QPS with a few-millisecond budget. So the top-k completions are precomputed at every node at build time (a node's list is the merge of its children's lists), and a read becomes a walk plus a cached-list read: constant time, no scan. The costs are extra memory (k bounded entries per node, mitigated by radix/FST compression) and that the top-k is only as fresh as the last build — which the real-time trending layer patches."
+/>
 
 <h2 id="ranking-scoring">Ranking, Filtering & Safety</h2>
 
-This section covers how suggestions are ranked by popularity and recency, and how safety filtering removes harmful completions.
+A suggestion's **score** is what decides the top-k, and getting it right is what separates a useful dropdown from a random one. The dominant signal is **popularity**: how often the phrase has been searched, aggregated from the query logs into a `frequency`. But raw frequency alone is stale and gameable, so it's blended with **recency / time-decay** — recent searches count more, and last year's hits fade — so the suggestions track what people are searching *now*, not cumulatively forever. On top of those global signals, optional **context and personalization** (covered later) can re-rank: the user's language, location, recent queries, or the current app surface. The score is computed offline in the pipeline and baked into the top-k lists; the hot path never recomputes it.
+
+Two guardrails ride on the same scoring stage. The first is **safety and filtering**: because autocomplete *publishes* completions to users — effectively putting words in the search box — it carries responsibility not to suggest harmful, offensive, defamatory, or unsafe phrases. A **blocklist plus classifiers** removes such phrases, applied both at **build time** (they never enter the trie) and at **query time** (a live filter so a takedown is immediate, not delayed until the next rebuild). The second is **demotion of manipulation**: spammy or artificially inflated phrases (bots hammering a query to make it suggest) are detected and down-weighted, so popularity can't be trivially gamed. The principle: rank by **popularity blended with recency decay**, computed offline and cached as the top-k; and treat **filtering/safety as a first-class, two-stage control** (build-time exclusion plus a live query-time filter), because publishing a suggestion is an editorial act, not a neutral lookup.
+
+<KnowledgeCheck
+  question="What signals determine a suggestion's rank, and why is safety filtering applied at both build and query time?"
+  options={[
+    "Only raw search frequency; safety is applied once at build time",
+    "Rank blends popularity (aggregated query frequency) with recency/time-decay (so it tracks what's searched now, not cumulatively), plus optional personalization. Safety filtering runs at build time (harmful phrases never enter the trie) AND at query time (a live filter), so a takedown takes effect immediately rather than waiting hours for the next rebuild — because publishing a suggestion is an editorial act that carries responsibility",
+    "Alphabetical order; safety is the search engine's job, not autocomplete's",
+    "Personalization only; global popularity is ignored",
+  ]}
+  answer={1}
+  explanation="Popularity (frequency from the logs) is the main signal, but raw cumulative frequency is stale and gameable, so it's blended with recency/time-decay and optionally personalized — all computed offline and cached as each node's top-k. Safety is two-stage on purpose: build-time exclusion keeps harmful phrases out of the trie, but because builds are hours apart, a live query-time filter (and blocklist) makes takedowns immediate. Autocomplete publishes suggestions to users, so filtering harmful/offensive/manipulated completions is a first-class responsibility, not an afterthought."
+/>
 
 <h2 id="data-pipeline">Building the Index from Query Logs</h2>
 
-This section describes the batch aggregation pipeline that consumes the query-log firehose and publishes new immutable index versions.
+The ranking data has to come from somewhere, and that somewhere is the **query log**: every submitted search is logged as a **QueryEvent**, producing a firehose of ~1 TB/day. A **batch pipeline** (MapReduce/Spark-style) consumes this log and does all the heavy lifting where latency doesn't matter: it **aggregates** events into per-phrase frequencies over a window, applies **time-decay** so recent activity weighs more, runs the **safety filter** to drop blocklisted phrases, computes the **top-k for every trie node** bottom-up, and **publishes the result as a new immutable index version**. Serving nodes then load that version and swap to it **atomically** — an instant cutover from the old trie to the new one, with no half-built state ever served. Because the index is immutable and versioned, a bad build can simply be rolled back to the prior version, and every replica converges on the same data.
+
+This is a **Lambda-architecture** split: a slow, comprehensive **batch layer** that rebuilds the whole ranked index every few hours, plus a fast **real-time layer** (next section) that patches the freshness gap in between. The batch layer's cadence is a deliberate trade — rebuild more often for fresher popularity at higher compute cost, less often to save cost at the price of staleness. The rebuild is itself a **time-triggered job**, the same shape as the **Distributed Job Scheduler** firing a periodic task, and the log it consumes is the same kind of append-only firehose as the **Distributed Logging** platform. The principle: do all the expensive ranking **offline** over the aggregated query log, publish the index as **immutable, atomically-swapped versions** (so serving is consistent and rollback is trivial), and accept a batch cadence for the bulk of freshness while a real-time layer covers the rest.
+
+<KnowledgeCheck
+  question="How is the ranked index built, and why is it published as immutable, atomically-swapped versions?"
+  options={[
+    "Serving nodes update the trie in place as each search arrives",
+    "A batch pipeline aggregates the query-log firehose into per-phrase frequencies, applies decay and safety filtering, computes the top-k per node, and publishes a new immutable index version that serving nodes load and swap to atomically. Immutability + versioning means every replica serves identical data, no half-built state is ever visible, and a bad build can be rolled back instantly — while a real-time layer covers freshness between rebuilds (a Lambda split)",
+    "The index is rebuilt synchronously on every query for freshness",
+    "There is no pipeline; popularity is guessed from the prefix length",
+  ]}
+  answer={1}
+  explanation="All the expensive ranking happens offline: a batch job aggregates the ~1 TB/day query log into frequencies, applies time-decay and the safety filter, computes each node's top-k bottom-up, and emits a new immutable index. Serving nodes swap to it atomically, so reads are always consistent (no partial trie is served) and a faulty build rolls back to the previous version in one step. The batch cadence trades compute cost against staleness, and a fast real-time/trending layer patches the gap — the classic Lambda architecture, echoing the Distributed Logging firehose and a Distributed Job Scheduler's periodic trigger."
+/>
 
 <h2 id="serving-layer">Serving, Sharding & the Latency Budget</h2>
 
-This section covers the in-memory replicated serving tier, its latency budget, and how stateless replicas scale by adding nodes.
+Serving ~1M+ QPS in single-digit milliseconds works because of one fact established in the capacity section: **the index is small enough to live in RAM**. At ~20 GB, the entire ranked trie fits in the memory of each serving node, so every node holds a **full replica** — and that changes how scaling works. Answering a single prefix needs no fan-out, no scatter-gather, no cross-node coordination: any node can answer any query from its own memory, so you scale reads by simply **adding more identical stateless replicas** behind a load balancer. This is the easy, embarrassingly-parallel kind of scaling, and it's only possible because the structure that must be fast is deliberately kept small (only popular phrases, not the whole corpus). In front of the replicas, a **suggestion cache** (often at the CDN/edge) absorbs the hottest prefixes — a small number of common prefixes account for a huge share of traffic — so most keystrokes are answered without even reaching a serving node.
+
+The **latency budget** is unforgiving because the dropdown must keep up with typing, and two techniques protect it. First, the **client debounces**: rather than firing a request on every single keystroke, it waits a few tens of milliseconds for the typing to settle, collapsing a burst of keystrokes into one request and cutting load substantially. Second, the service treats latency as a hard deadline — it returns the precomputed top-k within the budget or returns **nothing** rather than blocking, since a missing dropdown is far better than a janky, lagging one. When the index eventually outgrows a single node's memory (many languages, entities, personalization), you **shard by prefix** — the first character(s) route to different shards — so each node holds a slice; but for most designs, full replication is simpler and faster. The principle: keep the index small enough to **replicate into RAM** so reads scale by adding stateless replicas, put a **cache** in front for the hot prefixes, **debounce** on the client, and enforce a hard latency deadline (return nothing rather than be slow) — sharding by prefix only when the index no longer fits in one node.
+
+<KnowledgeCheck
+  question="Why can autocomplete serve over a million QPS by just adding replicas, and what protects the latency budget?"
+  options={[
+    "Because each query is sharded across many nodes and the results merged",
+    "The ranked index is only ~20 GB, so it fits entirely in each node's RAM and every node holds a full replica — answering a prefix needs no fan-out or coordination, so reads scale by adding identical stateless replicas behind a load balancer. The budget is protected by a front cache for hot prefixes, client-side debouncing (collapsing keystroke bursts into one request), and a hard deadline where the service returns nothing rather than blocking",
+    "Because the database is very fast at LIKE 'prefix%' queries",
+    "Because suggestions are computed lazily and cached forever",
+  ]}
+  answer={1}
+  explanation="The index is small by design (only popular phrases), so it lives in RAM on every serving node as a full replica. That means any node answers any prefix from its own memory with no scatter-gather — the embarrassingly-parallel case, where you scale reads by adding stateless replicas. A suggestion cache (often at the edge) absorbs the hottest prefixes, the client debounces to collapse keystroke bursts, and the service enforces a hard latency deadline, returning nothing rather than lagging. Prefix-sharding is reserved for when the index outgrows a single node's memory."
+/>
 
 <h2 id="freshness-trending">Freshness & Trending Queries</h2>
 
-This section explains the real-time trending layer that injects hot phrases into the served top-k between batch rebuilds.
+The batch-built index is **hours stale**, and that's exactly when it hurts most: a breaking news event, a just-released product, a viral moment — people start searching for it *now*, but the phrase barely existed at the last rebuild, so its batch-computed popularity is near zero and it never makes the top-k. Waiting for the next batch means the dropdown is useless for precisely the queries spiking in real time. The fix is a **real-time layer** that consumes the recent event stream, detects **velocity spikes** — phrases whose *rate of increase* is climbing sharply, not just their raw count — and **injects** those trending phrases into the served top-k between batch rebuilds. This is the fast half of the **Lambda architecture**: the batch layer owns comprehensive, decayed popularity; the real-time layer owns the last few minutes the batch can't see yet.
+
+The important design point is that trending keys on **velocity, not volume**. A perennially popular query like "weather" has huge raw counts every minute but isn't *trending* — it's already in the batch top-k. What you want to catch is the phrase that went from near-zero to a flood in minutes, which signals something *new*. That's also where the risk lives: reacting to spikes invites **manipulation and noise** (a coordinated burst to force a suggestion, or a transient blip that isn't real), so the trending layer pairs velocity thresholds with the same **safety filtering** and spam-demotion as the batch path, and the injection is bounded and decays quickly. The trade-off is **freshness versus stability**: react faster to surface real trends sooner, but risk surfacing noise or manipulated phrases. The principle: bridge the batch index's staleness with a real-time layer that detects **rate-of-change spikes** (not raw popularity) and injects trending phrases into the top-k, while filtering for safety and manipulation so the fast path doesn't become an attack surface.
+
+<KnowledgeCheck
+  question="Why does autocomplete need a real-time trending layer, and why does it key on velocity rather than raw count?"
+  options={[
+    "It doesn't — the batch rebuild is fast enough for everything",
+    "The batch index is hours stale, so phrases spiking right now (breaking news, new releases) have near-zero batch popularity and miss the top-k exactly when users search them. A real-time layer consumes recent events and injects trending phrases between rebuilds. It keys on velocity (rate of increase) not raw count, because high-volume perennial queries are already in the batch top-k — what's worth surfacing is a phrase that went from near-zero to a flood, signaling something new — while filtering for safety/manipulation since reacting to spikes is an abuse vector",
+    "Because the trie cannot store popular phrases",
+    "To reduce the size of the index by removing old phrases",
+  ]}
+  answer={1}
+  explanation="A few-hours-old batch index can't know about a query that started spiking minutes ago, so without a real-time layer the dropdown is empty for breaking/trending searches — the worst possible time. The real-time layer (the fast half of a Lambda architecture) injects such phrases into the served top-k. It detects velocity — rate of increase — rather than raw volume, because already-popular queries are in the batch top-k anyway; the signal of interest is a sudden surge indicating something new. Because spike-reaction is gameable, it applies the same safety/spam filtering and bounds the injection with quick decay."
+/>
 
 <h2 id="fuzzy-personalization">Typo Tolerance & Personalization</h2>
 
-This section covers edit-distance prefix expansion for typo correction and optional personalization signals.
+Two refinements make the matching both more forgiving and more relevant. The first is **typo tolerance**: people mistype, and an exact trie walk on "netflox" simply falls off the tree and returns nothing — a single wrong keystroke shouldn't empty the dropdown. So when the exact prefix has no good match, the service **expands** it to nearby variants within a small **edit distance** (insertions, deletions, substitutions, transpositions) and looks those up instead, surfacing "netflix" for "netflox" as a *did-you-mean*. Implementations range from generating edit-distance-1/2 candidates and probing the trie, to a dedicated fuzzy structure (a **BK-tree** or an FST with fuzzy matching) or a phonetic index for sound-alikes. It's bounded — edit distance 1–2, only when the exact match is weak — because unbounded fuzziness explodes the candidate set and the latency budget.
+
+The second is **personalization and context**. The global top-k reflects everyone; for a given user, their **own history**, **location**, **language**, and the **current surface** can make different completions more relevant ("home" might mean "Home Depot" near one user and "homework help" for another). The scalable way to do this is *not* a separate trie per user — that doesn't fit in memory — but a **lightweight re-rank**: fetch a slightly larger candidate set from the global trie, then re-order (or splice in a few personal phrases) using per-user signals at query time. This keeps the heavy, shared structure global and small while layering cheap personalization on top. Both refinements trade **precision and cost for recall and relevance**: typo expansion widens what can match (more recall, more compute), personalization tailors the order (more relevance, a little per-user work). The principle: tolerate typos by **bounded edit-distance expansion** only when the exact prefix is weak, and personalize by **re-ranking a global candidate set** with per-user signals rather than maintaining per-user indexes — keeping the shared trie small and fast while still feeling forgiving and tailored.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section examines how the system grows from a single region to a globally distributed deployment over time.
+Don't build the globally-distributed, sharded, trending-aware system on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Database LIKE 'prefix%'", "A small catalog, low QPS", "Full scan per keystroke — slow, no ranking, dies under read load"],
+    ["In-memory trie on one box", "Thousands of QPS; need ranking", "Precompute top-k per node; one box caps QPS and the index must fit its RAM"],
+    ["Replicated trie + batch pipeline + cache", "~1M+ QPS; popularity ranking", "Run a log-aggregation pipeline; replicate the index to many stateless nodes; cache hot prefixes"],
+    ["Global, sharded + replicated, real-time trending", "Web scale; freshness + personalization", "Geo-distribution; prefix-sharding when the index outgrows RAM; a real-time layer and edge caching"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the wall you're hitting. A **database `LIKE 'prefix%'`** scan is fine for a tiny catalog but does a table scan per keystroke, has no notion of ranking, and collapses under read load — never use it at scale. An **in-memory trie on one box** with precomputed top-k gives you fast, ranked answers, but a single machine caps QPS and the index must fit its RAM. The center of gravity for a real system is a **replicated in-memory trie fed by a batch query-log pipeline, with a suggestion cache** — this is where ranking comes from real popularity, reads scale across stateless replicas, and the hot prefixes are absorbed by the cache. Only true web scale needs **global distribution with prefix-sharding and a real-time trending layer**, paying for geographic reach, an index too big for one node's RAM, and freshness with cross-region complexity. Most autocomplete systems are well-served by "replicated in-memory trie, batch pipeline, cache in front."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section enumerates failure scenarios and the mitigations that ensure autocomplete never blocks typing or searching.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. Autocomplete's guiding rule is unusual and worth saying out loud: **the dropdown is optional — autocomplete failing must never block the user from typing or submitting a search.** That makes graceful degradation the default posture for almost every failure.
+
+<FailureMatrix
+  rows={[
+    { failure: "Serving node dies", impact: "Some capacity lost", detection: "Health check / LB probe", mitigation: "Stateless replicas each hold a full index copy; LB reroutes", recovery: "Replacement replica loads the latest index version and joins" },
+    { failure: "Bad / empty index build", impact: "Suggestions wrong or missing", detection: "Validate build (size, sample queries) before publish", mitigation: "Immutable versioned index; serve previous version until validated", recovery: "Roll back to the last good version instantly" },
+    { failure: "Serving tier overload", impact: "Latency budget at risk", detection: "Latency / QPS monitors", mitigation: "Edge cache, client debounce, shed load; return nothing over slow", recovery: "Cache absorbs hot prefixes; autoscale replicas" },
+    { failure: "Pipeline lag / stale index", impact: "Popularity goes stale", detection: "Index age / freshness metric", mitigation: "Real-time trending layer covers new spikes; serve stale-but-valid", recovery: "Next batch catches up; cadence tuned" },
+    { failure: "Trending abuse / spam spike", impact: "Manipulated suggestion surfaces", detection: "Velocity + anomaly thresholds", mitigation: "Safety filter + spam demotion on the real-time path; bounded injection", recovery: "Phrase decays out; blocklist if needed" },
+    { failure: "Unsafe suggestion slips through", impact: "Harmful completion shown", detection: "Reports / classifier flags", mitigation: "Blocklist filters live at query time, not just at build", recovery: "Takedown effective immediately; excluded from next build" },
+    { failure: "Query-log ingestion outage", impact: "No new popularity data", detection: "Ingestion rate drop", mitigation: "Buffer events; serving continues on the current index", recovery: "Backlog drains; aggregation resumes" },
+  ]}
+/>
+
+The theme: **degrade, never block; serve a previous good version; filter live.** A dead serving node is harmless because replicas are stateless and each holds a full index copy, so the load balancer just reroutes. A bad build can't poison serving because the index is **immutable and versioned** — you validate before publishing and roll back to the last good version in one step. Overload is met with the cache, client debounce, load-shedding, and the cardinal rule of returning *nothing* rather than being slow. Staleness is covered by the real-time trending layer while the next batch catches up, and ingestion outages are ridden out on the current index. The two safety failures — manipulated trends and unsafe completions — are contained by filtering on **both** paths (build and live query time), so a takedown is immediate. Because the index is a derived, rebuildable artifact and serving is stateless, recovery is almost always "reroute, roll back, or wait for the next build" — and the one inviolable rule is that none of these failures may ever prevent the user from typing and searching.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares the chosen architecture against alternative approaches and highlights the key trade-offs.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Serve top-k prefix completions from an in-memory trie whose every node caches its precomputed top-k (so a query is an O(prefix-length) walk plus a list read, never a subtree scan); rank by popularity blended with recency decay, computed offline by a batch pipeline that aggregates the query-log firehose and publishes the index as immutable, atomically-swapped versions; replicate that small (~20 GB) index across stateless serving nodes behind a suggestion cache to absorb ~1M+ QPS within a tight latency budget; patch freshness with a real-time trending layer keyed on velocity; tolerate typos with bounded edit-distance expansion and personalize by re-ranking a global candidate set; and filter unsafe phrases at both build and query time."
+  rationale="The hard parts are ranking and read-amplified serving, not matching. Precomputed top-k turns the hot path into constant work; the small index fits in RAM so reads scale by adding stateless replicas with no fan-out; doing all ranking offline keeps the read path trivial and cacheable; immutable versions make serving consistent and rollback instant; the trending layer covers the freshness the batch can't; and two-stage safety filtering reflects that publishing a suggestion is an editorial act. Each choice spends memory or build-time work to buy a fast, safe, scalable read."
+  alternatives="A database LIKE 'prefix%' query — trivial but a scan per keystroke, no ranking, dies under read load; computing top-k at query time by scanning the subtree — correct but far too slow for short prefixes at a million QPS; a single non-replicated trie — fast but caps QPS and can't survive a node loss; batch-only freshness — simple but misses trending queries when they matter most; per-user tries for personalization — too large to hold in memory, so re-rank a shared candidate set instead; unbounded fuzzy matching — explodes the candidate set and the latency budget; skipping safety filtering — unacceptable, since autocomplete publishes suggestions to users."
+  revisitWhen="The index outgrows a single node's RAM (many languages, entities, personalization) and must be prefix-sharded; freshness requirements tighten enough to need a heavier streaming layer; personalization becomes a primary signal (a learned re-ranker rather than a light re-rank); or the candidate phrases shift from past queries to a structured entity/product catalog with its own ranking."
+/>
+
+Four axes capture the real tension:
+
+- **Precompute top-k vs compute at query time.** Precomputing makes reads constant-time at the cost of memory and rebuild-bounded freshness; computing per query is always fresh but far too slow at scale. Precompute wins decisively here.
+- **In-memory replicated vs database-backed.** Replicating a small in-memory index gives millisecond reads and trivial horizontal scaling; a database is simpler operationally but can't meet the latency or the QPS. In-memory wins.
+- **Batch vs real-time freshness.** Batch gives comprehensive, cheap, decayed popularity but is stale; real-time catches trends instantly but is noisier and gameable. The Lambda split takes both.
+- **Global popularity vs personalization.** Global top-k is small, shared, and cache-friendly; personalization is more relevant but costly and doesn't fit a per-user index, so it's layered as a lightweight re-rank on a global candidate set.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section condenses the full design into a concise narrative you can deliver in sixty seconds at the whiteboard.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"Search autocomplete looks like a trie prefix lookup, but matching is the easy half — the design is ranking and read-amplified serving. I keep all the popular query phrases in a trie, and the key move is that every node caches its precomputed top-k completions, so answering a prefix is a walk to the node plus reading a small list — constant time, never a scan of the subtree, which short prefixes with millions of descendants would make impossible. Ranking is popularity blended with recency decay, computed entirely offline: a batch pipeline aggregates the query-log firehose into frequencies, applies decay and a safety filter, builds the trie with top-k per node, and publishes it as an immutable version that serving nodes swap to atomically. Serving handles over a million QPS — because every keystroke is a query, that's about twenty times the search rate — and it works because the index is only about twenty gigabytes, so every stateless node holds a full copy in RAM and I scale reads by just adding replicas behind a cache that absorbs the hottest prefixes; the client debounces, and the service returns nothing rather than being slow. The batch index is hours stale, so a real-time layer detects velocity spikes and injects trending phrases. I tolerate typos with bounded edit-distance expansion, personalize by re-ranking a global candidate set, and filter unsafe suggestions at both build and query time. The one rule I never break: autocomplete is optional — if it fails, the user must still be able to type and search."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why precompute top-k instead of querying at request time? Why does the index fit in memory, and how does that change scaling? Where does the ranking data come from? Why immutable versioned indexes? How do you surface trending queries the batch missed? How do you handle typos? How is autocomplete kept safe?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section provides knowledge checks and answers to frequently asked interview questions about search autocomplete.
+<KnowledgeCheck
+  question="Why is autocomplete's request rate so much higher than the actual search rate, and what does that force in the design?"
+  options={[
+    "It isn't — autocomplete gets one request per search",
+    "Because suggestions refresh on every keystroke, the service gets roughly one request per character typed — about 20× the search QPS, over a million QPS. That read amplification forces precomputed answers served from an in-memory, replicated, cached tier: there's no budget to compute anything per request, so all ranking is done offline and the hot path is a trie walk plus a cached-list read",
+    "Because every search is retried many times for reliability",
+    "Because autocomplete also serves the final search results",
+  ]}
+  answer={1}
+  explanation="Each keystroke (after debounce) issues an autocomplete request, so the read load is a large multiple of the number of searches actually submitted — around 20× in the capacity model, over a million QPS. At that rate nothing can be computed per request, which is the whole reason the top-k is precomputed offline and served from an in-memory, replicated, cached index. Read amplification is the defining force of the design."
+/>
+
+<KnowledgeCheck
+  question="If autocomplete's index build fails or the serving tier is overloaded, what is the correct behavior?"
+  options={[
+    "Block the search box until autocomplete recovers",
+    "Degrade gracefully and never block the user: serve the previous immutable index version on a bad build (with validation + instant rollback), and under overload lean on the cache, client debounce, and load-shedding — returning nothing rather than being slow. Autocomplete is optional; the user must always be able to type and submit a search",
+    "Recompute the index synchronously on the next query",
+    "Show an error message in the dropdown",
+  ]}
+  answer={1}
+  explanation="The inviolable rule is that autocomplete is an optional enhancement: its failure must never prevent typing or submitting a search. Because the index is immutable and versioned, a bad build is caught by validation and rolled back to the last good version instantly. Under overload, the cache absorbs hot prefixes, the client debounces, the tier sheds load, and the service returns nothing rather than lagging — a missing dropdown is acceptable, a janky one is not."
+/>
+
+<Faq
+  items={[
+    { question: "What is search autocomplete?", answer: "It's the typeahead dropdown of suggested queries that appears as you type into a search box: given a prefix, it returns the top-k most relevant completed queries in a few milliseconds, per keystroke. Google, Bing, Amazon, and YouTube all run it. The interesting engineering isn't matching the prefix — a trie does that — but ranking the best handful of completions and serving them instantly at enormous read volume." },
+    { question: "Why isn't a trie alone enough?", answer: "A trie answers 'which phrases start with this prefix?' with a fast O(prefix-length) walk, but that's matching, not ranking. A short prefix like 'a' has millions of descendants, and you have ~10 slots and a few-millisecond budget — you can't scan and sort the subtree per request. So each trie node stores a precomputed top-k of its best completions, turning a query into a walk plus a cached-list read: constant time regardless of subtree size." },
+    { question: "What does 'precomputed top-k' mean?", answer: "At index-build time, every node in the trie is annotated with the k highest-scoring phrases that pass through it, computed bottom-up (a node's top-k merges its children's lists). Then serving a prefix is just: walk to that node and return its cached list. It trades extra memory (k bounded entries per node) and rebuild-bounded freshness for a constant-time hot path, which is essential at a million-plus QPS." },
+    { question: "Why is autocomplete such a high-QPS system?", answer: "Because suggestions update on every character typed, so each search generates roughly one autocomplete request per keystroke — about 20× the actual search rate, over a million QPS in the capacity model. That read amplification is the defining constraint: it forces precomputed answers served from an in-memory, replicated, cached tier, because there's no budget to compute anything per request." },
+    { question: "How does the index fit in memory, and why does that matter?", answer: "Autocomplete indexes only the popular phrases — about 500 million at ~40 bytes each is only ~20 GB — so the whole ranked trie fits in each serving node's RAM. That's what makes the system scale so cleanly: every node holds a full replica, any node answers any prefix with no fan-out, and you scale reads by just adding stateless replicas behind a load balancer." },
+    { question: "Where does the ranking come from?", answer: "From the query logs. Every submitted search is logged as an event (~1 TB/day), and a batch pipeline aggregates these into per-phrase frequencies over a window, applies recency/time-decay, filters unsafe phrases, computes the top-k per node, and publishes a new immutable index. Popularity blended with recency is the score; it's all computed offline so the read path stays trivial." },
+    { question: "Why publish the index as immutable versions?", answer: "So serving is consistent and recoverable. An immutable, versioned index is loaded and swapped atomically by every replica, so no half-built state is ever served and all nodes converge on the same data. If a build is bad or empty, it's caught by validation and rolled back to the previous good version in one step — far safer than mutating a live trie in place." },
+    { question: "How are trending or breaking queries handled?", answer: "The batch index is hours stale, so a phrase spiking right now (breaking news, a new release) has near-zero batch popularity and would miss the top-k exactly when people search it. A real-time layer consumes recent events, detects velocity spikes (rate of increase, not raw count, since popular queries are already ranked), and injects trending phrases into the served top-k between rebuilds — the fast half of a Lambda architecture." },
+    { question: "How does autocomplete tolerate typos?", answer: "An exact trie walk on a mistyped prefix returns nothing, so when the exact match is weak the service expands the prefix to nearby variants within a small edit distance (1–2 insertions/deletions/substitutions/transpositions) and looks those up, surfacing 'did-you-mean' suggestions. It can use generated candidates, a BK-tree, an FST with fuzzy matching, or a phonetic index — bounded, because unbounded fuzziness explodes the candidate set and the latency budget." },
+    { question: "How is autocomplete personalized without a trie per user?", answer: "A per-user trie wouldn't fit in memory, so personalization is a lightweight re-rank: fetch a slightly larger candidate set from the shared global trie, then re-order it (or splice in a few personal phrases) using per-user signals — history, location, language, current surface — at query time. The heavy, shared structure stays global and small; only the cheap re-rank is per-user." },
+    { question: "How is autocomplete kept safe?", answer: "Because autocomplete publishes suggestions to users, it filters harmful, offensive, defamatory, or unsafe completions with a blocklist plus classifiers, applied at both build time (they never enter the trie) and query time (a live filter, so a takedown is immediate rather than waiting for the next rebuild). It also demotes spammy or artificially inflated phrases so popularity can't be trivially gamed." },
+    { question: "What happens if autocomplete fails?", answer: "It degrades gracefully and never blocks the user. The dropdown is an optional enhancement, so on a bad build the previous index version is served, under overload the cache and client debounce absorb traffic and the service returns nothing rather than being slow, and a node failure is just rerouted to a stateless replica. The one inviolable rule: the user must always be able to type and submit a search." },
+    { question: "How is this different from the search engine itself?", answer: "Autocomplete only completes the query — it suggests what to search for. The full search engine that ranks results for that query is a separate system, fed by a crawler's corpus (see the Web Crawler tutorial). Autocomplete is deliberately small and fast because it indexes only popular query phrases, not the entire web; it sits in front of search, not inside it." },
+  ]}
+/>
