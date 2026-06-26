@@ -23,6 +23,7 @@ import { DistributedLoggingCapacity } from "@/components/learning/distributed-lo
 import { DistributedJobSchedulerCapacity } from "@/components/learning/distributed-job-scheduler-capacity";
 import { MapsNavigationCapacity } from "@/components/learning/maps-navigation-capacity";
 import { ApiGatewayCapacity } from "@/components/learning/api-gateway-capacity";
+import { WebCrawlerCapacity } from "@/components/learning/web-crawler-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -154,6 +155,7 @@ const teachingComponents = {
   DistributedJobSchedulerCapacity,
   MapsNavigationCapacity,
   ApiGatewayCapacity,
+  WebCrawlerCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
