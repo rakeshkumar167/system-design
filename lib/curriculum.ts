@@ -82,7 +82,7 @@ export const problems: readonly Problem[] = [
       "Serve top-k prefix suggestions in milliseconds from a trie and ranking pipeline.",
     difficulty: "Intermediate",
     concepts: ["Trie", "Top-k ranking", "Low latency", "Precomputation"],
-    status: "coming-soon",
+    status: "available",
     sequence: 8,
   },
   {

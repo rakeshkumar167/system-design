@@ -441,6 +441,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "search-autocomplete": {
+    slug: "search-autocomplete",
+    title: "Design Search Autocomplete",
+    description:
+      "An interview-grade walkthrough of search autocomplete (typeahead): a trie with precomputed top-k at every node, ranking by popularity and recency with safety filtering, a batch query-log aggregation pipeline that builds and publishes the ranked index, an in-memory replicated serving tier under a tight latency budget, a real-time trending layer for freshness, typo tolerance and personalization, scaling, and failure modes.",
+    difficulty: "Intermediate",
+    readingMinutes: 34,
+    concepts: ["Trie", "Top-k ranking", "Low latency", "Precomputation"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "trie-topk", label: "The Trie & Precomputed Top-K", depth: "advanced" },
+      { id: "ranking-scoring", label: "Ranking, Filtering & Safety", depth: "advanced" },
+      { id: "data-pipeline", label: "Building the Index from Query Logs", depth: "advanced" },
+      { id: "serving-layer", label: "Serving, Sharding & the Latency Budget", depth: "advanced" },
+      { id: "freshness-trending", label: "Freshness & Trending Queries", depth: "advanced" },
+      { id: "fuzzy-personalization", label: "Typo Tolerance & Personalization", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

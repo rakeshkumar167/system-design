@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section sets the context for how to approach the search autocomplete problem in a system design interview.
+
+<h2 id="requirements">Requirements</h2>
+
+This section covers the functional and non-functional requirements for a production-grade search autocomplete system.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the capacity math, showing how keystroke-level read amplification drives the serving design.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section describes the core data entities: the Suggestion record, the trie node with cached top-k, and the QueryEvent.
+
+<h2 id="api-design">API Design</h2>
+
+This section defines the autocomplete, event ingestion, and blocklist management APIs.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the overall architecture: the serving tier, suggestion cache, trie index, query log, and batch pipeline.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section walks through the four key flows: serving a query, building the index, surfacing trending phrases, and correcting typos.
+
+<h2 id="trie-topk">The Trie & Precomputed Top-K</h2>
+
+This section explains the trie data structure and why precomputing top-k at every node is the key insight that makes sub-100ms latency achievable.
+
+<h2 id="ranking-scoring">Ranking, Filtering & Safety</h2>
+
+This section covers how suggestions are ranked by popularity and recency, and how safety filtering removes harmful completions.
+
+<h2 id="data-pipeline">Building the Index from Query Logs</h2>
+
+This section describes the batch aggregation pipeline that consumes the query-log firehose and publishes new immutable index versions.
+
+<h2 id="serving-layer">Serving, Sharding & the Latency Budget</h2>
+
+This section covers the in-memory replicated serving tier, its latency budget, and how stateless replicas scale by adding nodes.
+
+<h2 id="freshness-trending">Freshness & Trending Queries</h2>
+
+This section explains the real-time trending layer that injects hot phrases into the served top-k between batch rebuilds.
+
+<h2 id="fuzzy-personalization">Typo Tolerance & Personalization</h2>
+
+This section covers edit-distance prefix expansion for typo correction and optional personalization signals.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section examines how the system grows from a single region to a globally distributed deployment over time.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section enumerates failure scenarios and the mitigations that ensure autocomplete never blocks typing or searching.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares the chosen architecture against alternative approaches and highlights the key trade-offs.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section condenses the full design into a concise narrative you can deliver in sixty seconds at the whiteboard.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section provides knowledge checks and answers to frequently asked interview questions about search autocomplete.
