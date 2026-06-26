@@ -131,6 +131,13 @@ import {
   PolitenessSequence,
   RecrawlSequence,
 } from "@/components/diagrams/web-crawler-flows";
+import { SearchAutocompleteArchitecture } from "@/components/diagrams/search-autocomplete-architecture";
+import {
+  AutocompleteQuerySequence,
+  IndexBuildSequence as AutocompleteIndexBuildSequence,
+  TrendingUpdateSequence,
+  TypoCorrectionSequence,
+} from "@/components/diagrams/search-autocomplete-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -241,6 +248,11 @@ const teachingComponents = {
   DedupCheckSequence,
   PolitenessSequence,
   RecrawlSequence,
+  SearchAutocompleteArchitecture,
+  AutocompleteQuerySequence,
+  AutocompleteIndexBuildSequence,
+  TrendingUpdateSequence,
+  TypoCorrectionSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

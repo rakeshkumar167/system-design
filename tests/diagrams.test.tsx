@@ -449,3 +449,34 @@ describe("web crawler flow sequences", () => {
     expect(screen.getByRole("img", { name: /recrawl/i })).toBeInTheDocument();
   });
 });
+
+import { SearchAutocompleteArchitecture } from "@/components/diagrams/search-autocomplete-architecture";
+import {
+  AutocompleteQuerySequence,
+  IndexBuildSequence as AutocompleteIndexBuildSequence,
+  TrendingUpdateSequence,
+  TypoCorrectionSequence,
+} from "@/components/diagrams/search-autocomplete-flows";
+
+describe("SearchAutocompleteArchitecture", () => {
+  it("exposes the search autocomplete architecture to non-visual readers", () => {
+    render(<SearchAutocompleteArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /search autocomplete architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/precomputed top-k/i)).toBeInTheDocument();
+  });
+});
+
+describe("search autocomplete flow sequences", () => {
+  it("renders the query, index-build, trending, and typo sequences", () => {
+    render(<AutocompleteQuerySequence />);
+    expect(screen.getByRole("img", { name: /query/i })).toBeInTheDocument();
+    render(<AutocompleteIndexBuildSequence />);
+    expect(screen.getByRole("img", { name: /build/i })).toBeInTheDocument();
+    render(<TrendingUpdateSequence />);
+    expect(screen.getByRole("img", { name: /trending/i })).toBeInTheDocument();
+    render(<TypoCorrectionSequence />);
+    expect(screen.getByRole("img", { name: /typo/i })).toBeInTheDocument();
+  });
+});
