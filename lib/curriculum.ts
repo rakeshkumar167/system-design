@@ -72,7 +72,7 @@ export const problems: readonly Problem[] = [
       "Crawl the web at scale with politeness, deduplication, and freshness-aware scheduling.",
     difficulty: "Advanced",
     concepts: ["Frontier queue", "Dedup & hashing", "Politeness", "Scheduling"],
-    status: "coming-soon",
+    status: "available",
     sequence: 7,
   },
   {

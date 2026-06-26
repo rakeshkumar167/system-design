@@ -7,15 +7,16 @@ describe("curriculum", () => {
     expect(new Set(problems.map((p) => p.slug)).size).toBe(33);
   });
 
-  it("exposes URL Shortener, Rate Limiter, Pastebin, Notification Service, Distributed Cache, API Gateway, Video Streaming, Ticket Booking, Payment System, Distributed Logging, Collaborative Doc Editor, Cloud Drive, Maps and Navigation, and Distributed Job Scheduler as available", () => {
+  it("exposes URL Shortener, Rate Limiter, Pastebin, Notification Service, Distributed Cache, API Gateway, Web Crawler, Video Streaming, Ticket Booking, Payment System, Distributed Logging, Collaborative Doc Editor, Cloud Drive, Maps and Navigation, and Distributed Job Scheduler as available", () => {
     expect(
       problems.filter((p) => p.status === "available").map((p) => p.slug),
-    ).toEqual(["url-shortener", "rate-limiter", "pastebin", "notification-service", "distributed-cache", "api-gateway", "video-streaming", "ticket-booking", "payment-system", "distributed-logging", "collaborative-doc-editor", "cloud-drive", "maps-navigation", "distributed-job-scheduler"]);
+    ).toEqual(["url-shortener", "rate-limiter", "pastebin", "notification-service", "distributed-cache", "api-gateway", "web-crawler", "video-streaming", "ticket-booking", "payment-system", "distributed-logging", "collaborative-doc-editor", "cloud-drive", "maps-navigation", "distributed-job-scheduler"]);
     expect(getProblem("rate-limiter")?.title).toBe("Rate Limiter");
     expect(getProblem("pastebin")?.title).toBe("Pastebin");
     expect(getProblem("notification-service")?.title).toBe("Notification Service");
     expect(getProblem("distributed-cache")?.title).toBe("Distributed Cache");
     expect(getProblem("api-gateway")?.title).toBe("API Gateway");
+    expect(getProblem("web-crawler")?.title).toBe("Web Crawler");
     expect(getProblem("video-streaming")?.title).toBe("Video Streaming Platform");
     expect(getProblem("ticket-booking")?.title).toBe("Ticket Booking System");
     expect(getProblem("payment-system")?.title).toBe("Payment System");

@@ -412,6 +412,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "web-crawler": {
+    slug: "web-crawler",
+    title: "Design a Web Crawler",
+    description:
+      "An interview-grade walkthrough of a web crawler: the URL frontier (priority and politeness queues), robots.txt and per-host politeness, URL and content deduplication with bloom filters and fingerprints, DNS resolution and fetching at scale, freshness-aware re-crawl scheduling, crawler traps and robustness, scaling, and failure modes.",
+    difficulty: "Advanced",
+    readingMinutes: 36,
+    concepts: ["Frontier queue", "Dedup & hashing", "Politeness", "Scheduling"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "url-frontier", label: "The URL Frontier", depth: "advanced" },
+      { id: "politeness", label: "Politeness & robots.txt", depth: "advanced" },
+      { id: "dedup", label: "URL & Content Deduplication", depth: "advanced" },
+      { id: "dns-fetching", label: "DNS Resolution & Fetching", depth: "advanced" },
+      { id: "freshness-scheduling", label: "Freshness & Re-crawl Scheduling", depth: "advanced" },
+      { id: "traps-robustness", label: "Crawler Traps & Robustness", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

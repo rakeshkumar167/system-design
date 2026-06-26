@@ -1,0 +1,73 @@
+# Design a Web Crawler
+
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section frames the web crawler as a system design interview problem, covering scope, constraints, and what interviewers expect.
+
+<h2 id="requirements">Requirements</h2>
+
+This section establishes the functional and non-functional requirements for a web crawler at internet scale.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the capacity math for crawling tens of billions of pages, estimating crawl rate, bandwidth, fleet size, and storage needs.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core data entities: the crawl URL record, robots.txt cache entry, page content record, and per-host crawl state.
+
+<h2 id="api-design">API Design</h2>
+
+This section specifies the key APIs for seeding the crawler, pulling the next URL from the frontier, and retrieving crawled pages.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the high-level architecture showing seeds, the URL frontier, the fetcher fleet, DNS cache, robots cache, parser, seen-set, content store, and scheduler.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section walks through the four core flows: fetching a page, deduplication checks, politeness enforcement, and re-crawl scheduling.
+
+<h2 id="url-frontier">The URL Frontier</h2>
+
+This section explains the Mercator-style URL frontier with front queues for priority and per-host back queues for politeness, ensuring one in-flight request per host at any time.
+
+<h2 id="politeness">Politeness & robots.txt</h2>
+
+This section covers how the crawler respects robots.txt rules, enforces per-host crawl delays, and identifies itself via a User-Agent header to remain a good citizen.
+
+<h2 id="dedup">URL & Content Deduplication</h2>
+
+This section explains URL deduplication via a bloom filter seen-set and content deduplication using exact content hashes plus simhash and minhash for near-duplicate detection.
+
+<h2 id="dns-fetching">DNS Resolution & Fetching</h2>
+
+This section addresses DNS as a bottleneck, covering asynchronous resolution, DNS caching, and massively concurrent async I/O fetching across the crawler fleet.
+
+<h2 id="freshness-scheduling">Freshness & Re-crawl Scheduling</h2>
+
+This section describes how the scheduler assigns re-crawl cadences based on a page's observed change rate and importance, ensuring fast-changing pages are revisited more often.
+
+<h2 id="traps-robustness">Crawler Traps & Robustness</h2>
+
+This section covers defenses against crawler traps, including depth limits, URL-pattern caps, per-host budget limits, and handling dynamic or infinitely generating pages.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section discusses how the crawler scales horizontally across fetcher nodes, partitions work by host, and evolves from a single-machine to a distributed fleet.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section analyzes failure modes including fetcher crashes, frontier data loss, DNS failures, and storage unavailability, and describes the recovery strategies for each.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares key design decisions such as exact vs. approximate URL dedup, push vs. pull frontier models, and centralized vs. distributed scheduling.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section gives a 60-second interview answer summarizing the end-to-end design: frontier, politeness, bloom-filter dedup, async fetching, and freshness scheduling.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section contains knowledge check questions and a FAQ covering the most common web crawler interview questions and gotchas.
