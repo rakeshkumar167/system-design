@@ -1,39 +1,216 @@
 <h2 id="overview">What TLS & HTTPS Are</h2>
 
-Placeholder.
+Every time you see the padlock in a browser, **TLS** is doing the work. TLS — Transport Layer Security, the modern successor to SSL — is the protocol that turns an ordinary, eavesdroppable network connection into a secure one. **HTTPS is not a separate protocol; it is simply HTTP running over TLS.** The application speaks the same HTTP it always did; TLS sits underneath it, wrapping every byte. Swap the transport and `http://` becomes `https://` with no change to the application's logic.
+
+TLS provides three guarantees, and it's worth naming them precisely because they're often blurred together:
+
+- **Confidentiality** — the connection is **encrypted**, so anyone watching the wire (a malicious Wi-Fi hotspot, an ISP, an attacker on the path) sees only ciphertext, not your passwords, cookies, or data.
+- **Integrity** — the connection is **tamper-evident**, so a man-in-the-middle can't silently alter a message — injecting a script, flipping a transaction amount — without the change being detected and the connection torn down.
+- **Authentication** — you're talking to the **real server** you intended, not an impostor. This is what **certificates** prove, and it's the guarantee people forget: encryption to the *wrong* server is worthless, so verifying identity is as important as hiding the data.
+
+<Callout variant="info" title="HTTPS = HTTP + TLS">
+HTTPS is HTTP carried inside a TLS-secured connection. TLS delivers three things at once: **confidentiality** (encryption — eavesdroppers see ciphertext), **integrity** (tamper-evidence — messages can't be altered undetected), and **authentication** (the certificate proves you reached the genuine server, not a man-in-the-middle). Note the scope: TLS authenticates the *server and the connection*, not the *user* — proving who the human is at login is a separate concern (see [Authentication](/topics/security/authentication)).
+</Callout>
+
+The rest of this topic unpacks how TLS delivers all three: the crypto it's built on, the handshake that bootstraps a secure channel over an insecure one, the certificates and chain of trust behind authentication, and how all of it is operated in practice.
 
 <h2 id="symmetric-asymmetric">Symmetric vs Asymmetric Crypto</h2>
 
-Placeholder.
+TLS rests on two fundamentally different kinds of cryptography, and understanding why it needs *both* is the key that unlocks the handshake.
+
+**Symmetric encryption** uses a **single shared key** to both encrypt and decrypt (AES is the workhorse). It is **fast** — modern CPUs encrypt gigabytes per second — which makes it ideal for the actual bulk data of a connection. But it has a fatal bootstrapping problem: both parties must already share the secret key, and if you have to *send* the key over the network to share it, an eavesdropper simply grabs it in transit and the whole scheme collapses. How do two strangers agree on a secret key over a channel an attacker is **watching every byte of**, without ever transmitting the key itself?
+
+**Asymmetric (public-key) encryption** solves exactly that. Each party has a **key pair**: a **public key** anyone may know, and a **private key** kept secret. Data encrypted with the public key can only be decrypted with the matching private key (and a private key can *sign* data that anyone verifies with the public key). This breaks the bootstrapping problem — you can publish your public key to the world, and someone can use it to send you something only you can read. The catch is that asymmetric operations are **slow** (orders of magnitude slower than symmetric), far too expensive to encrypt every byte of a real connection. In practice TLS uses a key-exchange algorithm (**Diffie-Hellman**) built on the same public-key math to let both sides *derive* a shared secret without ever sending it.
+
+So TLS is a **hybrid**, and this is the whole trick: use the **slow asymmetric** crypto **once**, during the handshake, to securely establish a shared symmetric key; then use the **fast symmetric** crypto for **all the actual data**. You pay the expensive asymmetric cost a single time per connection to bootstrap a cheap, fast, encrypted channel. The [capacity section](#capacity-estimates) shows just how lopsided that cost is.
+
+<KnowledgeCheck
+  question="Why does TLS use both asymmetric and symmetric cryptography instead of just one?"
+  options={[
+    "It uses both purely for redundancy, in case one algorithm is broken",
+    "Symmetric encryption is fast but needs both sides to already share a secret key, which can't be sent over a watched channel without an eavesdropper stealing it; asymmetric crypto solves that key-distribution problem (public/private key pairs let two strangers agree on a secret without transmitting it) but is far too slow for bulk data. TLS is a hybrid: it pays the expensive asymmetric cost once during the handshake to establish a shared symmetric key, then uses fast symmetric encryption for all the actual traffic",
+    "Asymmetric encryption is faster than symmetric, so it handles the bulk data while symmetric handles setup",
+    "Symmetric crypto provides authentication and asymmetric provides encryption; you need one of each",
+  ]}
+  answer={1}
+  explanation="The two kinds of crypto have complementary strengths. Symmetric (e.g. AES) is fast — perfect for encrypting the connection's data — but requires a pre-shared key, and you can't safely send that key over a channel an attacker is watching. Asymmetric/public-key crypto (and Diffie-Hellman key exchange) solves the key-distribution problem without ever transmitting the secret, but it's far too slow to use on every byte. TLS combines them: asymmetric once in the handshake to agree on a shared symmetric key, then symmetric for the bulk traffic — fast and secure."
+/>
 
 <h2 id="tls-handshake">The TLS Handshake</h2>
 
-Placeholder.
+Before a single byte of HTTP flows, TLS runs a **handshake** to set up the secure channel. Three things happen in it. First, **negotiation**: the client offers the TLS versions and **cipher suites** it supports, and the server picks one — so both agree on exactly which algorithms to use. Second, **authentication**: the server presents its **certificate**, which (as the [next section](#certificates-pki) details) proves the server really owns the domain you're connecting to. Third, and most cleverly, **key exchange**: client and server run an **ephemeral Diffie-Hellman** exchange — swapping public values from which each side *independently derives the same shared secret*, while an eavesdropper who saw every exchanged value still cannot compute it. That shared secret becomes the symmetric session key.
+
+The word **ephemeral** matters: a fresh key pair is generated for each session and thrown away afterward. This gives **forward secrecy** — even if the server's long-term private key is stolen *later*, an attacker who recorded today's traffic still can't decrypt it, because the session key was never derivable from the long-term key alone. Forward secrecy is now a baseline expectation.
+
+Versions matter for performance. **TLS 1.3** (the modern default) streamlined the handshake to a **single round trip** (1-RTT), and supports **0-RTT** resumption where a returning client can send data immediately. **TLS 1.2** needed two round trips and is slower; older SSL/TLS versions are insecure and disabled. The handshake is the costly part of TLS — once it completes, the connection is just fast symmetric encryption.
+
+<TlsHandshakeSequence />
+
+<KnowledgeCheck
+  question="What is forward secrecy, and how does the TLS handshake provide it?"
+  options={[
+    "It means the server forgets each session key immediately, so it can't decrypt its own traffic",
+    "Forward secrecy means that compromising the server's long-term private key in the future cannot decrypt past recorded sessions. The handshake achieves it with an ephemeral Diffie-Hellman key exchange: a fresh key pair is generated per session and discarded afterward, and the session key is derived from those ephemeral values — not recoverable from the long-term key alone — so previously captured traffic stays secure even if the long-term key later leaks",
+    "It's the property that TLS 1.3 handshakes complete in zero round trips",
+    "It means certificates are rotated forward to newer ones on every connection",
+  ]}
+  answer={1}
+  explanation="Forward secrecy protects past sessions against a future key compromise. TLS gets it from ephemeral Diffie-Hellman: each session uses a freshly generated, then-discarded key pair, and both sides derive the shared session key from the exchanged ephemeral public values. Because that session key can't be reconstructed from the server's long-term private key, an attacker who records encrypted traffic today and steals the long-term key tomorrow still cannot decrypt what they captured. It's a property of the key exchange, distinct from how many round trips the handshake takes."
+/>
 
 <h2 id="capacity-estimates">Capacity: The Cost of TLS</h2>
 
-Placeholder.
+People worry that "encryption is expensive." The truth is more specific: **the handshake is expensive; the data encryption is cheap.** Symmetric encryption of the actual bytes runs at line rate on modern hardware. What costs real CPU is the **asymmetric** work in the handshake — and the dominant lever on TLS capacity is therefore **how often you have to do a full handshake** versus resuming an existing session. Let's size a busy edge.
+
+<TlsCapacity
+  assumptions={{
+    newConnectionsPerSec: 50000,
+    fullHandshakeCpuMs: 2,
+    resumedHandshakeCpuMs: 0.1,
+    resumptionRate: 0.8,
+    msPerCorePerSec: 1000,
+  }}
+/>
+
+The numbers make the point. At **50,000 new connections/sec**, if *every* connection did a full asymmetric handshake (~2 ms of CPU each), you'd burn **100,000 ms of CPU per second — 100 cores** just on handshakes. But most connections aren't truly new: with **session resumption** (TLS 1.3 resumption / 0-RTT, session tickets) and HTTP **keep-alive** reusing one connection for many requests, ~80% of handshakes are *resumed* at ~20× lower cost (~0.1 ms). That collapses the bill to ~**24,000 ms/sec — 24 cores**, roughly a **4× reduction**. The takeaway threefold: TLS-termination capacity is sized by **handshakes per second, not bytes transferred**; **session resumption and keep-alive are the dominant optimization** (don't re-handshake when you can resume); and because handshake CPU is a concentrated, optimizable cost, it pays to **terminate TLS at a shared, tuned edge** (a load balancer or CDN with hardware acceleration) rather than paying it redundantly on every backend. The [termination section](#tls-termination) builds on exactly that.
 
 <h2 id="certificates-pki">Certificates & the Chain of Trust</h2>
 
-Placeholder.
+The handshake's authentication step rests on the **certificate** — and certificates are where most people's mental model gets fuzzy. A **certificate** (an **X.509** document) **binds a domain name to a public key**, and is **digitally signed by a Certificate Authority (CA)** vouching that the binding is genuine. When the server presents its certificate, it proves it holds the matching private key, so you know the public key you're about to use really belongs to `example.com` and not an impostor.
+
+But that just moves the question: why trust the CA's signature? The answer is a **chain of trust**. Your server's certificate (the **leaf**) is signed by an **intermediate CA**, whose certificate is in turn signed — directly or through more intermediates — by a **root CA**. The roots are the anchor: a curated set of **root certificates ships pre-installed** in your operating system and browser, in what's called the **trust store**. These are the parties you trust *a priori*, without being told to. To validate, the client walks the chain from the leaf upward, verifying each certificate's signature against the next one up, until it reaches a root that is **already in its trust store**. If the chain terminates at a trusted anchor — and the certificate's **domain matches** the site and **nothing has expired** — the server's identity is accepted. This whole system of CAs, certificates, and chained trust is **Public Key Infrastructure (PKI)**.
+
+<CertValidationSequence />
+
+The chain exists so CAs don't sign leaf certificates with their precious, offline root keys directly; the root signs a small number of intermediates, and intermediates do the day-to-day signing. It also means trust is only as strong as the CA system: a compromised or careless CA can issue a certificate for a domain it shouldn't, which is why mechanisms like Certificate Transparency logs and pinning exist as backstops.
+
+<KnowledgeCheck
+  question="How does a browser decide whether to trust a server's certificate?"
+  options={[
+    "It contacts the website's owner directly to confirm the certificate is genuine",
+    "It validates a chain of trust: the server's leaf certificate is signed by an intermediate CA, which is signed (directly or transitively) by a root CA. The browser verifies each signature up the chain until it reaches a root certificate that is pre-installed in its local trust store — a trust anchor it already accepts — and also checks that the certificate's domain matches the site and nothing has expired. If the chain ends at a trusted root and all checks pass, the certificate is trusted",
+    "It trusts any certificate that is cryptographically valid, regardless of who signed it",
+    "It trusts the certificate if the connection is encrypted, since encryption implies authenticity",
+  ]}
+  answer={1}
+  explanation="Trust is anchored in a pre-installed set of root certificates in the OS/browser trust store. A server presents its leaf certificate plus intermediates; the client verifies each certificate's signature against the next one up the chain until it reaches one of those trusted roots. It additionally checks the certificate actually covers the requested hostname and is within its validity dates. Encryption alone proves nothing about identity — you could be encrypting to an impostor — which is exactly why the certificate chain (PKI) is what establishes authentication."
+/>
 
 <h2 id="certificate-lifecycle">Issuance, Expiry & Revocation</h2>
 
-Placeholder.
+Certificates have a life cycle, and operating it correctly is where real systems succeed or fail. **Issuance** starts with proving you control the domain. **Domain Validation (DV)** — the common case — just verifies domain control (e.g. you can place a file or DNS record the CA checks) and is fully **automated**: **ACME**, the protocol behind **Let's Encrypt**, issues and renews DV certificates with no human in the loop, which is why HTTPS is now free and ubiquitous. **Organization (OV)** and **Extended Validation (EV)** certificates add vetting of the legal entity, at more cost and manual effort, for cases where that matters.
+
+Certificates **expire** — deliberately, and lifetimes have been getting **shorter** (often 90 days or less). Short lifetimes limit the damage window of a mis-issued or compromised certificate, but they make **automated renewal non-negotiable**: the single most common TLS outage is a **certificate that quietly expired** because nobody automated its renewal, taking a site down for everyone at once. Automate it (ACME) and monitor expiry dates.
+
+Sometimes a certificate must be **revoked before it expires** — say its private key leaked. Three mechanisms address this, each fixing the last one's flaws:
+
+- **CRL (Certificate Revocation List)** — the CA publishes a list of revoked certificates. Simple, but the lists grow large and are fetched infrequently, so revocation is slow to take effect.
+- **OCSP (Online Certificate Status Protocol)** — the client asks the CA, in real time, "is this specific certificate still valid?" Fresher, but it adds latency to the handshake and leaks the user's browsing to the CA, and clients often "fail open" if the CA is unreachable.
+- **OCSP stapling** — the **server** periodically fetches a fresh, CA-signed status statement and **staples** it to its certificate during the handshake. The client gets up-to-date revocation info with no extra round trip and no privacy leak — the best of both, and the modern recommendation.
 
 <h2 id="https-in-practice">HTTPS in Practice</h2>
 
-Placeholder.
+Beyond the cryptography, a handful of practical mechanisms make HTTPS work at web scale:
+
+- **SNI (Server Name Indication).** A single IP address often hosts many HTTPS sites, but the server must present the *right* certificate before it knows which site you want — a chicken-and-egg. SNI fixes it: the client includes the **hostname it wants in the ClientHello**, so the server can select the matching certificate. It's what makes virtual hosting and shared CDN edges possible. (The hostname is visible in classic TLS; Encrypted Client Hello is the evolving fix.)
+- **ALPN (Application-Layer Protocol Negotiation).** During the handshake, client and server **negotiate which application protocol** to speak — HTTP/2, HTTP/1.1, etc. — so upgrading to HTTP/2 costs no extra round trip.
+- **HSTS (HTTP Strict Transport Security).** A response header telling the browser "**always** use HTTPS for this site, for the next N months." It defends against **downgrade and SSL-stripping** attacks, where an attacker tries to force the victim back onto plaintext HTTP. With HSTS the browser refuses to even try HTTP.
+- **The http→https redirect.** Sites still listen on port 80 only to immediately **redirect to HTTPS** (and then HSTS keeps the browser on HTTPS thereafter).
+- **Mixed content.** An HTTPS page that pulls a script or stylesheet over plain `http://` reopens the very hole HTTPS closed — that asset can be tampered with. Browsers **block active mixed content**; everything a secure page loads should itself be secure.
+
+<KnowledgeCheck
+  question="What problem does SNI solve, and what does HSTS protect against?"
+  options={[
+    "SNI encrypts the certificate and HSTS speeds up the handshake",
+    "SNI lets the client name the hostname it wants in the ClientHello, so a server (or CDN edge) hosting many HTTPS sites on one IP can present the correct certificate — solving the chicken-and-egg of needing the right cert before knowing which site is wanted. HSTS is a header that forces the browser to always use HTTPS for a site, defending against downgrade / SSL-stripping attacks that try to push the victim back onto plaintext HTTP",
+    "SNI negotiates the application protocol (HTTP/2 vs HTTP/1.1) and HSTS blocks mixed content",
+    "Both are optional performance optimizations with no security relevance",
+  ]}
+  answer={1}
+  explanation="SNI (Server Name Indication) carries the desired hostname in the ClientHello so one IP can serve many TLS sites — the server picks the right certificate based on it; that's what makes shared hosting and CDN edges work. HSTS (HTTP Strict Transport Security) is a response header instructing the browser to use HTTPS exclusively for a domain going forward, preventing downgrade/stripping attacks that try to force a plaintext connection. (Negotiating HTTP/2 vs HTTP/1.1 is ALPN's job, and blocking insecure sub-resources is the mixed-content policy — different mechanisms.)"
+/>
 
 <h2 id="tls-termination">TLS Termination & mTLS</h2>
 
-Placeholder.
+**Where** does TLS actually end? Rarely on the application server itself. In most architectures TLS is **terminated at the edge** — a **load balancer, reverse proxy, or CDN** decrypts the incoming TLS connection and forwards the request to the backends. This **centralizes certificate management** (one place to install and rotate certs) and **concentrates the handshake CPU** (the expensive part from the [capacity section](#capacity-estimates)) on a tier built and tuned for it, often with hardware acceleration. There are three patterns:
+
+- **Termination** — TLS ends at the edge; traffic to backends is plaintext on a trusted internal network. Simplest and fastest.
+- **Passthrough** — the edge forwards the encrypted bytes untouched and the backend terminates TLS itself, for cases where even the edge shouldn't see plaintext.
+- **Re-encryption** — the edge terminates the client's TLS, then opens a *new* TLS connection to the backend, so traffic is encrypted end to end while the edge still inspects/routes it.
+
+So far TLS authenticated only the **server** to the client. **Mutual TLS (mTLS)** makes it bidirectional: **both** sides present certificates, so the server also verifies the **client's** identity cryptographically. This is the backbone of **service-to-service** authentication in **zero-trust** architectures and **service meshes** — every service proves who it is with a certificate, so the network itself is never implicitly trusted. mTLS is overkill for public web traffic (you can't issue every user a certificate) but ideal *inside* a system, where you control both ends.
+
+<TradeoffTable
+  columns={["Mode", "Where TLS ends", "Trade-off"]}
+  rows={[
+    ["Termination at edge", "Load balancer / proxy / CDN", "Simple, centralized certs, offloaded handshake CPU; backend traffic is plaintext on the internal network"],
+    ["Passthrough", "The backend server", "Edge never sees plaintext, but can't inspect/route on content and each backend manages certs"],
+    ["Re-encryption", "Edge, then re-encrypted to backend", "End-to-end encryption plus edge routing — at the cost of a second handshake per hop"],
+    ["Mutual TLS (mTLS)", "Both ends, both authenticated", "Strong service-to-service identity for zero-trust; needs a cert per client, so impractical for public users"],
+  ]}
+  recommendedRow={0}
+/>
+
+<KnowledgeCheck
+  question="What is mutual TLS (mTLS) and where is it used?"
+  options={[
+    "It's TLS that uses two certificates from the same CA for extra encryption strength",
+    "In mTLS both sides of the connection present certificates, so the server authenticates the client's identity in addition to the client authenticating the server. It's the backbone of service-to-service authentication in zero-trust architectures and service meshes — each service proves who it is with a certificate so the network is never implicitly trusted. It's impractical for public web users (you can't issue every visitor a certificate) but ideal inside a system you control",
+    "It's when TLS is terminated at both the load balancer and the backend",
+    "It's a faster handshake mode where both sides skip certificate validation",
+  ]}
+  answer={1}
+  explanation="Standard TLS authenticates only the server to the client. Mutual TLS adds the reverse: the client also presents a certificate, so both ends are cryptographically authenticated. That makes it the foundation of zero-trust, service-to-service security — in a service mesh every workload has its own certificate and proves its identity on each connection, removing implicit network trust. It's well suited to internal systems where you control both ends and can issue certificates, but unworkable for arbitrary public users."
+/>
 
 <h2 id="pitfalls-best-practices">Pitfalls & Best Practices</h2>
 
-Placeholder.
+TLS is mature, but the operational failure modes are common and avoidable:
+
+<Callout variant="warning" title="TLS footguns">
+- **Expired certificates.** The number-one TLS outage: a cert quietly expires and the whole site goes down at once. **Automate renewal** (ACME/Let's Encrypt) and **monitor expiry dates** with alerts well ahead of time.
+- **Weak protocol versions and ciphers.** Disable SSLv3, TLS 1.0, and TLS 1.1, and drop weak cipher suites. **Prefer TLS 1.3** and require **forward secrecy** (ephemeral key exchange).
+- **Self-signed or untrusted chains.** A certificate that doesn't chain to a trusted root (or is missing its intermediates) breaks validation; ship the full chain and use a real CA in production.
+- **Not validating the hostname.** A valid certificate for the *wrong* domain is an attack; always check the cert covers the host you connected to (a classic bug in hand-rolled clients).
+- **Downgrade / SSL-stripping attacks.** Force HTTPS with **HSTS**, redirect http→https, and avoid **mixed content**.
+- **Protect the private key.** It's the crown jewel — store it securely (an HSM or secrets manager), restrict access, and rotate if exposure is suspected. Short cert lifetimes and forward secrecy limit the blast radius if it leaks.
+</Callout>
+
+<DecisionRecord
+  title="The default TLS/HTTPS posture"
+  choice="Serve everything over HTTPS with TLS 1.3 (TLS 1.2 only as a fallback), requiring forward-secret ephemeral key exchange and modern cipher suites. Terminate TLS at a shared edge (load balancer or CDN) to centralize certificates and offload handshake CPU, leaning on session resumption and keep-alive. Obtain DV certificates via ACME/Let's Encrypt with fully automated renewal and expiry monitoring, and use OCSP stapling for revocation. Enforce HTTPS with an http→https redirect plus HSTS, and block mixed content. For internal service-to-service traffic, use mTLS so both ends are authenticated."
+  rationale="TLS 1.3 + forward secrecy is faster (1-RTT) and protects past sessions against future key compromise. Edge termination concentrates the expensive asymmetric handshake on a tuned tier and makes certificates a single operational concern; resumption keeps that CPU ~4× lower. Automated DV issuance/renewal eliminates the most common TLS outage (expiry) and makes HTTPS free and universal. HSTS and the redirect close downgrade/stripping holes. mTLS extends authentication to both ends for zero-trust internal communication."
+  alternatives="Terminating TLS on each app server — avoids an edge hop but scatters certificates and handshake CPU everywhere. Long-lived manually-renewed certificates — fewer renewals but a far higher risk of a forgotten-expiry outage and a longer compromise window. OCSP without stapling — works but adds handshake latency and leaks browsing to the CA. Passthrough/re-encryption — needed when even the edge must not see plaintext, at extra cost. Skipping HSTS — leaves users exposed to a first-connection downgrade."
+  revisitWhen="Regulatory requirements demand end-to-end encryption past the edge (use re-encryption or passthrough); a zero-trust mandate pushes mTLS everywhere internally; very high new-connection rates make handshake CPU or session-resumption strategy a bottleneck; or you adopt newer privacy features like Encrypted Client Hello."
+/>
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="In the capacity model, handshakes cost ~100 cores without resumption but ~24 with it. Why is that the headline lesson of TLS performance?"
+  options={[
+    "Because resumption makes the symmetric encryption of data faster",
+    "Because the expensive part of TLS is the asymmetric handshake, not encrypting the bytes — symmetric encryption runs at line rate. So TLS-termination capacity is sized by handshakes per second, not throughput, and session resumption plus keep-alive (which avoid full handshakes) are the dominant optimization: resuming ~80% of connections cuts handshake CPU roughly 4× (~100 cores to ~24). It's also why TLS is terminated at a shared, tuned edge rather than re-handshaked everywhere",
+    "Because 100 cores is cheap, so TLS performance never matters",
+    "Because resumption reduces the number of bytes that must be encrypted",
+  ]}
+  answer={1}
+  explanation="The asymmetric work in the handshake is what costs CPU; encrypting the actual data with symmetric crypto is nearly free by comparison. That reframes TLS capacity around handshakes/sec rather than bandwidth. Session resumption (and HTTP keep-alive reusing a connection for many requests) lets most connections skip the full handshake at ~20× lower cost, collapsing ~100 cores to ~24 here. The same fact — handshake CPU is a concentrated, optimizable cost — is why systems terminate TLS at a shared, hardware-accelerated edge instead of paying it redundantly on every backend."
+/>
+
+<Faq
+  items={[
+    { question: "What's the difference between TLS, SSL, and HTTPS?", answer: "SSL is the old name for the protocol; TLS (Transport Layer Security) is its modern successor — people still say 'SSL' loosely, but production uses TLS (1.2 and 1.3; older versions are insecure). HTTPS is not a separate protocol at all: it's just HTTP carried over a TLS-secured connection. TLS provides the security (confidentiality, integrity, authentication); HTTP is the unchanged application protocol running inside it." },
+    { question: "What three things does TLS guarantee?", answer: "Confidentiality (the connection is encrypted, so eavesdroppers see only ciphertext), integrity (messages can't be altered in transit without detection), and authentication (the certificate proves you reached the genuine server, not an impostor). The authentication piece is easy to overlook but essential — encrypting to the wrong server is worthless. Note TLS authenticates the server/connection, not the user's login." },
+    { question: "Why does TLS use both symmetric and asymmetric cryptography?", answer: "Symmetric encryption is fast and ideal for bulk data but requires a pre-shared key you can't safely send over a watched channel. Asymmetric/public-key crypto solves that key-distribution problem (and enables Diffie-Hellman key exchange) but is far too slow for every byte. TLS is a hybrid: it uses asymmetric crypto once during the handshake to establish a shared symmetric session key, then uses fast symmetric encryption for all the traffic." },
+    { question: "What happens during the TLS handshake?", answer: "Client and server negotiate a protocol version and cipher suite, the server presents its certificate to prove its identity, and both sides perform an ephemeral Diffie-Hellman key exchange to independently derive the same shared session key without ever transmitting it. After that, fast symmetric encryption protects the data. TLS 1.3 does this in one round trip (with 0-RTT resumption); TLS 1.2 took two." },
+    { question: "What is forward secrecy?", answer: "The property that compromising the server's long-term private key in the future does not let an attacker decrypt past recorded sessions. TLS provides it with ephemeral key exchange: each session generates and then discards a fresh key pair, and the session key is derived from those ephemeral values rather than the long-term key — so captured traffic stays secure even if the long-term key later leaks. It's now a baseline expectation." },
+    { question: "What is a certificate and how is it trusted?", answer: "An X.509 certificate binds a domain name to a public key and is signed by a Certificate Authority (CA). Trust flows through a chain: the server's leaf certificate is signed by an intermediate CA, which chains up to a root CA whose certificate is pre-installed in the OS/browser trust store. The client verifies each signature up the chain to a trusted root, and checks the domain matches and nothing has expired. This whole system is PKI." },
+    { question: "Why do certificates expire, and what is ACME/Let's Encrypt?", answer: "Short lifetimes limit the damage window of a mis-issued or compromised certificate, but they make automated renewal essential — an unrenewed cert is the most common cause of TLS outages. ACME is the protocol that automates domain-validated issuance and renewal; Let's Encrypt is the free CA that popularized it, which is why HTTPS is now free and ubiquitous. Automate renewal and alert on upcoming expiry." },
+    { question: "How is a certificate revoked before it expires?", answer: "Three mechanisms: a CRL (Certificate Revocation List) the CA publishes (simple but slow to propagate); OCSP (Online Certificate Status Protocol), a real-time status query to the CA (fresher but adds handshake latency and leaks browsing to the CA); and OCSP stapling, where the server fetches a fresh signed status and attaches it during the handshake (up-to-date, no extra round trip, no privacy leak — the modern recommendation)." },
+    { question: "What is TLS termination and where does it happen?", answer: "TLS termination is where the encrypted connection is decrypted. Usually it's at the edge — a load balancer, reverse proxy, or CDN — which centralizes certificate management and concentrates the expensive handshake CPU on a tuned tier. Variants are termination (plaintext to backends on a trusted network), passthrough (backend terminates), and re-encryption (edge terminates then opens a new TLS connection to the backend for end-to-end encryption)." },
+    { question: "What is mutual TLS (mTLS)?", answer: "In mTLS both sides present certificates, so the client is authenticated to the server as well as the server to the client. It's the foundation of zero-trust, service-to-service security and service meshes — every service proves its identity with a certificate, so the network is never implicitly trusted. It's ideal inside a system you control but impractical for public web users, since you'd need to issue every visitor a certificate." },
+    { question: "What is HSTS and why does it matter?", answer: "HSTS (HTTP Strict Transport Security) is a response header that tells the browser to use HTTPS exclusively for a domain for a set period. It defends against downgrade and SSL-stripping attacks that try to force a victim onto plaintext HTTP — with HSTS the browser won't even attempt an http connection. Pair it with an http→https redirect and avoid mixed content (an HTTPS page loading http sub-resources, which browsers block)." },
+    { question: "Why is the TLS handshake the expensive part, not the encryption?", answer: "Symmetric encryption of the data runs at line rate on modern CPUs — it's nearly free. The cost is the asymmetric cryptography in the handshake, so TLS capacity is sized by handshakes per second, not bandwidth. Session resumption and HTTP keep-alive avoid full handshakes on most connections (a resumed handshake is ~20× cheaper), which is why a busy edge needs far fewer cores with resumption than without, and why TLS is terminated at a shared, optimized edge." },
+  ]}
+/>
