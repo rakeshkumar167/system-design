@@ -1,71 +1,374 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section frames the news feed problem as it appears in system design interviews.
+A news feed is the home timeline you see when you open Facebook, Twitter/X, Instagram, or LinkedIn: a personalized, ranked list of recent posts from the accounts you follow. You follow some people; they post; their posts show up in your feed, newest and most relevant first; you scroll, and more load. From the outside it's a textbook database query — "select posts where author in (the people I follow) order by created_at desc limit 50" — and that framing produces something that works for a hundred users and a thousand posts and then becomes impossible at a billion users: each feed open would scatter a query across hundreds of followees living on many shards, merge and sort the results on the fly, and do this for billions of feed opens a day. The query is simple; running it at scale, on every refresh, is the wall.
+
+The hard part is that **read-time aggregation is too expensive at scale, so you precompute each user's feed — and that precomputation has its own problems**. Three things dominate, and the database query is the easy one. First, **fan-out**: rather than aggregate at read time (**pull**), you aggregate at *write* time (**push**) — when someone posts, you push that post into the precomputed feed of every one of their followers, so a feed read becomes a single O(1) lookup of a ready-made list. That trades a cheap, rare write for an expensive, frequent read — the right trade, because feeds are read far more than written and must feel instant — but it creates enormous **write amplification** (one post becomes as many feed writes as the author has followers). Second, **hot users**: pure push **breaks for celebrities** — a post by an account with 100 million followers is 100 million feed writes, most of them landing in feeds nobody will read that day — so real systems go **hybrid**: push for ordinary accounts, but for high-fan-out accounts *don't* push; instead **pull** their recent posts at read time and **merge** them in. Third, **ranking and storage**: modern feeds aren't chronological — they're **relevance-ranked** by affinity, recency, and predicted engagement — and the precomputed feed stores only **post IDs**, not content, which are **hydrated** from a post store at read time so an edit or delete is reflected once instead of being copied into millions of feeds. The reframe to lead with: *it looks like a query over the people you follow, but that query is impossible to run at scale on every read — so you precompute feeds by fanning out on write, go hybrid for celebrities to bound the write amplification, rank for relevance, and store feeds as lists of post IDs hydrated from a post store. Reading a feed is trivial once it's precomputed; precomputing it cheaply, for everyone, including the accounts with a hundred million followers, is the design.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- Chronological or ranked? Ranking changes the read path (a scoring step) and is what most modern feeds do.
+- How big — average followers, and how skewed? The skew (celebrities) is what forces the hybrid model.
+- How fresh must posts be — seconds, or is a short delay fine? Fan-out is asynchronous, so feeds are eventually consistent.
+- Read-heavy or write-heavy from the user's view? (Reads dominate user behavior, but push makes the *system* write-heavy — worth naming.)
+- One feed type, or many surfaces (home, profile, explore)? We'll design the home feed.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "the query is impossible, so precompute via fan-out" reframe · **5 min** requirements (read latency, read scale, fan-out, freshness) · **5 min** capacity (fan-out write amplification: ~5.8k posts/sec → ~1.74M feed writes/sec) · **5 min** entity model (Post, FeedEntry) and the API · **8 min** fan-out on write vs read — the centerpiece · **8 min** the hybrid model for hot users + ranking · **5 min** storage/hydration, the pipeline, failure modes, wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for fan-out-on-write, a hybrid for celebrities, and feeds-as-ID-lists, not whether you can write the SQL.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** fan-out on write vs read, the hybrid model and hot-user handling, feed ranking (chronological vs relevance), feed storage + hydration + caching, the async fan-out pipeline, and the read path (pagination, dedup, freshness) — plus scaling, failure modes, and trade-offs. **Out of scope:** the post-composition / media-upload pipeline and the **Notification Service** that *also* reacts to a post (separate systems), the ML ranking models themselves beyond the signals they consume, the social-graph service internals (we treat "who follows whom" as a dependency), content moderation/spam beyond a mention, and direct messaging (that's the **Chat System**). Name them so the interviewer sees the boundary, then set them aside. This problem reuses the **async fan-out queue/worker pattern** from the **Notification Service** and the **precompute-for-fast-reads** intuition from **Search Autocomplete**, but centers them on *aggregating and ranking a personalized timeline at scale*.
 
 <h2 id="requirements">Requirements</h2>
 
-This section defines the functional and non-functional requirements for a news feed system.
+Separate what the system must *do* from how *well* it must do it. The functional list is short; the difficulty is in the non-functional column — read latency and scale, write fan-out, and freshness — which is what turns a query into a distributed system.
+
+<RequirementsTable
+  functional={[
+    "Create a post (text and/or media)",
+    "Follow and unfollow accounts",
+    "Fetch a ranked feed of followed accounts' posts",
+    "Paginate through the feed",
+    "See newly posted content promptly",
+    "Rank by relevance, not just recency",
+  ]}
+  nonFunctional={[
+    { goal: "Read latency", target: "feed opens instantly (tens of ms)" },
+    { goal: "Read scale", target: "billions of feed reads / day" },
+    { goal: "Write fan-out", target: "a post reaches all followers' feeds" },
+    { goal: "Freshness", target: "posts appear within seconds" },
+    { goal: "Availability", target: "the feed must always render" },
+    { goal: "Consistency", target: "eventual — feeds may lag a few seconds" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **the feed read must be instant**: people open and refresh their feed constantly, so the read path has to be a fast lookup, not a multi-shard aggregation — which is the whole reason to **precompute** feeds. Second, **fan-out makes the system write-heavy even though the product is read-heavy**: pushing each post to all followers means a moderate post rate becomes a huge feed-write rate (the capacity section puts it at ~300×), so the fan-out must be an **asynchronous, horizontally-scaled pipeline** that posting latency never waits on. Third, **freshness is eventual, and availability beats consistency**: because fan-out is async, a brand-new post may take a few seconds to appear in every follower's feed — perfectly acceptable for a timeline — and if something fails, the feed must still **render** (serve a slightly stale or cached version) rather than error, because a blank feed is a far worse experience than an outdated one. Note what's *relaxed*: there's **no strict ordering or exactly-once** requirement (an occasional duplicate filtered by post ID, or a post arriving a second late, is fine), and **coverage can be lazy** (feeds for inactive users needn't be eagerly maintained). The system trades strict freshness and consistency for instant reads, bounded write cost, and an always-rendering feed.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the capacity math for posts, fan-out writes, and feed reads.
+Estimates here separate the modest part (posting) from the signature part (fan-out). Creating posts is an ordinary write rate; what explodes is what happens *after* a post is created, when it's multiplied across the author's followers.
+
+<NewsFeedCapacity
+  assumptions={{
+    dailyActiveUsers: 300000000,
+    dailyPosts: 500000000,
+    avgFollowers: 300,
+    feedReadsPerUserPerDay: 50,
+    feedLengthCached: 1000,
+    bytesPerFeedEntry: 32,
+    fanoutWritesPerSecPerWorker: 10000,
+  }}
+/>
+
+The takeaways. First — the signature lesson — **fan-out is a write amplifier**: 500 million posts a day is only ~**5,787 posts/sec**, a modest write rate, but fan-out-on-write multiplies every post by its author's follower count, so at ~300 followers each it becomes ~**1,736,111 feed writes/sec** — a ~**300× amplification** that turns a read-oriented product into a fundamentally **write-heavy system**, needing ~**174 fan-out workers** to keep up. That is the *price* of precomputation. Second — the *payoff* — **reads are cheap**: because each user's feed is already assembled, the ~**173,611 feed reads/sec** are single lookups of a ready-made list, not multi-shard aggregations. You've deliberately moved the work from the frequent, latency-critical read to the rarer, latency-tolerant write. Third, **feeds store IDs, not content**: 300M users × 1,000 cached entries × 32 bytes is only ~**9.6 TB** across a distributed cache, because a feed entry is just a **post ID** plus a score — the actual post content (text, media, author, counters) lives once in a **post store** and is **hydrated** at read time, so editing or deleting a post touches one record instead of millions of feeds. And the amplification is exactly why **celebrities break pure push**: an account with 100 million followers turns *one* post into 100 million feed writes, a spike no push pipeline should absorb — which forces the **hybrid** model. The capacity story: the feed is hard because of **fan-out write amplification and ranking**, not because reading a precomputed list is difficult.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core entities: Post, FeedEntry, Follow edge, and User.
+The model centers on the **Post** — the content one user creates — and the **FeedEntry**, the precomputed pointer that places a post in a follower's feed. The most important ideas are that a FeedEntry stores a **post ID and a score, not the content** (content is hydrated from the post store), that feeds are **per-user and bounded** in length, and that the **follow graph** is a separate dependency the fan-out consults.
+
+<EntityModel
+  name="Post"
+  description="A single piece of content created by a user: the author, the body and any media, when it was created, and denormalized engagement counters. A Post is stored once in the post store; it is never copied into feeds — feeds reference it by id and hydrate it at read time, so an edit or delete is reflected everywhere by changing one record."
+  fields={[
+    { name: "post_id", type: "string", notes: "unique id; the key feeds reference and hydrate by" },
+    { name: "author_id", type: "string", notes: "who posted — used by fan-out to find followers" },
+    { name: "content", type: "text", notes: "the post body" },
+    { name: "media_url", type: "string", notes: "optional image/video reference (in blob storage)" },
+    { name: "created_at", type: "datetime", notes: "post time — a recency signal for ranking" },
+    { name: "like_count", type: "int", notes: "denormalized engagement counter (also comments/shares)" },
+    { name: "visibility", type: "enum", notes: "public | followers | private — filters fan-out" },
+  ]}
+  keys="A Post lives once in the post store, keyed by post_id. A FeedEntry is the precomputed unit of a feed: (user_id, post_id, score, inserted_at) — it stores the post's id and a ranking score, NOT its content, so feeds are tiny (IDs, not bytes) and a post is hydrated from the post store at read time. Each user's feed is a bounded list (e.g. the most recent ~1,000 entries) in a fast in-memory store, written by fan-out and read in one lookup. The Follow edge (follower_id → followee_id) is the social graph: fan-out reads an author's followers to know whose feeds to write, and the read path uses it (for the hybrid pull of hot accounts). Source of truth: posts in the post store and the follow graph; the per-user feeds are a derived, rebuildable cache."
+/>
+
+Two supporting entities complete the picture. The **FeedEntry** is the precomputed unit — `(user_id, post_id, score, inserted_at)` — held in a per-user, length-bounded list in a fast store; it carries an **ID and a score**, never the post body, which is the reason feeds are only ~9.6 TB and why a post edit isn't a million rewrites. The **Follow edge** (`follower_id → followee_id`) is the **social graph** the design treats as a dependency: fan-out reads an author's followers to decide whose feeds to update, and the read path consults it to pull hot accounts. And the **per-user feed** itself is a **derived cache** — rebuildable at any time from the post store plus the graph — which is what makes recovery cheap. The discipline: store each post **once** and reference it by ID from feeds; keep feeds as **bounded lists of IDs + scores**; and treat the feed cache as **derived state** over the durable post store and follow graph.
 
 <h2 id="api-design">API Design</h2>
 
-This section specifies the public API contracts for posting, reading the feed, and following users.
+The surface is three operations: create a post (which kicks off the async fan-out), read the feed (the hot path), and follow an account (which changes the graph and future fan-out). The read endpoint dominates traffic; the post endpoint returns fast and lets the pipeline do the heavy work.
+
+<ApiContract
+  method="POST"
+  path="/posts"
+  summary="Create a post; returns immediately and triggers asynchronous fan-out."
+  request={`POST /posts
+{ "author_id": "u_42", "content": "shipping the new feed!", "media_url": null, "visibility": "public" }`}
+  response={`HTTP/1.1 201 Created
+{ "post_id": "p_9f2c", "created_at": "2026-06-27T10:00:00Z", "fanout": "queued" }`}
+  statusCodes={[
+    { code: "201", meaning: "Post persisted; a fan-out job is enqueued (delivery is async)" },
+    { code: "400", meaning: "Empty/invalid content or disallowed media" },
+  ]}
+  notes="Posting must be fast, so it persists the post and enqueues fan-out, then returns. The post reaching all followers' feeds happens asynchronously over the next seconds — the response does not wait for fan-out to complete."
+/>
+
+<ApiContract
+  method="GET"
+  path="/feed"
+  summary="The hot path: read the ranked, paginated feed for a user."
+  request={`GET /feed?user_id=u_7&cursor=eyJ0cyI6...&limit=20`}
+  response={`HTTP/1.1 200 OK
+{ "items": [
+    { "post_id": "p_9f2c", "author_id": "u_42", "content": "shipping the new feed!", "score": 0.97, "created_at": "2026-06-27T10:00:00Z", "like_count": 1203 } ],
+  "next_cursor": "eyJ0cyI6..." }`}
+  statusCodes={[
+    { code: "200", meaning: "Returns a hydrated, ranked page; empty list if nothing to show" },
+    { code: "400", meaning: "Bad cursor or limit" },
+  ]}
+  notes="Reads the precomputed feed (post IDs) in one lookup, merges any pulled hot-user posts, hydrates content from the post store, ranks, and returns a page via an opaque cursor for stable pagination. Must always return something renderable — degrade to cached/stale over failing."
+/>
+
+<ApiContract
+  method="POST"
+  path="/follow/{userId}"
+  summary="Follow an account; affects the social graph and future fan-out."
+  request={`POST /follow/u_42
+{ "follower_id": "u_7" }`}
+  response={`HTTP/1.1 200 OK
+{ "following": true, "backfill": "queued" }`}
+  statusCodes={[
+    { code: "200", meaning: "Edge added; future posts by u_42 fan out to u_7" },
+    { code: "409", meaning: "Already following" },
+  ]}
+  notes="Adds a follow edge so the author's future posts reach this follower. Past posts can be lazily backfilled into the follower's feed (or simply pulled at read time), so following takes effect without rebuilding a feed synchronously."
+/>
+
+The whole surface is: post (async fan-out), read the feed (the million-plus-per-second hot path), and follow (a graph mutation). There's no synchronous heavy operation on the request path — posting enqueues work and returns, and reading hits a precomputed list — which is exactly what lets the feed feel instant while the expensive fan-out happens in the background.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the high-level architecture of the news feed system.
+The architecture is two planes that meet at the per-user feed: a **write/fan-out plane** that pushes new posts into followers' precomputed feeds, and a **read plane** that serves those feeds and hydrates them into full posts.
+
+<NewsFeedArchitecture />
+
+- **Client.** Posts content and reads the feed; paginates by cursor.
+- **Post Service.** Persists a post to the post store and triggers fan-out. Returns fast.
+- **Post Store.** The durable home of every post (content, media reference, author, counters) — the source of truth, read once per hydration.
+- **Fan-out Service.** On a new post, reads the author's followers from the social graph and enqueues fan-out jobs. Decides push vs hybrid based on the author's follower count.
+- **Social Graph.** The follow edges — who follows whom — a dependency consulted by fan-out and the hybrid read.
+- **Fan-out Queue.** Decouples posting from fan-out so spikes are absorbed and posting never waits.
+- **Fan-out Workers.** Consume jobs and write the post ID into each follower's feed (batched, sharded by user). Idempotent — a retry can't duplicate an entry.
+- **Feed Cache.** The precomputed per-user feeds — bounded lists of post IDs + scores — in a fast in-memory store. A read is one lookup here.
+- **Feed Service.** Reads the precomputed feed, merges pulled hot-user posts, hydrates content from the post store, ranks, and returns a page.
+
+The decisive boundary is **the write plane precomputes feeds by fanning out on write, and the read plane serves and hydrates them** — connected by the per-user feed cache, which is derived state over the durable post store and graph. Fan-out is asynchronous (queue + workers) so posting stays fast and spikes are absorbed; feeds store IDs so they're tiny and a post edit is one write; the read path hydrates and ranks over a small candidate set; and the hybrid decision (push vs pull) lives in the fan-out and read services so celebrities don't trigger a write storm. Every section that follows elaborates one piece: the push/pull choice, the hybrid for hot users, ranking, storage and hydration, the fan-out pipeline, and the read path.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section walks through the publish fan-out, read feed, hybrid merge, and feed ranking flows.
+Four flows cover the system: publishing a post and fanning it out, reading a precomputed feed, the hybrid merge for a hot-user follow, and ranking. The first two are the everyday write and read paths; the others are what make those paths scale and feel relevant.
+
+**Publish a post and fan it out.** The client creates a post; the post service stores it once and triggers fan-out; a worker looks up the author's followers and writes the post ID into each follower's precomputed feed. This is the write path — one durable post, many cheap feed pointers, done asynchronously.
+
+<PublishFanoutSequence />
+
+**Read a precomputed feed.** The feed service reads the user's precomputed feed (a list of post IDs) in one lookup, hydrates the content from the post store, ranks, and returns a page. This is the hot path, and it does no multi-shard aggregation — the aggregation already happened at write time.
+
+<ReadFeedSequence />
+
+**Merge a hybrid feed for a hot-user follow.** When a user follows a celebrity whose posts aren't pushed, the feed service reads the pushed feed *and* pulls the hot account's recent posts at read time, then merges and ranks them into one feed. This is how the hybrid model keeps pure push from exploding while still showing celebrity posts.
+
+<HybridMergeSequence />
+
+**Rank a feed by relevance.** The feed service scores candidate posts by signals like affinity, recency, and predicted engagement, orders them, and returns the top — so the feed is ranked, not strictly chronological.
+
+<FeedRankingSequence />
 
 <h2 id="fanout-models">Fan-out: Write vs Read</h2>
 
-This section compares fan-out-on-write (push) and fan-out-on-read (pull) and explains when each applies.
+This is the centerpiece, and the whole design pivots on it. There are two ways to assemble a feed. **Fan-out on read (pull)**: store each post once, and when a user opens their feed, query all the accounts they follow, merge the results, and sort — assembling the feed *at read time*. It's simple and storage-cheap (one copy of each post, no precomputed feeds), and it's always fresh, but every single read does an expensive **scatter-gather** across hundreds of followees on many shards, and feeds are read constantly — so this melts under read load. **Fan-out on write (push)**: when a post is created, immediately write its ID into the precomputed feed of every follower, so when a user opens their feed it's a **single O(1) lookup** of a ready-made list. Reads become trivial; the cost moves to writes, which now carry the fan-out **amplification** (one post → as many feed writes as the author has followers) and do some wasted work (pushing into feeds of users who won't read them soon).
+
+The choice comes down to **where you can afford to pay**: feeds are read far more often than they're written, and reads are the latency-critical, user-facing operation, so you want reads cheap — which means **push is the default for the body of users**. You spend extra, latency-tolerant work at write time (precomputing feeds) to make the frequent, latency-critical read a simple lookup; it's the same precompute-for-fast-reads trade as **Search Autocomplete**'s top-k. Pull isn't useless, though — it's exactly right when fan-out would be wasteful: rarely-read feeds (inactive users) and, crucially, **very high fan-out accounts** (the next section), where pushing to tens of millions of followers costs far more than pulling on demand. The principle: **fan-out on read is simple but pays on every read; fan-out on write precomputes feeds so reads are O(1) but pays write amplification** — and because reads dominate and must be instant, push is the default, with pull reserved for where push is wasteful.
+
+<KnowledgeCheck
+  question="Why do large news feeds default to fan-out-on-write (push) rather than fan-out-on-read (pull)?"
+  options={[
+    "Push uses less storage than pull",
+    "Feeds are read far more often than written and reads must be instant, so push moves the work to write time: when a post is created it's written into every follower's precomputed feed, making a read a single O(1) lookup instead of an expensive scatter-gather across hundreds of followees on every read. The cost is write amplification (one post → many feed writes) and some wasted work, which is the right trade because reads dominate and are latency-critical",
+    "Pull cannot rank posts, only push can",
+    "Push guarantees perfectly fresh feeds with no delay",
+  ]}
+  answer={1}
+  explanation="Pull assembles the feed at read time by querying all followees and merging — simple and always fresh, but a costly scatter-gather on every read, and feeds are read constantly. Push precomputes each follower's feed when a post is created, so a read is one lookup of a ready-made list. Since reads vastly outnumber writes and must be instant, paying extra (latency-tolerant) work at write time to make the frequent read cheap is the right trade — the same precompute-for-fast-reads idea as autocomplete's top-k. The cost is fan-out write amplification, addressed for celebrities by the hybrid model."
+/>
 
 <h2 id="hybrid-hot-users">The Hybrid Model & Hot Users</h2>
 
-This section explains how the hybrid model handles celebrity accounts that would otherwise produce millions of fan-out writes per post.
+Pure push has a fatal edge case: **celebrities**. An account with 100 million followers turns a *single* post into 100 million feed writes — an enormous, spiky burst of work, most of it landing in the feeds of users who won't open the app before the post is stale. The amplification that's merely large for an average account (hundreds of followers) becomes catastrophic at the top of the follower distribution, which is heavily **skewed**: a tiny number of accounts have a vast share of the follows. Pushing for them wastes compute and storage and creates thundering-herd write spikes whenever they post.
+
+The fix is the **hybrid model**: **push for ordinary accounts, pull for hot ones**. Most of everyone's feed is still precomputed by fan-out-on-write, as before. But for a small set of **high-fan-out accounts** — identified by a follower-count threshold — the system **does not push** their posts; instead, at **read time**, the feed service **pulls** those accounts' recent posts directly and **merges** them into the reader's precomputed feed before ranking. Because a user follows only a handful of celebrities, this read-time pull is cheap (a few extra lookups), and it eliminates the millions of wasteful writes. The threshold is a tuning knob: set it where push amplification stops being worth it. Related optimizations ride along — feeds for **inactive users** can be built lazily (pulled on their rare visits rather than eagerly pushed), and a newly-**followed** account's back-catalog can be pulled rather than back-pushed. The principle: bound write amplification by **not pushing high-fan-out accounts** — push the common case for cheap reads, **pull-and-merge the celebrity tail at read time**, and tune the threshold so neither the write storm of full push nor the read cost of full pull dominates.
+
+<KnowledgeCheck
+  question="Why does pure fan-out-on-write break for celebrities, and how does the hybrid model fix it?"
+  options={[
+    "Celebrities post too often; the fix is to rate-limit their posts",
+    "An account with tens of millions of followers turns one post into tens of millions of feed writes — a wasteful, spiky burst mostly landing in feeds nobody reads soon. The hybrid model pushes for ordinary accounts (cheap reads for the common case) but does NOT push high-fan-out accounts; instead it pulls their recent posts at read time and merges them into the reader's feed. Since a user follows only a few celebrities, that read-time pull is cheap, and it eliminates the millions of wasteful writes",
+    "Celebrities' posts can't be ranked, so they're pulled separately",
+    "The hybrid model stores celebrity posts in a separate database for legal reasons",
+  ]}
+  answer={1}
+  explanation="The follower distribution is heavily skewed, so push amplification is catastrophic at the top: one celebrity post = millions of feed writes, spiky and largely wasted on inactive followers. The hybrid model keeps push for the body of accounts (so most reads stay O(1)) but switches high-fan-out accounts to pull: their recent posts are fetched and merged into the reader's precomputed feed at read time. Because each user follows only a few such accounts, the extra read cost is small, and the write storm disappears. The follower-count threshold tunes where push stops paying off."
+/>
 
 <h2 id="feed-ranking">Feed Ranking</h2>
 
-This section covers how feeds are ranked by relevance signals including affinity, recency, and predicted engagement.
+Early feeds were **chronological** — newest first — which is simple, predictable, and easy to reason about, but it buries a post you'd love under a pile of recent noise and shows you a stale-but-recent item over a highly relevant older one. Modern feeds are **relevance-ranked**: after the candidate posts are gathered (the pushed feed plus any pulled hot-user posts), each is **scored**, and the feed is ordered by score rather than time. The signals are familiar "EdgeRank"-style features: **affinity** (how close the reader is to the author — past interactions, follows-back, messaging), **recency** (a time-decay so fresh content is favored without being absolute), **predicted engagement** (the model's estimate that you'll like, comment, share, or dwell), and **content-type weighting** (photos vs links vs text). The score combines these, and the top-scoring posts lead the feed.
+
+Ranking changes the read path: instead of returning a precomputed list verbatim, the feed service **scores a bounded candidate set** at read time (often a few hundred candidates) and returns the best page. To keep that affordable, the candidate set is kept small (the bounded precomputed feed plus a few pulled accounts), some features are **precomputed** (affinity tables, post quality), and the heavy model work is bounded per request. The trade-off is **engagement and relevance versus simplicity and predictability**: ranked feeds demonstrably increase engagement but add a scoring stage, model infrastructure, and the well-known downsides (filter bubbles, harder debugging, "why am I seeing this?"). The principle: rank a **bounded candidate set** by **affinity + recency + predicted engagement** at read time, precomputing features to stay within the latency budget — choosing relevance ranking over chronological because it drives engagement, while acknowledging the added complexity and the option to fall back to chronological when ranking is unavailable.
+
+<KnowledgeCheck
+  question="How does relevance ranking work in the read path, and what's the trade-off against chronological?"
+  options={[
+    "It sorts all of a user's posts by like count in the database",
+    "After gathering a bounded candidate set (the precomputed feed plus pulled hot-user posts), the feed service scores each post at read time by signals like affinity, recency/time-decay, and predicted engagement, and orders by score — keeping it affordable by bounding the candidate set and precomputing features. The trade-off vs chronological is more engagement and relevance at the cost of a scoring stage, model infrastructure, less predictability, and filter-bubble concerns",
+    "Ranking is done once at write time and never changes per reader",
+    "There is no trade-off; ranked feeds are strictly better in every way",
+  ]}
+  answer={1}
+  explanation="Relevance ranking scores a bounded candidate set at read time using affinity (reader-author closeness), recency decay, predicted engagement, and content type, then orders by score rather than time. It's kept within the latency budget by limiting candidates and precomputing features like affinity tables. Versus chronological — which is simple, predictable, and debuggable — ranking drives engagement but adds scoring infrastructure, reduces predictability, and brings filter-bubble and explainability concerns. A common resilience fallback is to serve chronological when the ranking service is unavailable."
+/>
 
 <h2 id="feed-storage-hydration">Feed Storage, Hydration & Caching</h2>
 
-This section describes how precomputed feeds store post IDs in a distributed cache and hydrate full post content from the post store at read time.
+A crucial design decision is *what* the precomputed feed actually stores. It stores **post IDs (plus a score), not post content**. Each user's feed is a **bounded list** — the most recent ~1,000 entries — held in a fast in-memory store (e.g. Redis sorted sets keyed by user), which is why all of 300M users' feeds fit in only ~9.6 TB: an entry is a reference, not a copy. The post **content** — text, media, author, like/comment counts — lives **once** in the **post store**, and at read time the feed's IDs are **hydrated** into full posts by looking them up there (through a post cache). This separation is the payoff of storing IDs: when a post is **edited, deleted, or its counters change**, you update **one** record in the post store and every feed that references it reflects the change on the next hydration — instead of having copied the post into millions of feeds and needing to rewrite them all.
+
+Caching is layered to protect both the read and the write paths. **Active-user feeds** stay hot in the feed cache; **popular posts** are cached in the post store's read cache so hydration is cheap even when a celebrity's post is referenced by millions of feeds (it's read from cache, not recomputed). The bounded feed length caps memory and matches reality — nobody scrolls past the recent window, and older content can be fetched on demand. Because the feed cache is **derived state** over the durable post store and graph, losing a feed shard is recoverable: the affected feeds are **rebuilt** from recent posts and the follow graph. The principle: store feeds as **bounded lists of IDs + scores**, keep post **content in one place** and **hydrate** at read time (so edits/deletes touch one record), and **cache** active feeds and hot posts — treating the feed store as a rebuildable cache, not a system of record.
+
+<KnowledgeCheck
+  question="Why does the precomputed feed store post IDs instead of the post content, and what does hydration buy?"
+  options={[
+    "To make feeds larger and more detailed",
+    "A feed entry is just a post ID (plus a score), so feeds are tiny (~9.6 TB for 300M bounded feeds) and the content lives once in the post store. At read time the IDs are hydrated into full posts. The big win: editing, deleting, or updating the counters of a post changes one record and every feed referencing it reflects it on next hydration — instead of having copied the post into millions of feeds and needing to rewrite them all. Hot posts and active feeds are cached so hydration stays cheap",
+    "Because post IDs are encrypted and content is not",
+    "Storing content in feeds would be faster but is disallowed by Redis",
+  ]}
+  answer={1}
+  explanation="Feeds store references (post ID + score), not copies of content, which keeps them small enough to hold all users' bounded feeds in ~9.6 TB and keeps the post content in a single authoritative place. Hydration looks up those IDs in the post store (through a cache) at read time. The decisive benefit is single-source-of-truth: an edit, delete, or counter change updates one record and propagates to every feed on the next read, avoiding the impossible task of rewriting millions of feeds. Caching hot posts and active feeds keeps hydration fast even for widely-referenced celebrity posts."
+/>
 
 <h2 id="fanout-pipeline">The Fan-out Pipeline</h2>
 
-This section details the asynchronous queue-and-worker pipeline that fans out posts to follower feeds with at-least-once delivery and idempotent writes.
+Posting must feel instant, so fan-out — the expensive part — is done **asynchronously**. When a post is created, the post service does two cheap things: **persist** the post to the post store, and **enqueue** a fan-out job; then it returns. Behind the queue, a fleet of **fan-out workers** consumes jobs, looks up the author's followers from the **social graph**, and writes the post ID into each follower's feed — **batched** (many followers per round-trip) and **sharded by user** (each worker owns a slice of feeds), which is how ~174 workers sustain ~1.74M feed writes/sec. This decoupling means posting latency never depends on follower count, and the queue **absorbs spikes** (a burst of posts queues up and drains rather than overwhelming the feed store) — the same async **queue/worker fan-out pattern** as the **Notification Service**.
+
+Reliability follows the queue's usual discipline. Workers process jobs **at-least-once**, so a crash mid-fan-out just re-leases the job to another worker; the feed writes are **idempotent** — keyed by `(user_id, post_id)` — so a retry that re-pushes an already-delivered post is a no-op rather than a duplicate. Fan-out can be **prioritized**: push to **active users first** so the people likely to open the app soon see the post quickly, and lazily handle inactive users (or skip them, pulling on their rare visit). And the hybrid decision lives here — workers simply **don't fan out** high-follower accounts, leaving those to read-time pull. The principle: make fan-out an **async, queue-backed, horizontally-sharded pipeline** so posting is fast and spikes are absorbed, with **at-least-once delivery and idempotent feed writes** for safe retries, **active-user prioritization** for perceived freshness, and the **hybrid skip** for hot accounts — the Notification Service's fan-out pattern applied to timelines.
+
+<KnowledgeCheck
+  question="Why is fan-out asynchronous and queue-backed, and how are retries kept safe?"
+  options={[
+    "It's synchronous so the poster waits until all followers are updated",
+    "Posting persists the post and enqueues a fan-out job, then returns — so posting latency never depends on follower count and the queue absorbs spikes. Workers consume jobs, look up followers, and write post IDs into feeds, batched and sharded by user. Delivery is at-least-once (a crashed worker's job is re-leased) and feed writes are idempotent, keyed by (user_id, post_id), so a retry re-pushing an already-delivered post is a no-op rather than a duplicate — the same async fan-out pattern as the Notification Service",
+    "Retries are avoided by never restarting failed workers",
+    "Each follower polls the poster directly for new posts",
+  ]}
+  answer={1}
+  explanation="Fan-out is the costly step, so it's pushed off the request path: the post service persists the post and enqueues a job, then returns, decoupling posting latency from follower count and letting the queue smooth out post spikes. A sharded worker fleet does the writes (batched, by-user). Reliability uses the standard queue discipline: at-least-once processing means a crashed worker's job is simply re-leased, and idempotent feed writes keyed by (user_id, post_id) make a re-push harmless. Workers also prioritize active users and skip hot accounts (hybrid) — the Notification Service's fan-out pattern applied to feeds."
+/>
 
 <h2 id="read-path-consistency">Read Path: Pagination & Freshness</h2>
 
-This section covers cursor-based pagination, eventual consistency, and strategies for keeping feeds fresh.
+Reading a feed pulls the pieces together. The feed service **reads the precomputed feed** (a list of post IDs) in one lookup, **merges** any pulled hot-user posts (the hybrid step), **hydrates** the IDs into full posts from the post store, **ranks** the bounded candidate set, and returns a **page**. Pagination uses an **opaque cursor** rather than a numeric offset, so the page is stable as new posts arrive at the top — the cursor encodes a position (a score/timestamp boundary) and the next page continues from there, avoiding the "items shift and you see duplicates or gaps" problem that offset pagination has on a constantly-changing list. The read path also handles **dedup** (the same post reachable via push and pull, or across pages, is shown once — easy because entries are keyed by post ID) and optional **already-seen** filtering (don't re-surface posts the user has already scrolled past).
+
+The freshness model is **eventual consistency**, and that's a deliberate, acceptable relaxation. Because fan-out is asynchronous, a just-created post takes a **few seconds** to appear in every follower's feed — fine for a timeline, where no one expects instantaneous global propagation. Two touches improve the *perceived* freshness: the reader's **own** new post can be **injected immediately** into their view (so posting feels instant to the author even before fan-out completes), and feeds can be **refreshed** on pull-to-refresh to pick up the latest pushed entries. Crucially, the read path is built to **always render**: if ranking is down it falls back to chronological, if a hydration misses it skips that item, and if the live feed is unavailable it serves the last cached version — because a slightly stale feed is vastly better than a blank one. The principle: assemble the page by **reading + merging + hydrating + ranking**, paginate with a **stable cursor**, **dedup by post ID**, and accept **eventual freshness** while protecting *perceived* freshness (inject the user's own post) and *availability* (always render — degrade to cached/chronological).
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-This section discusses how the system scales horizontally and evolves as user and traffic patterns change.
+Don't build the globally-sharded, hybrid, ranked feed on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Pull: read-time SQL aggregation", "Small graph, low read volume", "Scatter-gather on every read — melts as users/follows grow"],
+    ["Push: fan-out-on-write to precomputed feeds", "Reads dominate; feeds must be instant", "Write amplification; run a fan-out pipeline and a feed store"],
+    ["Hybrid + ranking + caching", "Celebrities; relevance matters", "Hot-user threshold to tune; a ranking service; layered caches"],
+    ["Globally sharded, ranked, regional caches", "Billions of users worldwide", "Geo-sharding feeds; cross-region freshness; capacity for the write firehose"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the wall you're hitting. **Pull** (read-time aggregation) is the obvious first build and fine for a small graph, but the scatter-gather cost grows with both users and follows until reads collapse. **Push** (fan-out-on-write) makes reads instant by precomputing feeds, at the price of write amplification and the fan-out pipeline — the right move once reads dominate. The center of gravity for a real feed is **hybrid fan-out with ranking and caching**: push for the body of users, pull-and-merge celebrities, rank for relevance, and cache active feeds and hot posts — this is where the write storm is bounded and the feed feels both fast and relevant. Only true global scale needs **geo-sharded feeds with regional caches**, paying for cross-region freshness and the sheer capacity of the fan-out firehose. Most feeds are well-served by "hybrid fan-out, relevance ranking, IDs-hydrated-from-a-post-store, heavy caching."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-This section analyzes failure scenarios across the fan-out pipeline, feed cache, and read path, and the mitigations for each.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. The feed's guiding rule is unusual and worth saying out loud: **the feed must always render — degrade to cached, stale, or chronological rather than fail**, because a blank feed is the worst possible outcome.
+
+<FailureMatrix
+  rows={[
+    { failure: "Fan-out worker dies mid-job", impact: "Some feeds not yet updated", detection: "Queue lease expiry / lag", mitigation: "At-least-once: job re-leased; idempotent feed writes by (user,post)", recovery: "Another worker finishes; no duplicates" },
+    { failure: "Fan-out backlog / lag", impact: "New posts appear late", detection: "Queue depth / delivery-age metric", mitigation: "Prioritize active users; scale workers; serve current feed", recovery: "Backlog drains; freshness recovers" },
+    { failure: "Feed cache shard lost", impact: "Some users' feeds gone", detection: "Cache health checks", mitigation: "Feeds are derived — rebuild from post store + graph; or pull", recovery: "Shard restored; feeds repopulate" },
+    { failure: "Post store outage", impact: "Hydration fails", detection: "Read error rate", mitigation: "Serve from post/read cache; skip un-hydratable items", recovery: "Store recovers; cache refills" },
+    { failure: "Celebrity post spike", impact: "Write storm risk", detection: "Per-author fan-out size", mitigation: "Hybrid: don't push high-fan-out accounts; rate-limit fan-out", recovery: "Pulled at read time; no storm" },
+    { failure: "Ranking service down", impact: "Can't score the feed", detection: "Ranking latency / errors", mitigation: "Fall back to chronological ordering of the candidate set", recovery: "Ranking returns; scoring resumes" },
+    { failure: "Hot-user threshold mis-set", impact: "Wasted pushes or heavy pulls", detection: "Fan-out cost / read-pull metrics", mitigation: "Monitor follower distribution; reclassify accounts", recovery: "Threshold retuned; costs rebalance" },
+  ]}
+/>
+
+The theme: **degrade gracefully, lean on derived state, and bound the tail.** A dead fan-out worker is harmless because jobs are **at-least-once** and feed writes are **idempotent**, so re-leasing finishes the work without duplicates. Backlogs are met by **prioritizing active users** and scaling workers while the current (slightly stale) feed keeps serving. A lost feed shard is recoverable precisely because feeds are **derived state** — rebuildable from the durable post store and graph (or pulled on demand). Post-store hiccups are ridden out by the **post cache**, skipping any item that can't be hydrated rather than failing the page. The celebrity write storm is **designed out** by the hybrid model, and a downed ranking service simply **falls back to chronological**. Because the feed cache is rebuildable and every read path has a degraded mode, recovery is almost always "re-lease, rebuild, or fall back" — and the one inviolable rule is that the feed always renders *something*, even if stale or chronological.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-This section compares the key architectural trade-offs and alternative approaches to news feed design.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Precompute each user's feed by fanning out posts on write into bounded per-user lists of post IDs + scores held in a fast cache (so a read is an O(1) lookup), go hybrid by not pushing high-fan-out accounts but pulling-and-merging their recent posts at read time, rank a bounded candidate set by affinity/recency/predicted-engagement, hydrate IDs into content from a single post store at read time, run fan-out as an async queue/worker pipeline with at-least-once delivery and idempotent feed writes, cache active feeds and hot posts, and serve under eventual consistency with an always-render read path."
+  rationale="The naive read-time aggregation is impossible at scale, so feeds are precomputed by fan-out-on-write to make the frequent, latency-critical read cheap. Pure push breaks for celebrities, so the hybrid bounds write amplification while keeping reads fast. Storing IDs (not content) keeps feeds tiny and makes edits/deletes one write. Async fan-out keeps posting fast and absorbs spikes; idempotent writes make retries safe. Ranking drives engagement on a bounded, affordable candidate set. Eventual consistency and graceful degradation are acceptable for a timeline and keep the feed always rendering."
+  alternatives="Fan-out on read (pull) — simple and always fresh but an expensive scatter-gather on every read, melting under load; pure fan-out on write (push) — fast reads but a write storm for celebrities; storing post content in feeds — fast hydration but edits/deletes require rewriting millions of feeds and feeds balloon in size; chronological-only ordering — simple and predictable but lower engagement and buries relevant posts; synchronous fan-out — couples posting latency to follower count and can't absorb spikes; strong consistency — needless for a timeline and costly versus eventual freshness."
+  revisitWhen="The follower distribution or read/write ratio shifts enough to retune the hot-user threshold; ranking becomes a primary differentiator needing a heavier real-time model; the feed must be globally distributed with regional freshness; or new surfaces (explore/recommendations from accounts you don't follow) change the candidate-generation problem from 'followees' to 'retrieval'."
+/>
+
+Four axes capture the real tension:
+
+- **Push vs pull (write cost vs read cost).** Push precomputes feeds for O(1) reads at the cost of write amplification; pull is cheap to store and always fresh but pays a scatter-gather per read. Reads dominate, so push is the default — hybrid for the celebrity tail.
+- **Chronological vs ranked.** Chronological is simple and predictable; ranked drives engagement but adds a scoring stage, model infrastructure, and filter-bubble concerns. Ranked wins for engagement, with chronological as the fallback.
+- **Store IDs vs denormalized content.** IDs keep feeds tiny and make edits one write (hydrate at read); denormalized content makes reads need no hydration but turns every edit into millions of rewrites. IDs win.
+- **Strong vs eventual freshness.** Strong consistency would make a post appear everywhere instantly but is costly and unnecessary; eventual (a few seconds) is the natural fit for a timeline, with the author's own post injected immediately for perceived freshness.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section provides a concise 60-second interview answer synthesizing the key design decisions.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A news feed looks like a query over the accounts you follow, ordered by time, but that read-time aggregation is impossible at scale — billions of feed opens, each scattering across hundreds of followees on many shards. So I precompute each user's feed by fanning out on write: when someone posts, workers push that post's ID into every follower's precomputed feed, so a read is a single O(1) lookup of a ready-made list. That makes reads cheap at the cost of write amplification — a moderate ~5.8k posts a second becomes ~1.7 million feed writes a second at ~300 followers each — which is why fan-out is an async queue-and-worker pipeline, at-least-once with idempotent feed writes, that posting never waits on. Pure push breaks for celebrities — one post by a 100-million-follower account is 100 million writes — so I go hybrid: push for ordinary accounts, but don't push high-fan-out accounts; instead pull their recent posts at read time and merge them in, which is cheap because you follow only a few celebrities. Feeds store post IDs and a score, not content, so they're tiny — about ten terabytes for everyone — and a post's content lives once in a post store that I hydrate from at read time, so an edit or delete is one write, not millions. The feed is relevance-ranked over a bounded candidate set by affinity, recency, and predicted engagement, not strictly chronological. It's eventually consistent — a post takes a few seconds to fan out — and the read path always renders: it falls back to chronological if ranking is down and serves a cached feed rather than a blank one. The whole trick is moving the work from the frequent read to the rarer write, then bounding that write with the hybrid."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Push or pull, and why? How do you handle celebrities? Why store IDs instead of content? How does ranking fit in the read path? Why is fan-out asynchronous, and how are retries safe? How fresh is the feed, and what happens when a component fails?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-This section contains review questions and answers to frequently asked interview questions about news feed design.
+<KnowledgeCheck
+  question="A modest ~5.8k posts/sec becomes ~1.74M feed writes/sec in the capacity model. What causes that, and what does it imply?"
+  options={[
+    "Users retry posts ~300 times; the implication is rate-limiting",
+    "Fan-out-on-write multiplies each post by the author's follower count (~300 on average), so creating a post triggers hundreds of feed writes — a ~300× write amplification that makes the feed a write-heavy system despite being a read product. It implies fan-out must be an async, horizontally-sharded worker pipeline, and that the celebrity tail (millions of followers) must be handled by the hybrid model rather than pushed",
+    "The feed cache duplicates every write three hundred times for durability",
+    "Ranking recomputes each post 300 times per read",
+  ]}
+  answer={1}
+  explanation="The amplification is the fan-out factor: pushing a post into every follower's precomputed feed means one post becomes (avg followers) feed writes — ~300× here, turning ~5.8k posts/sec into ~1.74M feed writes/sec. The implications are structural: fan-out can't be synchronous or single-node, so it's an async, sharded worker pipeline sized to the write rate; and because the follower distribution is skewed, the highest-fan-out accounts would create write storms, so they're served by pull-and-merge (hybrid) instead of push."
+/>
+
+<KnowledgeCheck
+  question="When a component of the feed fails, what is the correct behavior, and why is it acceptable?"
+  options={[
+    "Return an error so the user knows the feed is unavailable",
+    "Always render something: fall back to chronological if ranking is down, serve the last cached feed if the live one is unavailable, skip items that can't be hydrated, and rebuild lost feed shards from the post store and graph. It's acceptable because feeds are eventually consistent and the feed cache is derived state — a slightly stale or chronological feed is far better than a blank one",
+    "Synchronously rebuild every affected feed before responding",
+    "Switch all users to fan-out-on-read permanently",
+  ]}
+  answer={1}
+  explanation="The feed's cardinal rule is that it must always render — a blank feed is the worst experience. Because the feed is eventually consistent and the feed cache is derived from the durable post store and follow graph, every failure has a graceful degradation: chronological instead of ranked, cached instead of live, skip un-hydratable items, rebuild lost shards from source. None of these is perfect freshness, but a slightly stale or simply-ordered feed keeps the product usable while the failed component recovers."
+/>
+
+<Faq
+  items={[
+    { question: "What is a news feed (or home timeline)?", answer: "It's the personalized, ranked list of recent posts from the accounts a user follows — the home screen of Facebook, Twitter/X, Instagram, or LinkedIn. The user follows accounts, those accounts post, and the posts are aggregated, ranked, and shown newest-and-most-relevant first. The interesting engineering isn't the query; it's assembling that feed instantly for billions of users when a moderate post stream fans out into an enormous volume of feed updates." },
+    { question: "Why can't a news feed just be a database query?", answer: "The naive 'select posts where author in (my followees) order by time limit 50' must scatter across hundreds of followees living on many shards, merge, and sort — on every feed open, for billions of opens a day. That read-time aggregation is too expensive at scale, so feeds are precomputed instead: the work is moved to write time (fan-out), making a read a single lookup of a ready-made list." },
+    { question: "What is fan-out on write vs fan-out on read?", answer: "Fan-out on read (pull) stores each post once and assembles the feed at read time by querying all followees — simple and always fresh, but an expensive scatter-gather on every read. Fan-out on write (push) writes a new post into every follower's precomputed feed when it's created, so a read is an O(1) lookup — fast reads at the cost of write amplification. Because reads dominate and must be instant, push is the default, with pull reserved for where push is wasteful." },
+    { question: "How are celebrities (hot users) handled?", answer: "Pure push breaks for them: one post by a 100-million-follower account is 100 million feed writes, mostly wasted on inactive followers. So the system goes hybrid — it pushes for ordinary accounts but does NOT push high-fan-out accounts; instead it pulls their recent posts at read time and merges them into the reader's feed. Since each user follows only a few celebrities, the extra read cost is small, and the write storm disappears. A follower-count threshold tunes the split." },
+    { question: "Why does the feed store post IDs instead of content?", answer: "A feed entry is just a post ID plus a score, so all users' bounded feeds are tiny (~9.6 TB) and the post content lives once in a post store. At read time the IDs are hydrated into full posts. The decisive benefit is that editing, deleting, or updating the counters of a post is one write to the post store and propagates to every feed on the next read — versus having copied the post into millions of feeds and needing to rewrite them all." },
+    { question: "Is the feed chronological or ranked?", answer: "Modern feeds are relevance-ranked, not strictly chronological. After gathering a bounded candidate set (the pushed feed plus pulled hot-user posts), each post is scored at read time by signals like affinity (reader-author closeness), recency/time-decay, and predicted engagement, and ordered by score. Chronological is simpler and more predictable and is a common fallback, but ranking drives more engagement at the cost of a scoring stage and filter-bubble concerns." },
+    { question: "Why is fan-out asynchronous?", answer: "Posting must feel instant, so the post service just persists the post and enqueues a fan-out job, then returns — posting latency never depends on follower count. Behind the queue, a sharded worker fleet writes the post ID into followers' feeds. The queue also absorbs spikes, so a burst of posts drains rather than overwhelming the feed store. It's the same async queue/worker fan-out pattern as the Notification Service." },
+    { question: "How are fan-out retries kept safe?", answer: "Delivery is at-least-once: if a worker crashes mid-job, the job's lease expires and another worker re-processes it. Feed writes are idempotent, keyed by (user_id, post_id), so a retry that re-pushes an already-delivered post is a no-op rather than a duplicate. This means the pipeline can safely retry without corrupting feeds, and any rare duplicate is also caught by post-ID dedup on the read path." },
+    { question: "How fresh is the feed?", answer: "Eventually consistent — because fan-out is asynchronous, a brand-new post takes a few seconds to appear in every follower's feed, which is fine for a timeline. Perceived freshness is improved by injecting the author's own post into their view immediately and by refreshing on pull-to-refresh. There's no need for strong consistency; a few seconds of propagation delay is an acceptable and deliberate relaxation." },
+    { question: "How does pagination work without showing duplicates?", answer: "The feed uses an opaque cursor rather than a numeric offset. The cursor encodes a position (a score/timestamp boundary), and the next page continues from there, so the page stays stable even as new posts arrive at the top — avoiding the duplicates and gaps that offset pagination suffers on a constantly-changing list. Dedup is easy because feed entries are keyed by post ID, so the same post is shown once across pages and across push/pull." },
+    { question: "What happens when a follow is added — does the feed rebuild?", answer: "No synchronous rebuild. Adding a follow edge means the author's future posts will fan out to the new follower. Their past posts can be lazily backfilled into the follower's feed or simply pulled at read time, so following takes effect immediately without rebuilding a feed on the request path. The feed cache is derived state, so it can always be repopulated from the post store and graph." },
+    { question: "How is this different from the Notification Service?", answer: "They share the async fan-out queue/worker pattern, but the goal differs: the Notification Service delivers individual alerts (push/email/SMS) to a user across channels with retries and dead-lettering, while the news feed precomputes a ranked, bounded, hydrated timeline read at O(1). A post often triggers both — a feed fan-out and notifications — but they're separate systems with different storage (per-user feeds vs delivery logs) and read patterns (scroll a timeline vs receive an alert)." },
+  ]}
+/>
