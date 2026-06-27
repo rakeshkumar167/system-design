@@ -470,6 +470,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "news-feed": {
+    slug: "news-feed",
+    title: "Design a News Feed",
+    description:
+      "An interview-grade walkthrough of a news feed (home timeline): fan-out on write vs read, the hybrid model for hot users (celebrities), relevance feed ranking, feed storage as post-ID lists hydrated from a post store, the asynchronous fan-out pipeline, the read path with pagination and freshness, scaling, and failure modes.",
+    difficulty: "Advanced",
+    readingMinutes: 36,
+    concepts: ["Fan-out strategies", "Ranking", "Hot users", "Caching"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "fanout-models", label: "Fan-out: Write vs Read", depth: "advanced" },
+      { id: "hybrid-hot-users", label: "The Hybrid Model & Hot Users", depth: "advanced" },
+      { id: "feed-ranking", label: "Feed Ranking", depth: "advanced" },
+      { id: "feed-storage-hydration", label: "Feed Storage, Hydration & Caching", depth: "advanced" },
+      { id: "fanout-pipeline", label: "The Fan-out Pipeline", depth: "advanced" },
+      { id: "read-path-consistency", label: "Read Path: Pagination & Freshness", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

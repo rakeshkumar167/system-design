@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section frames the news feed problem as it appears in system design interviews.
+
+<h2 id="requirements">Requirements</h2>
+
+This section defines the functional and non-functional requirements for a news feed system.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the capacity math for posts, fan-out writes, and feed reads.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core entities: Post, FeedEntry, Follow edge, and User.
+
+<h2 id="api-design">API Design</h2>
+
+This section specifies the public API contracts for posting, reading the feed, and following users.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the high-level architecture of the news feed system.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section walks through the publish fan-out, read feed, hybrid merge, and feed ranking flows.
+
+<h2 id="fanout-models">Fan-out: Write vs Read</h2>
+
+This section compares fan-out-on-write (push) and fan-out-on-read (pull) and explains when each applies.
+
+<h2 id="hybrid-hot-users">The Hybrid Model & Hot Users</h2>
+
+This section explains how the hybrid model handles celebrity accounts that would otherwise produce millions of fan-out writes per post.
+
+<h2 id="feed-ranking">Feed Ranking</h2>
+
+This section covers how feeds are ranked by relevance signals including affinity, recency, and predicted engagement.
+
+<h2 id="feed-storage-hydration">Feed Storage, Hydration & Caching</h2>
+
+This section describes how precomputed feeds store post IDs in a distributed cache and hydrate full post content from the post store at read time.
+
+<h2 id="fanout-pipeline">The Fan-out Pipeline</h2>
+
+This section details the asynchronous queue-and-worker pipeline that fans out posts to follower feeds with at-least-once delivery and idempotent writes.
+
+<h2 id="read-path-consistency">Read Path: Pagination & Freshness</h2>
+
+This section covers cursor-based pagination, eventual consistency, and strategies for keeping feeds fresh.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+This section discusses how the system scales horizontally and evolves as user and traffic patterns change.
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+This section analyzes failure scenarios across the fan-out pipeline, feed cache, and read path, and the mitigations for each.
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+This section compares the key architectural trade-offs and alternative approaches to news feed design.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section provides a concise 60-second interview answer synthesizing the key design decisions.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+This section contains review questions and answers to frequently asked interview questions about news feed design.

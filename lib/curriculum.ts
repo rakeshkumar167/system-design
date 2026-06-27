@@ -92,7 +92,7 @@ export const problems: readonly Problem[] = [
       "Generate personalized feeds, balancing fan-out-on-write against read-time aggregation.",
     difficulty: "Advanced",
     concepts: ["Fan-out strategies", "Ranking", "Hot users", "Caching"],
-    status: "coming-soon",
+    status: "available",
     sequence: 9,
   },
   {

@@ -19,6 +19,7 @@ import MapsNavigationContent from "@/content/tutorials/maps-navigation.mdx";
 import ApiGatewayContent from "@/content/tutorials/api-gateway.mdx";
 import WebCrawlerContent from "@/content/tutorials/web-crawler.mdx";
 import SearchAutocompleteContent from "@/content/tutorials/search-autocomplete.mdx";
+import NewsFeedContent from "@/content/tutorials/news-feed.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -38,6 +39,7 @@ const content: Record<string, ComponentType> = {
   "api-gateway": ApiGatewayContent,
   "web-crawler": WebCrawlerContent,
   "search-autocomplete": SearchAutocompleteContent,
+  "news-feed": NewsFeedContent,
 };
 
 export function generateStaticParams() {
