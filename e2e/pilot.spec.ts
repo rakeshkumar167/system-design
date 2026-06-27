@@ -100,6 +100,20 @@ test("learner can open the authentication security topic", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("learner can open the TLS security topic", async ({ page }) => {
+  await page.goto("/topics");
+  await page.getByRole("link", { name: /tls\/https and certificates/i }).first().click();
+  await expect(
+    page.getByRole("heading", { level: 1, name: /tls\/https and certificates/i }),
+  ).toBeVisible();
+  // Navigate to a section via URL fragment (TOC is hidden on mobile viewports)
+  await page.goto("/topics/security/tls-https-certificates#tls-handshake");
+  await expect(page.locator("#tls-handshake")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /tls handshake establishing an encrypted session/i }).first(),
+  ).toBeVisible();
+});
+
 test("theme toggle switches between light and dark", async ({ page }) => {
   await page.goto("/");
   const html = page.locator("html");
