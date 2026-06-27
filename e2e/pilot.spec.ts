@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(17);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(16);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -213,5 +213,17 @@ test("learner can open the search autocomplete tutorial", async ({ page }) => {
   await expect(page.locator("#trie-topk")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /search autocomplete architecture/i }).first(),
+  ).toBeVisible();
+});
+
+test("learner can open the news feed tutorial", async ({ page }) => {
+  await page.goto("/learn/news-feed");
+  await expect(
+    page.getByRole("heading", { name: /design a news feed/i }),
+  ).toBeVisible();
+  await page.goto("/learn/news-feed#fanout-models");
+  await expect(page.locator("#fanout-models")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /news feed architecture/i }).first(),
   ).toBeVisible();
 });
