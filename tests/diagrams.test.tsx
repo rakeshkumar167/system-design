@@ -511,3 +511,34 @@ describe("news feed flow sequences", () => {
     expect(screen.getByRole("img", { name: /ranking/i })).toBeInTheDocument();
   });
 });
+
+import { ChatArchitecture } from "@/components/diagrams/chat-system-architecture";
+import {
+  SendMessageSequence,
+  OfflineDeliverySequence,
+  DeliveryReceiptSequence,
+  PresenceUpdateSequence,
+} from "@/components/diagrams/chat-system-flows";
+
+describe("ChatArchitecture", () => {
+  it("exposes the chat system architecture to non-visual readers", () => {
+    render(<ChatArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /chat system architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/persistent connection/i)).toBeInTheDocument();
+  });
+});
+
+describe("chat system flow sequences", () => {
+  it("renders the send, offline, receipt, and presence sequences", () => {
+    render(<SendMessageSequence />);
+    expect(screen.getByRole("img", { name: /send/i })).toBeInTheDocument();
+    render(<OfflineDeliverySequence />);
+    expect(screen.getByRole("img", { name: /offline/i })).toBeInTheDocument();
+    render(<DeliveryReceiptSequence />);
+    expect(screen.getByRole("img", { name: /receipt/i })).toBeInTheDocument();
+    render(<PresenceUpdateSequence />);
+    expect(screen.getByRole("img", { name: /presence/i })).toBeInTheDocument();
+  });
+});

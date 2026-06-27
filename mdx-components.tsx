@@ -147,6 +147,13 @@ import {
   HybridMergeSequence,
   FeedRankingSequence,
 } from "@/components/diagrams/news-feed-flows";
+import { ChatArchitecture } from "@/components/diagrams/chat-system-architecture";
+import {
+  SendMessageSequence,
+  OfflineDeliverySequence,
+  DeliveryReceiptSequence,
+  PresenceUpdateSequence,
+} from "@/components/diagrams/chat-system-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -269,6 +276,11 @@ const teachingComponents = {
   ReadFeedSequence,
   HybridMergeSequence,
   FeedRankingSequence,
+  ChatArchitecture,
+  SendMessageSequence,
+  OfflineDeliverySequence,
+  DeliveryReceiptSequence,
+  PresenceUpdateSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
