@@ -19,6 +19,16 @@ export interface TutorialMeta {
   sections: readonly TutorialSection[];
 }
 
+export interface TopicMeta {
+  slug: string;
+  categorySlug: string;
+  title: string;
+  description: string;
+  readingMinutes: number;
+  concepts: readonly string[];
+  sections: readonly TutorialSection[];
+}
+
 export interface Topic {
   /** URL-safe identifier, unique within its category. */
   slug: string;
