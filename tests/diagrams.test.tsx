@@ -542,3 +542,26 @@ describe("chat system flow sequences", () => {
     expect(screen.getByRole("img", { name: /presence/i })).toBeInTheDocument();
   });
 });
+
+import {
+  OAuthAuthCodeSequence,
+  SessionVsTokenSequence,
+} from "@/components/diagrams/authentication-flows";
+
+describe("Authentication flow diagrams", () => {
+  it("exposes the OAuth authorization-code flow to non-visual readers", () => {
+    render(<OAuthAuthCodeSequence />);
+    expect(
+      screen.getByRole("img", { name: /authorization-code flow with pkce/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/without ever revealing their password/i)).toBeInTheDocument();
+  });
+
+  it("contrasts stateful session lookup with stateless verification", () => {
+    render(<SessionVsTokenSequence />);
+    expect(
+      screen.getByRole("img", { name: /session lookup vs stateless token/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/network round-trip on the hot path/i)).toBeInTheDocument();
+  });
+});

@@ -155,6 +155,7 @@ import {
   DeliveryReceiptSequence,
   PresenceUpdateSequence,
 } from "@/components/diagrams/chat-system-flows";
+import { OAuthAuthCodeSequence, SessionVsTokenSequence } from "@/components/diagrams/authentication-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -283,6 +284,8 @@ const teachingComponents = {
   OfflineDeliverySequence,
   DeliveryReceiptSequence,
   PresenceUpdateSequence,
+  OAuthAuthCodeSequence,
+  SessionVsTokenSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
