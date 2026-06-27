@@ -25,6 +25,7 @@ import { MapsNavigationCapacity } from "@/components/learning/maps-navigation-ca
 import { ApiGatewayCapacity } from "@/components/learning/api-gateway-capacity";
 import { WebCrawlerCapacity } from "@/components/learning/web-crawler-capacity";
 import { SearchAutocompleteCapacity } from "@/components/learning/search-autocomplete-capacity";
+import { NewsFeedCapacity } from "@/components/learning/news-feed-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -172,6 +173,7 @@ const teachingComponents = {
   ApiGatewayCapacity,
   WebCrawlerCapacity,
   SearchAutocompleteCapacity,
+  NewsFeedCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
