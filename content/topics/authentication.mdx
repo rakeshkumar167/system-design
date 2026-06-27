@@ -1,43 +1,252 @@
 <h2 id="overview">What Authentication Is</h2>
 
-Placeholder.
+Authentication answers one question: **are you who you claim to be?** A user types a username and a password, or taps "Sign in with Google", or presents a fingerprint — and the system has to decide whether to believe the claim. That is *authentication* (authN): verifying identity. It is distinct from *authorization* (authZ), which answers a different question — **now that I know who you are, what are you allowed to do?** Authentication proves you are Alice; authorization decides whether Alice may delete this record. The two are constantly confused (and even the OAuth 2.0 spec, as we'll see, blurs the line), but they are separate concerns with separate machinery — authorization, with its roles and policies, is [its own topic](/topics/security/authorization). This topic is about proving identity.
+
+The reason authentication is more than a single password check is **HTTP is stateless**. Each request arrives independently, carrying no memory of the last one, so proving your identity *once* at login isn't enough — every subsequent request has to re-establish *who you are* without making you log in again. The entire topic is really about that: take a claim of identity plus some evidence, verify it, and then carry the *proven identity* across a stream of stateless requests securely, at scale, and revocably. Everything that follows — sessions, tokens, JWTs, OAuth, OIDC, MFA — is a different answer to "how do I prove identity and then keep proving it cheaply and safely."
+
+<Callout variant="info" title="Authentication vs Authorization">
+**Authentication (authN)** = *who are you?* — verifying identity (this topic). **Authorization (authZ)** = *what may you do?* — evaluating permissions (a separate topic: RBAC, ABAC). A request is first authenticated (identity established), then authorized (permission checked). Conflating them is the source of a surprising number of security bugs — for example, treating "the token is valid" (authN) as if it also meant "this action is allowed" (authZ).
+</Callout>
+
+The evidence you present is a **factor**, and factors come in three kinds: something you **know** (a password), something you **have** (a phone, a security key), and something you **are** (a fingerprint, a face). Strong authentication combines factors — that's multi-factor authentication, later in this topic. But it all starts with a single login that exchanges some factor for a credential the system will trust on later requests.
 
 <h2 id="credentials-passwords">Credentials & Password Login</h2>
 
-Placeholder.
+The oldest and still most common factor is the **password** — something you know. The login flow is deceptively simple: the user submits a username and password, the server verifies them, and on success it issues something (a session or a token) that authenticates subsequent requests. The security lives entirely in that middle step: **how the server stores and verifies the password**.
+
+The cardinal rule is that the server **never stores the password itself**. If the database is breached — and you must assume it eventually will be — plaintext passwords hand the attacker every account instantly, plus every *other* site where the user reused that password. Instead, the server stores a **salted, slow cryptographic hash** of the password. At login it hashes the submitted password the same way and compares hashes; the original is never recoverable. The hash must be **slow** (Argon2, bcrypt, scrypt — deliberately expensive functions) so that an attacker who steals the hashes can't brute-force billions of guesses per second, and **salted** (a unique random value per user) so that identical passwords don't produce identical hashes and precomputed "rainbow table" lookups are useless. The *details* of choosing and tuning those functions are involved enough to be [their own topic](/topics/security/password-hashing) — here the takeaway is simply: **never plaintext; always a salted slow hash.**
+
+Login is also where you meet your first attackers head-on. **Brute force** (guessing one account's password repeatedly) and **credential stuffing** (replaying username/password pairs leaked from other breaches) are constant background noise on any login endpoint. The defenses are layered: [rate-limit and lock out](/topics/security/rate-limiting) repeated failures, monitor for credential-stuffing patterns, and — most effective — require a **second factor** so a correct password alone isn't enough. A password is a weak factor on its own (users pick guessable ones and reuse them everywhere); the modern posture is to treat the password as one factor among several, or to replace it entirely with passkeys (covered under MFA).
 
 <h2 id="sessions-vs-tokens">Sessions vs Tokens</h2>
 
-Placeholder.
+Once login succeeds, the server must issue something the client sends on every later request to prove "I already authenticated." There are two fundamentally different ways to do this, and choosing between them shapes the whole system. This is **the** central decision in authentication.
+
+**Stateful sessions.** The server creates a **session record** — a row in a session store (often Redis or a database) holding the user's identity and metadata — and hands the client an **opaque session id** (a random string with no meaning of its own), typically in a cookie. On each request the client sends the cookie, and the server **looks the id up in the session store** to recover who the user is. The identity lives on the *server*; the client just holds a pointer to it.
+
+**Stateless tokens.** The server creates a **signed, self-contained token** — a [JWT](#jwt-internals) — that *carries the identity and claims inside it*, cryptographically signed so it can't be tampered with. The client stores the token and sends it on each request, and the server **verifies the signature locally** to trust the contents. There is no lookup: the token *is* the identity, and anyone holding the signing key (or the public half of it) can validate it without consulting a shared store.
+
+The trade-off is sharp and runs through the rest of this topic. Stateful sessions are **trivially revocable** — to log someone out everywhere, you delete the record — but they put a **store lookup on the hot path of every request** and are awkward across many services (each must reach the same session store). Stateless tokens **scale beautifully** — no per-request shared read, and any service can verify them independently, which is why they dominate microservice and API architectures — but they are **hard to revoke**: a signed token is valid until it expires, and you can't "delete" a record that was never stored server-side. The [capacity section](#capacity-estimates) makes that cost concrete, and the [token-lifecycle section](#token-lifecycle) confronts the revocation problem head-on.
+
+<SessionVsTokenSequence />
+
+<TradeoffTable
+  columns={["Dimension", "Stateful session", "Stateless token (JWT)"]}
+  rows={[
+    ["Where identity lives", "Server-side session store", "Inside the token, on the client"],
+    ["Per-request cost", "A lookup in the central session store", "A local signature verification (no I/O)"],
+    ["Revocation", "Easy — delete the record", "Hard — valid until it expires"],
+    ["Cross-service / scaling", "Every service needs the shared store", "Any service verifies independently"],
+    ["Failure blast radius", "Session store is a hot dependency", "No shared read on the hot path"],
+  ]}
+  recommendedRow={2}
+/>
+
+<KnowledgeCheck
+  question="What is the fundamental difference between a stateful session and a stateless token, and what does each trade off?"
+  options={[
+    "Sessions are encrypted and tokens are not; otherwise they behave identically",
+    "A stateful session stores identity server-side and gives the client an opaque id it must look up on every request — easily revocable but a per-request store lookup; a stateless token carries the signed identity inside itself and is verified locally with no lookup — it scales without a shared read and works across services, but is hard to revoke before it expires because there is no server-side record to delete",
+    "Tokens store identity on the server and sessions store it on the client",
+    "Sessions scale better than tokens because they avoid all database reads",
+  ]}
+  answer={1}
+  explanation="The split is where identity lives. A stateful session keeps it in a server-side store and hands the client only an opaque pointer (the session id), so every request costs a central lookup — but logging out is just deleting the record. A stateless token embeds the signed identity in the token itself; the server verifies the signature locally with no I/O, so it scales and any service can validate it independently — but because nothing is stored server-side, you can't delete it to revoke it, so it stays valid until expiry. That single difference drives the capacity, revocation, and architecture decisions for the rest of the topic."
+/>
 
 <h2 id="capacity-estimates">Capacity: The Cost of Verifying</h2>
 
-Placeholder.
+The sessions-vs-tokens choice is usually argued on feel ("tokens scale better"). It's more convincing as a number. Every authenticated request must verify identity — that work is *unavoidable*. The design decision is **where** the check happens: against a central datastore (stateful) or locally on the server (stateless). Let's size both for a mid-large service.
+
+<AuthenticationCapacity
+  assumptions={{
+    dailyActiveUsers: 50000000,
+    authedRequestsPerUserPerDay: 200,
+    peakMultiplier: 3,
+    sessionStoreReadsPerNode: 50000,
+  }}
+/>
+
+The numbers tell the whole story. Fifty million daily users making 200 authenticated requests each is ~**115,740 auth checks/sec** on average, and with a 3× peak factor ~**347,222/sec** at the busy hour. That peak load is identical for both models — verifying identity is mandatory either way. The difference is the **mechanism**. With **stateful sessions**, each of those ~347k requests is a **read against the central session store**, so the store must sustain ~347k reads/sec — about **7 session-store nodes** that sit directly on the hot path of *every* request and must be replicated, sharded, and kept highly available, because if they're down, *nobody* can make an authenticated request. With **stateless tokens**, that per-request central read is **zero**: verification is a local signature check (CPU on the server already handling the request), so there is no shared datastore to size, scale, or keep alive in front of your traffic.
+
+That is the concrete meaning of "tokens scale": they convert a **stateful, central, hot-path read** into **stateless, local CPU**, removing a shared dependency from the critical path of every request. And it previews the catch — the very self-containment that eliminates the lookup is exactly *why you can't revoke a token by deleting a record*. There's nothing to delete. The [token-lifecycle section](#token-lifecycle) is where that bill comes due.
 
 <h2 id="jwt-internals">JWT Internals</h2>
 
-Placeholder.
+The stateless token in practice is almost always a **JWT** — a JSON Web Token. Understanding its anatomy demystifies most of modern authentication. A JWT is three Base64URL-encoded parts joined by dots: **`header.payload.signature`**.
+
+- The **header** names the signing algorithm, e.g. `{"alg": "RS256", "typ": "JWT"}`.
+- The **payload** is a JSON object of **claims** — facts about the user and the token. Standard registered claims include `sub` (subject — the user id), `iss` (issuer — who minted it), `aud` (audience — who it's for), `exp` (expiry timestamp), and `iat` (issued-at). You can add custom claims (roles, email) too.
+- The **signature** is computed over the header and payload with a secret or private key, and is what makes the token **tamper-proof**: change a single byte of the payload and the signature no longer matches.
+
+The single most important — and most misunderstood — property: **a JWT is signed, not encrypted.** The payload is merely Base64-encoded, which is *not* secrecy — anyone holding the token can decode and read every claim. The signature guarantees **integrity and authenticity** (it hasn't been altered, and it came from someone holding the key), but it provides **no confidentiality**. Therefore: **never put secrets in a JWT payload** (no passwords, no sensitive PII) — treat it as public, readable data that merely can't be forged.
+
+Signing comes in two flavors, and the choice matters at scale. **Symmetric (HMAC, e.g. HS256)** uses a single shared secret to both sign and verify — simple, but every verifier needs the secret, which means every verifier can also *mint* tokens. **Asymmetric (RSA/ECDSA, e.g. RS256)** uses a **private key to sign** and the corresponding **public key to verify** — so the authorization server holds the private key, and any number of independent services verify with the freely distributable public key, *without* the power to issue tokens. Asymmetric signing is what makes JWTs work cleanly across many services. Verification, then, is: recompute/verify the signature with the right key, and check the claims — crucially `exp` (not expired), `aud` (intended for me), and `iss` (from someone I trust).
+
+<ApiContract
+  method="POST"
+  path="/oauth/token"
+  summary="Exchange credentials (or an authorization code) for a signed access token."
+  request={`POST /oauth/token
+{ "grant_type": "password", "username": "alice", "password": "..." }`}
+  response={`HTTP/1.1 200 OK
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1XzQyIiwiYXVkIjoiYXBpIiwiZXhwIjoxNzE5NTAwMDAwfQ.<sig>",
+  "token_type": "Bearer",
+  "expires_in": 900
+}`}
+  statusCodes={[
+    { code: "200", meaning: "Credentials verified; returns a signed access token (a JWT) and its lifetime" },
+    { code: "401", meaning: "Invalid credentials — no token issued" },
+  ]}
+  notes="The access_token is a JWT: header.payload.signature. The server signs it with its private key; resource services verify it with the public key. expires_in is short (here 900s = 15 min) to bound the damage of a leak — see the token lifecycle section. The client sends it as `Authorization: Bearer <token>` on subsequent requests."
+/>
+
+<KnowledgeCheck
+  question="A developer stores a user's password and a 'isAdmin' flag inside a JWT payload, reasoning that the signature keeps them safe. What's wrong?"
+  options={[
+    "Nothing — the signature encrypts the payload so the data is safe",
+    "A JWT is signed, not encrypted: the payload is only Base64-encoded and anyone holding the token can decode and read every claim. The signature provides integrity and authenticity (it can't be forged or altered) but no confidentiality — so the password is effectively exposed. Secrets must never go in a JWT. The isAdmin flag is readable too (though not forgeable), and authorization decisions deserve more care than a self-asserted claim",
+    "The problem is only that JWTs can't hold boolean values",
+    "It's fine as long as you use HS256 instead of RS256",
+  ]}
+  answer={1}
+  explanation="Base64URL encoding is not encryption — it's trivially reversible. A JWT's signature guarantees the claims weren't tampered with and came from the key holder, but it does nothing to hide them; the payload is plainly readable by anyone who has the token. So a password in the payload is exposed to the client and to anyone who intercepts the token. The rule is absolute: never put secrets in a JWT. (You *can* put non-secret claims like a user id or roles, since they can't be forged — but sensitive data needs real encryption or simply doesn't belong in the token.)"
+/>
 
 <h2 id="oauth2-delegated">OAuth 2.0</h2>
 
-Placeholder.
+So far identity has been between a user and one application. **OAuth 2.0** solves a different, harder problem: letting a user grant **one application limited access to their data on another service** — *without sharing their password*. When a photo-printing app wants to access your Google Photos, you don't hand it your Google password; you're redirected to Google, you consent, and the app receives a scoped, revocable **access token**. That's OAuth: **delegated authorization**.
+
+It defines four roles. The **resource owner** (the user) owns the data. The **client** (the third-party app) wants access. The **authorization server** (Google's login) authenticates the user and issues tokens. The **resource server** (the Google Photos API) holds the data and accepts the token. The canonical, secure dance between them is the **authorization-code flow**: the client redirects the user's browser to the authorization server; the user logs in and consents; the authorization server redirects back with a short-lived **authorization code**; the client then exchanges that code (server-to-server) at the **token endpoint** for an access token. The indirection exists so the access token never passes through the browser's URL/history. For mobile and single-page "public" clients that can't keep a secret, **PKCE** (Proof Key for Code Exchange) adds a one-time `code_verifier`/`code_challenge` pair so a stolen authorization code is useless to an attacker who lacks the verifier.
+
+<OAuthAuthCodeSequence />
+
+There are other grant types — **client credentials** for machine-to-machine access (no user involved), and the legacy **implicit** and **resource-owner-password** grants, both now **discouraged** in favor of authorization-code-plus-PKCE. But the crucial conceptual point, the one interviewers probe: **OAuth 2.0 is an *authorization* framework, not an *authentication* one.** An access token grants *access to an API*; it says nothing reliable about *who the user is*. Apps that tried to use a raw OAuth access token as "proof of login" created real security holes (the token could have been minted for a different app entirely). Plugging that gap is precisely why **OpenID Connect** exists.
+
+<KnowledgeCheck
+  question="Why is OAuth 2.0 described as authorization rather than authentication, and what problem does that cause?"
+  options={[
+    "It's just naming; OAuth 2.0 fully authenticates users on its own",
+    "OAuth 2.0 issues access tokens that grant a client scoped access to an API (authorization), but an access token doesn't reliably tell you who the user is — it can be valid for a different client entirely. Apps that treated an access token as 'proof of login' could be fooled by a token minted elsewhere. OpenID Connect was added on top precisely to provide a verifiable identity assertion (the ID token)",
+    "OAuth 2.0 only works for machine-to-machine access and never involves users",
+    "The problem is that OAuth 2.0 tokens are never signed",
+  ]}
+  answer={1}
+  explanation="OAuth 2.0's job is delegated access: it lets a user authorize a client to call an API on their behalf, and the access token represents that grant. It was never designed to assert identity — an access token doesn't carry a trustworthy 'this is who logged in' statement, and one app could be fooled by an access token issued for another. That gap led to real vulnerabilities when developers used OAuth as a login mechanism. OpenID Connect layers a proper identity assertion (the ID token) on top of OAuth to do authentication correctly."
+/>
 
 <h2 id="oidc">OpenID Connect (OIDC)</h2>
 
-Placeholder.
+**OpenID Connect** is a thin **identity layer on top of OAuth 2.0**. It reuses the exact same authorization-code flow but adds the missing piece: alongside the access token, the authorization server also returns an **ID token** — a **JWT that asserts who the user is**, with standardized identity claims (`sub` for the stable user id, plus optionally `name`, `email`, etc.) and signed by the provider so the client can verify it. OIDC also defines a `userinfo` endpoint for fetching profile data and a discovery document so clients can configure themselves automatically.
+
+The key distinction to keep straight is the **two tokens** and who each is *for*:
+
+- The **ID token** is for the **client** — it proves *who the user is*. The client verifies its signature and reads `sub` to know the logged-in identity. This is the authentication piece.
+- The **access token** is for the **resource server (API)** — it grants *access to call the API*. The client treats it as an opaque bearer credential and forwards it; it should not try to read it as identity.
+
+Mixing them up — using the access token as proof of identity, or sending the ID token to the API as an access credential — is a classic mistake. With this layer, "Sign in with Google / Apple / Microsoft" becomes genuine, standardized **single sign-on**: one identity provider authenticates the user, issues an ID token proving it, and many relying applications trust that provider instead of each maintaining their own passwords. OIDC is the backbone of modern federated login and enterprise SSO.
 
 <h2 id="mfa">Multi-Factor Authentication</h2>
 
-Placeholder.
+A password is a single factor, and a weak one — it can be guessed, phished, reused, or leaked in a breach. **Multi-factor authentication (MFA)** strengthens the proof by requiring **two or more factors from *different* categories**, so compromising one isn't enough. The three categories, again: something you **know** (password, PIN), something you **have** (a phone, a hardware security key), and something you **are** (fingerprint, face). Two passwords aren't MFA — they're the same category; the security comes from the factors being *independent*, so an attacker would have to defeat two unrelated things at once.
+
+The common second factors, roughly weakest to strongest:
+
+- **SMS one-time codes** — better than nothing, but the **weakest** second factor: vulnerable to SIM-swap attacks (an attacker ports your number) and interception. Avoid where you can.
+- **TOTP** (Time-based One-Time Password, RFC 6238) — an authenticator app and the server share a secret seed at setup, and both derive the same 6-digit code from the seed plus the current 30-second time window. No network needed, no SMS to intercept. The ubiquitous "authenticator app" model.
+- **WebAuthn / passkeys** — public-key credentials bound to the device (and often a biometric). The device holds a private key; the server holds the public key and verifies a signed challenge. Critically, passkeys are **phishing-resistant**: the credential is cryptographically scoped to the real site's origin, so a lookalike phishing page can't elicit a usable response. This is the direction the industry is moving — passkeys can *replace* the password entirely, not just supplement it.
+
+MFA doesn't have to fire on every action. A common pattern is **step-up authentication**: authenticate normally for routine use, then demand a second factor only for sensitive operations (changing a password, moving money). The principle: combine **independent factors** so a single stolen credential — especially a phishable password — can't by itself grant access.
+
+<KnowledgeCheck
+  question="Why is requiring a password plus an SMS code considered multi-factor, while requiring a password plus a security question is not — and which second factor is strongest?"
+  options={[
+    "Both are multi-factor; there's no real difference",
+    "A security question is another 'something you know' — the same category as the password — so it adds little independent security and isn't a true second factor; an SMS code is 'something you have' (your phone), a different category, so it qualifies as MFA. Among second factors, phishing-resistant WebAuthn/passkeys are strongest, TOTP authenticator apps are solid, and SMS is the weakest (SIM-swap and interception)",
+    "SMS is stronger than passkeys because it uses the cellular network",
+    "A security question counts as 'something you are' because it's personal",
+  ]}
+  answer={1}
+  explanation="MFA's strength comes from combining factors from *different* categories, so one compromise isn't enough. A security question is just more knowledge — same category as the password, defeated by the same phishing or data-mining — so it isn't genuine MFA. An SMS code relies on possession of the phone, a separate category, so it qualifies (even though SMS itself is the weakest option, due to SIM-swap and interception). The strongest second factor is WebAuthn/passkeys, which are phishing-resistant because the credential is cryptographically bound to the real site's origin; TOTP apps are a strong middle ground."
+/>
 
 <h2 id="token-lifecycle">Token Lifecycle: Refresh & Revocation</h2>
 
-Placeholder.
+Stateless tokens scale because nothing is stored server-side — which is exactly why they're **hard to revoke**, the bill foreshadowed in the [capacity section](#capacity-estimates). If a JWT is stolen, it stays valid until its `exp`. You can't delete what was never stored. The lifecycle design exists to manage that risk.
+
+The standard pattern is **short-lived access token + long-lived refresh token**. The **access token** (the JWT used on every API call) is given a **short lifetime** — minutes — so that a leaked token is useful only briefly. To avoid forcing a fresh login every few minutes, the client also holds a **refresh token**: a longer-lived, *stored, revocable* credential whose only job is to mint new access tokens at the token endpoint when the old one expires. This gets the best of both worlds — the per-request hot path stays stateless (verify the access-token signature, no lookup), while the refresh token, used rarely, *is* tracked server-side and can be revoked to cut off access.
+
+Refresh tokens introduce their own risk (they're long-lived and powerful), mitigated by **rotation with reuse detection**: each time a refresh token is used, it's invalidated and a new one issued. If an *old, already-used* refresh token is ever presented again, that means it was stolen and replayed — so the server **revokes the entire token family**, logging out the attacker and the legitimate user (who can simply log in again). This turns a silent theft into a detectable, contained event.
+
+For revoking **access tokens** before expiry, you have two honest choices, and they trade directly against the [capacity lesson](#capacity-estimates):
+
+- **Short TTLs only** — accept that a token is valid until it expires, and keep that window tiny. No per-request lookup; you tolerate a small revocation lag. This preserves the stateless-scaling win.
+- **A denylist or token introspection** — check each token against a server-side list of revoked tokens (denylist) or ask the authorization server "is this still valid?" (introspection) on each request. This gives *immediate* revocation — but it **re-introduces exactly the per-request central lookup** that statelessness was meant to eliminate, partially recreating the stateful model from the [sessions-vs-tokens section](#sessions-vs-tokens).
+
+There's no free lunch: instant revocation costs a lookup. Most systems land on short-lived access tokens (small revocation window, fully stateless) plus revocable refresh tokens (rotation + reuse detection), reserving denylists for high-stakes immediate-kill scenarios.
+
+<KnowledgeCheck
+  question="Why are stateless JWTs hard to revoke, and how does the short-access-plus-refresh-token pattern address it?"
+  options={[
+    "JWTs aren't hard to revoke; you just delete them from the database",
+    "Because a JWT is self-contained and not stored server-side, there's no record to delete — it stays valid until its exp. The fix is to keep access tokens short-lived (minutes) so a leak is useful only briefly, while issuing a longer-lived, stored, revocable refresh token to mint new access tokens. The hot path stays stateless (verify signature, no lookup); the rarely-used refresh token is tracked and revocable, and rotating it with reuse detection turns a stolen-and-replayed refresh token into a detectable event that revokes the whole family",
+    "You revoke a JWT by changing the user's password, which deletes the token",
+    "Refresh tokens make revocation impossible, so they should never be used",
+  ]}
+  answer={1}
+  explanation="A stateless JWT is verified by signature, not looked up, so nothing is stored to delete — it remains valid until expiry, which is the revocation problem. The lifecycle pattern bounds it: access tokens get a short TTL so a leaked one expires fast (and the per-request path stays a stateless signature check), while a longer-lived refresh token — which *is* stored and revocable — is used occasionally to obtain new access tokens. Rotating refresh tokens with reuse detection means a replayed old refresh token reveals theft and triggers revoking the entire family. For immediate access-token revocation you'd add a denylist/introspection, but that reintroduces a per-request lookup — the cost of instant revocation."
+/>
 
 <h2 id="pitfalls-best-practices">Pitfalls & Best Practices</h2>
 
-Placeholder.
+Authentication is a domain where small mistakes become full compromises. The recurring ones:
+
+<Callout variant="warning" title="Authentication footguns">
+- **`alg: none` / algorithm-confusion attacks.** Early JWT libraries honored an `alg: none` header (no signature) or could be tricked into verifying an RS256 token with the public key as an HMAC secret. **Always pin the expected algorithm** server-side; never let the token's own header choose how it's verified.
+- **Storing tokens in `localStorage`.** It's readable by any JavaScript, so a single XSS bug exfiltrates the token. Prefer **`HttpOnly`, `Secure`, `SameSite` cookies** (inaccessible to JS), and pair them with CSRF defenses (`SameSite` plus anti-CSRF tokens) since cookies are sent automatically.
+- **Secrets in the JWT payload.** It's signed, not encrypted — the payload is public. No passwords, no sensitive PII.
+- **Not validating all the claims.** Always verify the **signature**, and check **`exp`** (expired?), **`aud`** (for me?), and **`iss`** (from a trusted issuer?). A valid signature on a token meant for a different audience is still an attack.
+- **Long-lived access tokens.** A leaked token is valid for its whole lifetime; keep access-token TTLs short and lean on refresh tokens.
+- **Treating authentication as authorization.** "The token is valid" (authN) is not "this action is allowed" (authZ). Check permissions separately.
+- **Weak login hygiene.** Rate-limit and lock out brute force/credential stuffing, offer MFA, and require step-up auth for sensitive actions.
+</Callout>
+
+<DecisionRecord
+  title="The default authentication design"
+  choice="Authenticate users with a password verified against a salted slow hash (Argon2/bcrypt), offering MFA (TOTP or, preferably, phishing-resistant passkeys) and step-up for sensitive actions. For federated login and SSO, use OAuth 2.0 + OpenID Connect with the authorization-code flow plus PKCE, treating the ID token as identity and the access token as API access. Issue short-lived signed JWT access tokens (verified locally for stateless scale) alongside longer-lived, stored, rotating refresh tokens with reuse detection. Store tokens in HttpOnly/Secure/SameSite cookies, pin the signing algorithm, and always validate signature, exp, aud, and iss."
+  rationale="Salted slow hashing makes a stolen password database expensive to crack. Short-lived stateless access tokens keep the per-request hot path free of a central session-store lookup (the capacity win), while revocable rotating refresh tokens recover the revocation control that pure statelessness gives up. OAuth 2.0 + OIDC is the standardized, audited way to delegate access and assert identity without sharing passwords. MFA — especially passkeys — defends the weak password factor against phishing and reuse."
+  alternatives="Stateful server sessions — simplest and trivially revocable, a fine choice for a single monolith, but a per-request store lookup that's awkward across services. Pure long-lived JWTs with no refresh — simple but unrevocable and dangerous if leaked. Access-token denylist/introspection — gives instant revocation but reintroduces the per-request central lookup statelessness removed. SMS-based MFA — acceptable as a fallback but the weakest second factor (SIM-swap)."
+  revisitWhen="Moving from a monolith to many services (favors stateless tokens / a shared identity provider); needing instant global revocation (consider short TTLs vs a denylist's lookup cost); regulatory or high-value-transaction requirements (stronger MFA, step-up, shorter sessions); or adopting passwordless/passkey-first login."
+/>
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="In the capacity model, peak load is ~347k auth checks/sec for both models. Why is that the argument for stateless tokens?"
+  options={[
+    "Because tokens reduce the number of authenticated requests",
+    "Because verifying identity is unavoidable at that rate, but the *mechanism* differs: stateful sessions turn each of the ~347k checks into a read against a central session store (~7 nodes on the hot path of every request, which must stay available), while stateless tokens make each check a local signature verification with zero central reads. Tokens convert a shared, hot-path datastore dependency into local CPU — that's what 'tokens scale' means concretely",
+    "Because stateless tokens cache the session store results",
+    "Because 347k is too small to matter for either approach",
+  ]}
+  answer={1}
+  explanation="The peak verification rate is identical because authenticating every request is mandatory regardless of mechanism. The cost difference is where the check lands: stateful sessions require a central session-store read per request, sizing a replicated, must-be-available store (~7 nodes here) directly in front of all traffic; stateless tokens verify a signature locally on the server already handling the request, needing no shared read. Removing that hot-path central dependency is the scaling argument — and its flip side is the harder revocation, since nothing is stored to delete."
+/>
+
+<Faq
+  items={[
+    { question: "What's the difference between authentication and authorization?", answer: "Authentication (authN) verifies *who you are* — it proves identity (this topic). Authorization (authZ) decides *what you're allowed to do* — it evaluates permissions (a separate topic covering RBAC, ABAC). A request is authenticated first, then authorized. Conflating them — assuming a valid token also means an action is permitted — is a common source of security bugs." },
+    { question: "Should I use sessions or tokens?", answer: "Stateful sessions store identity server-side and are trivially revocable but require a session-store lookup on every request and are awkward across services — a solid default for a single monolith. Stateless JWT tokens carry the signed identity in the token, are verified locally with no lookup, and scale across services, but are hard to revoke before they expire. Most multi-service / API architectures choose short-lived tokens plus revocable refresh tokens." },
+    { question: "Is a JWT encrypted?", answer: "No. A JWT is *signed*, not encrypted. The payload is only Base64URL-encoded, so anyone holding the token can read every claim. The signature guarantees integrity and authenticity (it can't be forged or altered) but provides no confidentiality. Never put secrets — passwords, sensitive PII — in a JWT payload." },
+    { question: "What's the difference between HMAC (HS256) and RSA (RS256) signing?", answer: "HMAC uses a single shared secret to both sign and verify, so every verifier can also mint tokens — fine within one trust boundary. RSA/ECDSA uses a private key to sign and a public key to verify, so the authorization server signs and any number of services verify with the public key without being able to issue tokens. Asymmetric signing is what makes JWTs work cleanly across many independent services." },
+    { question: "Why is OAuth 2.0 not authentication?", answer: "OAuth 2.0 is a delegated *authorization* framework: it lets a user grant a client scoped access to an API without sharing their password, represented by an access token. An access token doesn't reliably say who the user is (it could be issued for a different client), so using it as 'proof of login' is unsafe. OpenID Connect adds an identity layer (the ID token) to do authentication properly." },
+    { question: "What does OpenID Connect add on top of OAuth 2.0?", answer: "OIDC adds an ID token — a signed JWT that asserts who the user is, with standardized identity claims like `sub` and `email` — plus a userinfo endpoint and discovery. The ID token is for the client (proves identity); the access token is for the API (grants access). OIDC is what makes 'Sign in with Google/Apple' genuine, standardized single sign-on." },
+    { question: "What is the authorization-code flow with PKCE?", answer: "The secure OAuth/OIDC flow: the client redirects the browser to the authorization server, the user logs in and consents, the server redirects back with a short-lived authorization code, and the client exchanges that code server-to-server for tokens — so tokens never sit in the browser URL. PKCE adds a one-time code_verifier/code_challenge so that an intercepted authorization code is useless without the verifier, making it safe for mobile and single-page (public) clients." },
+    { question: "What counts as multi-factor authentication?", answer: "Requiring two or more factors from *different* categories: something you know (password), something you have (phone, security key), something you are (biometric). Two of the same kind — a password plus a security question — isn't true MFA. Strength order: phishing-resistant passkeys/WebAuthn (strongest), TOTP authenticator apps, then SMS codes (weakest, due to SIM-swap and interception)." },
+    { question: "Why are stateless JWTs hard to revoke?", answer: "Because they're self-contained and not stored server-side, there's no record to delete — a JWT stays valid until its `exp`. Mitigations: keep access tokens short-lived so a leak expires quickly; pair them with stored, revocable refresh tokens (rotated with reuse detection); and, only when you need instant revocation, add a denylist or introspection check — which reintroduces a per-request lookup, the very cost statelessness avoided." },
+    { question: "Why use short-lived access tokens with refresh tokens?", answer: "A short access-token TTL bounds the damage of a leaked token while keeping the per-request path stateless (verify the signature, no lookup). The refresh token — longer-lived but stored and revocable — is used occasionally to mint new access tokens without forcing re-login. Rotating refresh tokens with reuse detection turns a stolen, replayed refresh token into a detectable event that revokes the whole family." },
+    { question: "Where should I store tokens in a browser?", answer: "Prefer HttpOnly, Secure, SameSite cookies, which JavaScript can't read, so an XSS bug can't exfiltrate the token. localStorage is readable by any script and is a common token-theft vector. Cookies are sent automatically, so add CSRF defenses (SameSite plus anti-CSRF tokens). Also pin the signing algorithm server-side and always validate signature, exp, aud, and iss." },
+    { question: "How should passwords be stored?", answer: "Never in plaintext. Store a salted, slow cryptographic hash (Argon2, bcrypt, scrypt): the salt (unique per user) defeats precomputed rainbow tables and makes identical passwords hash differently, and the deliberate slowness makes mass brute-forcing of stolen hashes expensive. The tuning details are their own topic (Password hashing); the rule here is salted-slow-hash, never plaintext, and pair login with rate-limiting and MFA against credential stuffing." },
+  ]}
+/>
