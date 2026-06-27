@@ -26,6 +26,7 @@ import { ApiGatewayCapacity } from "@/components/learning/api-gateway-capacity";
 import { WebCrawlerCapacity } from "@/components/learning/web-crawler-capacity";
 import { SearchAutocompleteCapacity } from "@/components/learning/search-autocomplete-capacity";
 import { NewsFeedCapacity } from "@/components/learning/news-feed-capacity";
+import { ChatSystemCapacity } from "@/components/learning/chat-system-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -181,6 +182,7 @@ const teachingComponents = {
   WebCrawlerCapacity,
   SearchAutocompleteCapacity,
   NewsFeedCapacity,
+  ChatSystemCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
