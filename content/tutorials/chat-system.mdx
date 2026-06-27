@@ -1,71 +1,372 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-This section sets the stage for the chat system interview, covering the problem scope and what interviewers expect.
+A chat system delivers messages between people in real time: you type a message, your friend sees it a moment later, you see "delivered" and then "read", and if they were offline they get it the next time they open the app. WhatsApp, Messenger, Slack DMs, iMessage, Telegram — all the same core system, scaled to a billion users and group chats. From the outside it looks like a CRUD app over a `messages` table: POST a message, store it, the recipient GETs their messages. That framing produces something that works in a demo and is fundamentally wrong at scale, because the recipient can't keep asking "anything for me?" — the message has to **arrive at their device the instant it's sent**, which a request/response model can't do. The server has to **push**, and pushing to a billion devices is a different kind of system entirely.
+
+The hard part is **real-time delivery to recipients who may be online or offline, in order, exactly once as they see it, over millions of persistent connections**. Three problems dominate, and storing the message is the easy one. First, the **connection layer**: real-time push requires a **persistent, bidirectional connection** — a **WebSocket** — held open for every online user, on a fleet of **stateful gateway servers**. And because a user is connected to exactly *one* gateway, delivering a message means finding *which* gateway holds the recipient's connection (a user→gateway **session registry**) and routing to it — you can't just put stateless boxes behind a load balancer. Second, **delivery and guarantees**: an **online** recipient gets a real-time push; an **offline** recipient has the message saved in a per-user **mailbox** and delivered when they reconnect; and because networks drop packets, delivery is **at-least-once** with client **ACKs** and **dedup by a client-generated message id**, which drives the **sent → delivered → read** receipts. Third, **ordering**: everyone in a conversation must see messages in the *same* order, so each message gets a **monotonic per-conversation sequence number** (you can't trust wall-clocks across devices), and a **group** message fans out to every member. Plus **presence** (online / last-seen / typing), which is cheap per event but brutal in fan-out. The reframe to lead with: *it looks like storing and fetching messages, but the server can't wait to be asked — it must push over a persistent connection, so the design is a stateful fleet of WebSocket gateways holding millions of connections, a session registry that routes each message to the recipient's gateway, an online-push / offline-mailbox delivery model with ACK-based at-least-once guarantees, per-conversation ordering, and presence. Persisting a message is trivial; delivering it in real time to whichever of a billion users is connected where, in order, exactly once as they see it, is the design.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- 1:1 only, or group chats too? Groups add fan-out and per-member delivery state.
+- How real-time — sub-second push, or is a short delay fine? This decides WebSockets vs polling.
+- Do we need delivery and read receipts, and presence/typing? They add ACK propagation and ephemeral state.
+- Offline support and history — must messages survive when the recipient is offline for days? Yes → durable mailbox + history.
+- How big — DAU and peak concurrency? The concurrent-connection count is the real sizing driver.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "must push over a persistent connection" reframe · **5 min** requirements (real-time, reliability, ordering, presence) · **5 min** capacity (the signature: ~100M concurrent connections, ~1,000 gateways) · **5 min** entity model (Message, Conversation, Mailbox) and the socket API · **8 min** connection layer + session-registry routing — the centerpiece · **8 min** delivery (online/offline mailbox), guarantees (at-least-once + dedup), ordering · **5 min** groups, presence, failure modes, wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for WebSocket gateways, a session registry, an offline mailbox, and at-least-once-with-dedup, not whether you can model a messages table.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the WebSocket connection layer and gateway fleet, the session registry / message routing, online-push vs offline-mailbox delivery, delivery guarantees and receipts, ordering and consistency, group-chat fan-out, and presence/typing — plus scaling, failure modes, and trade-offs. **Out of scope:** end-to-end encryption protocol internals (a layer we mention, not design), audio/video calling (a separate real-time-media system), the **Notification Service** that sends an out-of-app push when a user is offline (a separate system we hand off to), rich-media upload/storage internals (treated as a blob reference), and spam/abuse beyond a mention. Name them so the interviewer sees the boundary, then set them aside. This problem reuses the **async fan-out** idea from the **Notification Service** and the **News Feed**, and the **WebSocket fan-out / reconnect-sync** patterns from the **Collaborative Document Editor**, but centers them on *reliable, ordered, real-time message delivery at connection scale*.
 
 <h2 id="requirements">Requirements</h2>
 
-This section defines the functional and non-functional requirements for a real-time 1:1 and group chat system.
+Separate what the system must *do* from how *well* it must do it. The functional list is recognizable; the difficulty is in the non-functional column — real-time latency, millions of persistent connections, reliability, and ordering — which is what turns a messages table into a distributed system.
+
+<RequirementsTable
+  functional={[
+    "Send and receive 1:1 messages in real time",
+    "Group chat (a message to many members)",
+    "Deliver to offline users on reconnect",
+    "Delivery and read receipts",
+    "Presence and last-seen",
+    "Durable message history",
+  ]}
+  nonFunctional={[
+    { goal: "Real-time latency", target: "sub-second delivery when online" },
+    { goal: "Connections", target: "millions held concurrently" },
+    { goal: "Reliability", target: "no lost messages (at-least-once + dedup)" },
+    { goal: "Ordering", target: "consistent within a conversation" },
+    { goal: "Availability", target: "reconnect transparently; history survives" },
+    { goal: "Durability", target: "messages persisted before delivery" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **real-time delivery requires server push**, which means a **persistent connection** per online user — the system's defining feature and the reason it's built around a stateful gateway fleet rather than stateless request/response. Second, **reliability is non-negotiable and networks are unreliable**, so delivery is **at-least-once** (retry until the client acknowledges) combined with **idempotent dedup** by a client-generated message id, giving the user **exactly-once display** even though the wire protocol may redeliver. Third, **ordering must be consistent within a conversation** — all participants see the same sequence — which you get from a **per-conversation sequence number**, not from timestamps (device clocks skew). Note what's *relaxed*: **presence is eventually consistent** (a "last seen" a few seconds stale is fine, and presence is the first thing to shed under load), **cross-conversation ordering doesn't matter** (only order *within* a chat), and a brief delay for offline delivery is acceptable. The system trades global ordering and perfect presence for reliable, ordered, real-time delivery within each conversation, at connection scale.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-This section works through the capacity math, revealing that persistent WebSocket connections — not message throughput — are the signature constraint.
+Estimates here separate the ordinary part (the message rate) from the signature part (the connections). Storing messages is a routine write workload; what makes chat a distinct kind of system is the sheer number of long-lived connections it must hold open at once.
+
+<ChatSystemCapacity
+  assumptions={{
+    dailyActiveUsers: 500000000,
+    messagesPerUserPerDay: 40,
+    peakOnlineFraction: 0.2,
+    connectionsPerServer: 100000,
+    avgMessageBytes: 200,
+    bytesPerConnection: 10000,
+  }}
+/>
+
+The takeaways. First, **the message rate is ordinary**: 500 million users sending 40 messages a day is ~**231,481 messages/sec** and ~**4 TB/day** of durable history — a real but unremarkable write-and-store throughput problem, the kind any of the prior tutorials' techniques handle. Second — the signature lesson — **the connections are the constraint**: at peak roughly 20% of users are online, so the system must hold ~**100 million persistent WebSocket connections** open *simultaneously*. That single fact reshapes everything: it forces a fleet of ~**1,000 stateful gateway servers** (each holding ~100k connections), ~**1 TB** of connection memory across the fleet (buffers and per-socket state), and — because each user sits on exactly one gateway — a **session registry** to route every message to the specific gateway holding the recipient's connection. This is the fundamental departure from a request/response service: you don't scale by adding interchangeable stateless boxes behind a load balancer and forgetting about them; you **hold millions of long-lived, stateful connections** and route messages between them. The capacity story: chat is hard because of the **connection layer and routing**, not because the message rate or storage is large — the moment you internalize "100 million open sockets," the rest of the design follows.
 
 <h2 id="entity-model">Entity Model</h2>
 
-This section defines the core data entities: Message, Conversation, Mailbox, and Session Registry.
+The model centers on the **Message** — one piece of content in a conversation, carrying the **sequence number** that orders it and the **id** that dedups it. The most important ideas are that messages are **ordered within a conversation** by a monotonic `seq` (not by clock), **deduped** by a **client-generated `message_id`**, and that delivery state lives alongside them; the connection itself is tracked separately in a session registry.
+
+<EntityModel
+  name="Message"
+  description="One message in a conversation: who sent it, its content, the per-conversation sequence number that orders it, and its delivery status. The client generates message_id before sending so a retried send is idempotent (deduped); the server assigns seq so all participants agree on order. Messages are persisted before delivery and kept as durable history."
+  fields={[
+    { name: "message_id", type: "string", notes: "client-generated UUID — the idempotency / dedup key" },
+    { name: "conversation_id", type: "string", notes: "partition + ordering unit (1:1 or group)" },
+    { name: "sender_id", type: "string", notes: "who sent it" },
+    { name: "content", type: "text", notes: "body (or a blob reference for media)" },
+    { name: "seq", type: "long", notes: "monotonic per-conversation sequence number — the order" },
+    { name: "created_at", type: "datetime", notes: "server receive time (display only, not ordering)" },
+    { name: "status", type: "enum", notes: "sent | delivered | read" },
+  ]}
+  keys="A Message is keyed by (conversation_id, seq): the conversation is the ordering and partition unit, and seq is a monotonic per-conversation sequence the server assigns so every participant sees one order — clients sort by seq, never by wall-clock. The client generates message_id up front, so if a flaky network makes it resend, the server (and recipient) dedup on message_id and the message isn't stored or shown twice — at-least-once on the wire, exactly-once as the user sees it. A Conversation record holds its type (1:1 or group) and member list (and drives group fan-out). A per-user Mailbox holds messages for a recipient who is offline — a durable queue drained on reconnect. The session registry (not a stored entity but a fast, ephemeral mapping) records which gateway each online user is connected to, so the message service can route a message to the right gateway. Source of truth: persisted messages + conversation membership; the session registry and presence are ephemeral."
+/>
+
+Three supporting entities complete the picture. The **Conversation** holds its **type** (1:1 or group) and **member list**, and is the unit messages are ordered and partitioned by; for groups it drives **fan-out**. The per-user **Mailbox** is a durable queue of messages awaiting an **offline** recipient, drained when they reconnect — the mechanism that makes "deliver later" reliable. And the **session registry** is the fast, **ephemeral** user→gateway mapping that tells the message service *where* a recipient is connected so it can route to them (rebuilt from reconnections if lost). The discipline: order **within a conversation** by a server-assigned `seq`, dedup by a **client-generated `message_id`**, **persist before delivering**, and keep the **connection mapping** in a separate ephemeral registry.
 
 <h2 id="api-design">API Design</h2>
 
-This section specifies the key APIs including the WebSocket upgrade endpoint and the message send and history endpoints.
+A chat system's "API" is mostly a **persistent socket carrying framed events**, not request/response — which is the whole point. There's a connection-establishment handshake, message events that flow both ways over the open socket, and a history/sync endpoint for catching up. We express the message send as a logical contract, but in practice it's a frame on the WebSocket.
+
+<ApiContract
+  method="GET"
+  path="/ws"
+  summary="Upgrade the connection to a WebSocket: establish the persistent, bidirectional channel."
+  request={`GET /ws
+Upgrade: websocket
+Authorization: Bearer <token>`}
+  response={`HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+{ "connected": true, "gateway": "gw-734", "resume_from_seq": 4096 }`}
+  statusCodes={[
+    { code: "101", meaning: "Connection upgraded; the socket stays open for push both ways" },
+    { code: "401", meaning: "Auth failed — connection refused" },
+  ]}
+  notes="The client authenticates once on connect; the server records (user → this gateway) in the session registry and keeps the socket open. resume_from_seq lets the client request anything it missed. Heartbeats keep the connection alive; on drop the client reconnects (possibly to a different gateway) with backoff."
+/>
+
+<ApiContract
+  method="POST"
+  path="/messages"
+  summary="Send a message (logically over the socket); returns the assigned sequence and an ack."
+  request={`POST /messages
+{ "message_id": "c_8f1a", "conversation_id": "conv_42", "content": "on my way" }`}
+  response={`HTTP/1.1 202 Accepted
+{ "message_id": "c_8f1a", "seq": 4097, "status": "sent" }`}
+  statusCodes={[
+    { code: "202", meaning: "Persisted and assigned seq; delivery proceeds (push or mailbox)" },
+    { code: "409", meaning: "Duplicate message_id — already accepted (idempotent no-op)" },
+  ]}
+  notes="message_id is client-generated for idempotency, so a retried send returns the same result instead of duplicating. The server assigns the monotonic per-conversation seq, persists the message, then routes it to the recipient's gateway (online) or their mailbox (offline)."
+/>
+
+<ApiContract
+  method="GET"
+  path="/conversations/{id}/messages"
+  summary="Fetch history / sync missed messages on reconnect, paginated by seq."
+  request={`GET /conversations/conv_42/messages?after_seq=4096&limit=50`}
+  response={`HTTP/1.1 200 OK
+{ "messages": [ { "message_id": "c_8f1a", "seq": 4097, "sender_id": "u_42", "content": "on my way", "status": "delivered" } ],
+  "next_after_seq": 4097 }`}
+  statusCodes={[
+    { code: "200", meaning: "Returns messages after the given seq (catch-up / scrollback)" },
+    { code: "404", meaning: "Conversation not found or not a member" },
+  ]}
+  notes="On reconnect the client asks for everything after its last-seen seq, draining its mailbox and filling gaps. Paginated by seq (not offset) so it's stable as new messages arrive."
+/>
+
+The whole surface is: open a socket (the persistent channel where the real action is), send a message (idempotent, seq-assigned, then routed), and sync history by seq (catch-up on reconnect). The interesting contracts are the **stateful socket** and the **seq-based sync**, because the system's job is pushing and ordering, not answering one-off requests.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-This section presents the high-level architecture showing WebSocket gateways, the message service, session registry, and mailbox store.
+The architecture is built around the **persistent connection**: clients hold a socket to a **stateful gateway**, and a **message service** persists each message and **routes** it — through a **session registry** — to the recipient's gateway for a real-time push, or to their **mailbox** if they're offline.
+
+<ChatArchitecture />
+
+- **Sender / Recipient (clients).** Hold a persistent WebSocket to a gateway; send and receive framed events; reconnect with backoff and sync by seq.
+- **WebSocket Gateway.** A stateful server that holds millions of open connections, authenticates them, runs heartbeats, and pushes messages to the clients connected to it. Sized by connections-per-server.
+- **Message Service.** Assigns the per-conversation seq, persists the message, looks up the recipient's gateway, and routes the message (or writes it to the mailbox). The brain of delivery.
+- **Message Store.** Durable home of all messages and history (persist-before-deliver), partitioned by conversation.
+- **Session Registry.** The fast, ephemeral user→gateway mapping used to route a message to the one gateway holding the recipient's connection.
+- **Mailbox.** A per-user durable queue of messages for an **offline** recipient, drained on reconnect.
+- **Presence.** Tracks online / last-seen via heartbeats and fans presence changes out to subscribers.
+
+The decisive boundary is **the gateways hold the connections, and the message service routes between them via the session registry** — everything else is persistence and offline handling around that core. The gateway fleet absorbs the millions of stateful sockets; the session registry turns "deliver to user X" into "push to gateway gw-734"; the message service persists first (durability) then delivers (push or mailbox); and presence rides alongside as ephemeral state. When the recipient is offline, the mailbox makes delivery reliable; when they're online, the registry makes it instant. Every section that follows elaborates one piece: the connection layer and routing, the delivery model and mailbox, the guarantees and receipts, ordering, group fan-out, and presence.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-This section walks through the send, offline delivery, receipt, and presence update flows step by step.
+Four flows cover the system: sending to an online recipient, delivering to an offline one, propagating receipts, and updating presence. The first two are the core delivery paths; the others are what make delivery feel complete and alive.
 
-<h2 id="connection-layer">WebSockets and Connection Management</h2>
+**Send a message to an online recipient.** The sender emits the message over its socket; the gateway forwards it to the message service, which assigns a seq, persists it, looks up the recipient's gateway in the session registry, and routes it there for an immediate push. This is the real-time happy path — persist, locate, push.
 
-This section explains why WebSockets are essential for chat and how the stateful gateway fleet manages millions of persistent connections.
+<SendMessageSequence />
 
-<h2 id="message-delivery">Message Delivery and the Mailbox</h2>
+**Deliver to an offline recipient.** If the recipient has no live connection, the message service writes the message into their per-user mailbox; when they later reconnect, the client syncs (by last-seen seq) and the mailbox is drained to their device. This is how "deliver later" stays reliable.
 
-This section covers the online-push path and the offline-mailbox pattern for delivering messages when the recipient is not connected.
+<OfflineDeliverySequence />
 
-<h2 id="delivery-guarantees">Delivery Guarantees and Receipts</h2>
+**Propagate a delivery receipt.** When the recipient's device receives a message it ACKs **delivered** (and **read** when the user opens it); the ACK flows back through the gateway and message service, which updates the message status and notifies the sender — the "✓✓" you see. This is the receipt state machine in motion.
 
-This section describes at-least-once delivery with client ACKs, deduplication by client message ID, and the sent-delivered-read receipt state machine.
+<DeliveryReceiptSequence />
 
-<h2 id="ordering-consistency">Ordering and Consistency</h2>
+**Broadcast a presence update.** A client heartbeat keeps its presence fresh; when a user goes online/offline or starts typing, the presence service records it and fans the change out to subscribers — for instance, the friend currently viewing the conversation. Cheap per event, but multiplied across subscribers.
 
-This section explains how per-conversation monotonic sequence numbers ensure messages are displayed in the correct order on all clients.
+<PresenceUpdateSequence />
 
-<h2 id="group-chat-fanout">Group Chat and Fan-out</h2>
+<h2 id="connection-layer">WebSockets & Connection Management</h2>
 
-This section covers the fan-out-on-write approach for group messages and the tradeoffs involved in delivering to many recipients.
+The connection layer is the centerpiece, and it starts with *why* you can't use plain request/response. To get a message to a recipient the instant it's sent, the **server must initiate** the transfer — but HTTP is client-initiated, so the recipient would have to **poll** ("anything new?") constantly, which is wasteful and laggy, or hold a **long-poll** open, which is a hack. The right tool is a **WebSocket**: a single TCP connection, upgraded once, that stays **open and bidirectional**, so the server can push a frame to the client at any moment with no request. Every online user holds one such persistent connection to a **gateway server**, and because connections are long-lived and stateful, the gateways are sized by **how many connections each can hold** (tens to hundreds of thousands), giving the ~1,000-server fleet from the capacity model.
 
-<h2 id="presence-typing">Presence, Typing, and Last-Seen</h2>
+The subtle, load-bearing piece is **routing**. A user is connected to **exactly one** gateway, and the message service has no way to know which one without help — so a **session registry** records `user → gateway` on connect and is consulted on every delivery: "user X is on gw-734, push there." This is why chat can't be stateless: the connection *is* state, pinned to a server. Around this sit the **lifecycle** concerns: **authenticate** on connect (then trust the socket), exchange **heartbeats** (ping/pong) to detect dead connections and keep NATs open, **reconnect with backoff** when a socket drops (re-registering in the session registry, possibly on a *different* gateway, and syncing missed messages by seq), and **drain gracefully** when a gateway is deployed or dies (clients reconnect elsewhere). The principle: use **WebSockets** for server push, hold the connections on a **stateful gateway fleet** sized by connections-per-server, and make delivery possible by maintaining a **session registry** that maps each user to their current gateway — with a lifecycle of auth, heartbeats, and reconnect-and-resync that treats dropped connections as normal.
 
-This section explains heartbeat-driven presence, typing indicators, and why presence fan-out is costly at scale.
+<KnowledgeCheck
+  question="Why does a chat system use WebSockets on stateful gateways with a session registry, instead of stateless HTTP servers behind a load balancer?"
+  options={[
+    "WebSockets are just faster HTTP; the architecture is otherwise the same",
+    "Real-time delivery needs the server to push, which HTTP request/response can't do — so each online user holds a persistent, bidirectional WebSocket to a gateway. Because a user is connected to exactly one gateway, the connection is state pinned to a server, so the system can't be stateless: a session registry maps user → gateway, and the message service consults it to route each message to the specific gateway holding the recipient's connection. Lifecycle (auth, heartbeats, reconnect-and-resync) treats dropped sockets as normal",
+    "A load balancer can deliver messages directly without any gateway",
+    "Stateless servers can hold persistent connections just as well",
+  ]}
+  answer={1}
+  explanation="Pushing a message the instant it's sent requires server-initiated transfer, which HTTP's client-initiated model can't provide — hence persistent, bidirectional WebSockets. Those connections are long-lived and stateful, held on gateway servers sized by connections-per-server. The catch is routing: a user is on exactly one gateway, so delivering to them means knowing which one — a session registry maps user → gateway and is consulted on every send. That state-pinned-to-a-server property is precisely why chat isn't a stateless-boxes-behind-an-LB design, and why connection lifecycle (auth once, heartbeat to detect death, reconnect with backoff and resync by seq) is a first-class concern."
+/>
 
-<h2 id="scalability-evolution">Scalability and Evolution</h2>
+<h2 id="message-delivery">Message Delivery & the Mailbox</h2>
 
-This section discusses how the system scales horizontally and how the architecture evolves as demand grows.
+With connections and routing in place, delivery has two paths depending on whether the recipient is **online**. The **online path**: the message service, after persisting the message, looks up the recipient in the **session registry**, finds their gateway, and **routes** the message there for an immediate **push** down the open socket — sub-second delivery. The **offline path**: there's no live connection to push to, so the message is written to the recipient's **mailbox** — a per-user **durable queue** of undelivered messages — and simply waits. When the recipient next connects, their client **syncs** (asks for everything after its last-seen seq), the mailbox is **drained** to the device, and they catch up. Critically, the message is **persisted to the message store first**, *before* either delivery attempt, so a crash mid-delivery never loses it — delivery is a best-effort push over durable state, not the system of record.
 
-<h2 id="resiliency-failure-modes">Resiliency and Failure Modes</h2>
+This split is what makes chat reliable across the messy reality of mobile: people are constantly going offline (subway, airplane, dead battery) and back, and the mailbox absorbs all of it. For **group** messages, the same logic runs per member — push to those online, mailbox for those offline. And when a recipient is offline, the system can hand off to the **Notification Service** to send an out-of-app **push notification** ("You have a new message"), nudging them to reopen the app — a clean separation where chat owns in-app delivery and the notification system owns the out-of-app nudge. The principle: **persist first, then deliver** by **pushing to online recipients** (via the session registry) and **queuing for offline ones** in a durable **mailbox** drained on reconnect — with the **Notification Service** handling the out-of-app push, so a message is never lost regardless of whether anyone is connected.
 
-This section analyzes failure scenarios such as gateway crashes and session registry partitions, and explains the recovery paths.
+<KnowledgeCheck
+  question="How does a chat system reliably deliver to a recipient who is offline when the message is sent?"
+  options={[
+    "It drops the message and asks the sender to resend later",
+    "The message is persisted to the message store first, then — finding no live connection in the session registry — written to the recipient's per-user mailbox, a durable queue of undelivered messages. When the recipient reconnects, their client syncs from its last-seen seq and the mailbox is drained to the device. An out-of-app push notification (handed to the Notification Service) nudges them to reopen the app. Persist-before-deliver means a crash never loses the message",
+    "It keeps retrying the push every second forever until they come online",
+    "Offline messages are stored only on the sender's device",
+  ]}
+  answer={1}
+  explanation="Delivery has two paths. Online: route through the session registry to the recipient's gateway and push down the open socket. Offline: there's nothing to push to, so the message — already persisted to the durable store before any delivery attempt — is written to the recipient's mailbox, a per-user durable queue, and waits. On reconnect the client syncs by last-seen seq and drains the mailbox. The Notification Service sends the out-of-app push so they know to reopen. Because the message is persisted first, neither a crash nor the recipient's absence can lose it."
+/>
 
-<h2 id="tradeoffs-alternatives">Trade-offs and Alternatives</h2>
+<h2 id="delivery-guarantees">Delivery Guarantees & Receipts</h2>
 
-This section compares architectural choices such as push vs pull, fan-out strategies, and storage options.
+Networks are unreliable — packets drop, sockets die mid-send, a phone loses signal right as a message arrives — so the delivery guarantee is **at-least-once**: the server (or sender) keeps the message pending and **retries** until it receives an **ACK** from the recipient's device confirming receipt. At-least-once means a message can be **delivered twice** (a retry races an ACK that was already in flight), which would show duplicates — so the client **dedups** by the **client-generated `message_id`**: if it's already seen that id, it drops the redelivery. The combination — **at-least-once on the wire + idempotent dedup by message_id** — gives the user **exactly-once display**, which is what they actually care about. (True end-to-end exactly-once delivery is impossible over an unreliable network; at-least-once-plus-dedup is how every real system fakes it.)
+
+Riding on the same ACKs is the **receipt state machine**: a message moves **sent** (accepted and persisted by the server) → **delivered** (the recipient's device ACKed receipt) → **read** (the recipient opened the conversation and the client sent a read-ACK). Each transition is an event propagated **back to the sender**, which is how you see one check, two checks, two blue checks. The receipts are themselves small messages, deduped and ordered like any other, and `read` is often privacy-gated (users can disable read receipts). The principle: guarantee delivery with **at-least-once + retries until ACK**, make it **exactly-once as the user sees it** via **idempotent dedup on the client-generated message_id**, and drive the **sent → delivered → read** receipts off the ACKs, propagating each back to the sender.
+
+<KnowledgeCheck
+  question="How does a chat system avoid both losing and duplicating messages over an unreliable network?"
+  options={[
+    "It uses exactly-once delivery guaranteed by TCP",
+    "Delivery is at-least-once: the server retries until the recipient's device ACKs, so nothing is lost — but a retry can deliver a message twice. The client dedups by the client-generated message_id, dropping any redelivery it has already seen, so the user sees each message exactly once. At-least-once on the wire plus idempotent dedup gives exactly-once display, and the same ACKs drive the sent → delivered → read receipts back to the sender",
+    "It sends each message once and accepts that some are lost",
+    "It stores messages only after the recipient confirms, so duplicates are impossible",
+  ]}
+  answer={1}
+  explanation="True exactly-once delivery is impossible over an unreliable network, so chat uses at-least-once: retry until the recipient ACKs, guaranteeing no loss. The cost is possible duplicates (a retry racing an in-flight ACK), which the client eliminates by deduping on the client-generated message_id — a redelivery of a known id is dropped. The user therefore sees each message exactly once. Those same ACKs power the receipt state machine (sent → delivered → read), each transition propagated back to the sender as the checkmarks."
+/>
+
+<h2 id="ordering-consistency">Ordering & Consistency</h2>
+
+Within a conversation, everyone must see messages in the **same order** — a reply must come after the message it answers, for both people — and you cannot get this from **timestamps**, because device and server clocks **skew** and two messages can carry misleading times. The fix is a **monotonic per-conversation sequence number**: when the message service accepts a message, it assigns the next `seq` for that conversation, and **all clients order by `seq`**, never by wall-clock. The **conversation is the ordering unit** (and a natural **partition key**): a single sequencer per conversation serializes its messages, so concurrent sends from two people are simply assigned consecutive seq values in whatever order the sequencer accepts them — a total order everyone agrees on. Cross-conversation order doesn't matter, so different conversations are independent and scale horizontally by partition.
+
+This makes **gaps detectable and recoverable**. Because seq is contiguous per conversation, a client that has up to seq 4096 and suddenly receives 4099 knows it **missed 4097–4098** and re-syncs (`GET …?after_seq=4096`) to fill the hole — the same mechanism that drains the mailbox on reconnect. Ordering and catch-up are thus the same idea: trust the seq, detect gaps, pull what's missing. (Group chats keep a single per-conversation seq so all members share one order; the sequencer for a hot group is a point to scale carefully.) The principle: order by a **monotonic per-conversation sequence number** assigned by the server — not by clocks — with the **conversation as the ordering/partition unit**, so all participants agree on one order, concurrent sends are serialized, and **missing seqs are detected and re-synced**.
+
+<KnowledgeCheck
+  question="Why order messages by a per-conversation sequence number instead of by timestamp?"
+  options={[
+    "Timestamps are too large to store efficiently",
+    "Device and server clocks skew, so timestamps can't give a consistent order everyone agrees on. The message service assigns a monotonic per-conversation seq as it accepts each message, and all clients order by seq — the conversation is the ordering/partition unit, so a single sequencer serializes concurrent sends into a total order. Because seq is contiguous, a client can detect a gap (it jumped from 4096 to 4099) and re-sync the missing messages, the same mechanism that drains the offline mailbox",
+    "Sequence numbers are random, which improves security",
+    "Timestamps work fine; sequence numbers are unnecessary",
+  ]}
+  answer={1}
+  explanation="Clocks across devices and servers are not reliably synchronized, so ordering by timestamp would show different orders to different participants. Instead the server assigns a monotonic per-conversation sequence number and everyone orders by it, with the conversation as the partition/ordering unit so a single sequencer produces one total order for concurrent sends. The contiguity of seq is a bonus: a client that sees a gap knows exactly what it missed and re-syncs by seq — unifying ordering with offline catch-up. Cross-conversation order is irrelevant, so conversations scale independently."
+/>
+
+<h2 id="group-chat-fanout">Group Chat & Fan-out</h2>
+
+A group message must reach **every member**, which is **fan-out on write** — the same idea as the **News Feed**, applied to messaging: the message service takes one accepted message and delivers a copy to each member, **pushing** to those currently online (via their gateways) and writing to the **mailbox** of those offline. The message is stored **once** (keyed by the group conversation) and fanned out as **per-member delivery**, with **per-member delivery state** (each member has their own delivered/read status) — which is why a group's read receipts show "read by 4 of 7." For **small groups** (a few to a few dozen) this is cheap and indistinguishable from 1:1 delivery repeated.
+
+The interesting case is **large groups** — thousands of members, or broadcast-style channels — which are the chat analog of the News Feed's **celebrity** problem: one message becomes thousands of pushes and mailbox writes, and a chatty large group multiplies that per message. The mitigations rhyme with fan-out everywhere: **bound** the fan-out work, do it **asynchronously** through a queue so a burst doesn't stall the sender, and for very large broadcast groups consider **pull** (members fetch the group's recent messages on open) instead of pushing to everyone, or tiered delivery (push to active members, mailbox/pull for the rest). All of it preserves the single per-conversation **seq** so every member sees one order. The principle: deliver group messages by **fan-out on write** — one stored message, per-member push-or-mailbox with per-member delivery state — keeping small groups trivial and taming **large groups** with bounded, async fan-out (and pull for broadcast-scale), exactly the hot-user trade-off the News Feed makes.
+
+<KnowledgeCheck
+  question="How are group messages delivered, and what makes very large groups challenging?"
+  options={[
+    "The message is stored once per member and there is no fan-out",
+    "Group delivery is fan-out on write: one stored message (keyed by the group conversation) is delivered to each member — pushed to those online via their gateways, written to the mailbox for those offline — with per-member delivery state (hence 'read by 4 of 7'). Small groups are trivial; very large groups are the celebrity analog from the News Feed — one message becomes thousands of pushes/writes — so the fan-out is bounded and done asynchronously, with pull for broadcast-scale groups, all preserving the single per-conversation seq",
+    "Every member polls the group every second for new messages",
+    "Large groups are split into many separate 1:1 conversations",
+  ]}
+  answer={1}
+  explanation="A group message is fanned out on write: stored once, then delivered per member (push if online, mailbox if offline) with each member's own delivered/read state. Small groups are just 1:1 repeated. Large groups mirror the News Feed's hot-user problem — a single message explodes into thousands of deliveries — so the work is bounded and pushed through an async queue, and broadcast-scale groups can switch to pull (fetch on open) instead of pushing to everyone. Throughout, the conversation keeps one per-conversation seq so all members share a single message order."
+/>
+
+<h2 id="presence-typing">Presence, Typing & Last-Seen</h2>
+
+**Presence** (online / offline / last-seen) and **typing** indicators feel minor but have a distinctive cost profile: they are **ephemeral** and **high-frequency**, and their expense is **fan-out**, not storage. Presence is driven by **heartbeats** — the same keepalives that detect dead connections double as "I'm still here" signals — so a user's online state is just "have we heard a heartbeat recently," held in a **fast, ephemeral store** (not the durable message path), and **last-seen** is a timestamp updated on heartbeat or disconnect. Typing is even more transient: a short-lived "user is typing" event that auto-expires after a couple of seconds. None of it is persisted as history.
+
+The challenge is that **every presence change must notify everyone watching that user**, and that fan-out **amplifies**: a user with many contacts going online can trigger a notification to each, and typing indicators fire repeatedly as someone types. Naively this can generate more traffic than the actual messages. So presence is aggressively **optimized**: **throttle and batch** updates (don't emit every keystroke; coalesce), **scope** delivery to where it matters (only push presence/typing for conversations a user currently has **open**, not their entire contact list), and treat it as **best-effort and eventually consistent** — a last-seen that's a few seconds stale is fine, and presence is the **first thing to shed** when the system is under load. The principle: model presence and typing as **ephemeral, heartbeat-driven** state kept out of the durable path, and control their **fan-out cost** by throttling, batching, and scoping to active conversations — accepting eventual consistency and shedding presence before ever degrading message delivery.
+
+<h2 id="scalability-evolution">Scalability & Evolution</h2>
+
+Don't build the globally-distributed, sharded-mailbox system on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["HTTP polling", "A toy app, few users", "Laggy and wasteful — clients poll constantly; no real-time push"],
+    ["Long-polling", "Want push-ish without WebSockets", "A hack — held requests, awkward server resources, still not full-duplex"],
+    ["WebSocket gateways + session registry + mailbox", "Real-time at scale; offline users", "Stateful gateway fleet; route via session registry; durable mailboxes"],
+    ["Globally distributed gateways, sharded mailboxes, regional presence", "A billion users worldwide", "Cross-region routing; sharded mailbox/seq; regional presence; Notification Service for offline push"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the wall you're hitting. **HTTP polling** is the naive start — clients ask "anything new?" on a timer — and it's both laggy and wasteful, useless for real-time. **Long-polling** holds a request open to fake push, but it's a hack that ties up server resources and still isn't truly bidirectional. The center of gravity for a real chat system is **WebSocket gateways with a session registry and durable mailboxes** — this is where push is real, routing works across a stateful fleet, and offline users are handled reliably. Only true global scale needs **geo-distributed gateways with sharded mailboxes and regional presence**, paying for cross-region routing, partitioned per-conversation sequencing, and regional presence — leaning on the **Notification Service** for the offline out-of-app push. Most chat systems are well-served by "WebSocket gateways, session-registry routing, durable mailbox, at-least-once + dedup."
+
+<h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
+
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. The chat system's guiding rules: **never lose or duplicate a message as the user sees it**, and **shed presence before ever degrading message delivery**.
+
+<FailureMatrix
+  rows={[
+    { failure: "Gateway server dies", impact: "Its connections drop (thousands)", detection: "Heartbeat / health loss", mitigation: "Clients auto-reconnect to another gateway, re-register in the session registry, sync by seq", recovery: "In-flight messages redelivered (at-least-once); dedup absorbs repeats" },
+    { failure: "Session registry loss", impact: "Can't route to recipients", detection: "Lookup failure rate", mitigation: "Registry is ephemeral — rebuilt from reconnections; replicate it; fall back to mailbox", recovery: "Reconnects repopulate user → gateway" },
+    { failure: "Message store outage", impact: "Can't persist before deliver", detection: "Write error rate", mitigation: "Persist-before-deliver: reject the send (don't ack) rather than deliver-and-lose", recovery: "Store recovers; senders retry idempotently by message_id" },
+    { failure: "Mailbox lag / backlog", impact: "Offline delivery delayed", detection: "Mailbox depth / drain age", mitigation: "Scale mailbox shards; prioritize active users; sync on reconnect", recovery: "Backlog drains; clients catch up by seq" },
+    { failure: "Duplicate delivery", impact: "Message shown twice", detection: "Repeated message_id", mitigation: "Idempotent client dedup by client-generated message_id", recovery: "Redelivery dropped — exactly-once display preserved" },
+    { failure: "Gap / out-of-order", impact: "Missing or misordered messages", detection: "Non-contiguous seq", mitigation: "Order by seq; re-sync after_seq to fill gaps", recovery: "Missing messages pulled; order restored" },
+    { failure: "Presence fan-out storm", impact: "Presence traffic floods", detection: "Presence event rate", mitigation: "Throttle/batch, scope to open conversations, shed presence first", recovery: "Load subsides; messaging unaffected" },
+  ]}
+/>
+
+The theme: **persist first, reconnect-and-resync, dedup, and protect messaging over presence.** A dead gateway is survivable because connections are *expected* to drop — clients reconnect to another gateway, re-register, and **sync by seq**, and any in-flight messages are **redelivered** (at-least-once) with the client **deduping** repeats. The session registry is **ephemeral and rebuildable** from reconnections, so losing it degrades but doesn't lose data. The cardinal **persist-before-deliver** rule means a store outage causes a *rejected send* (the user sees it didn't go through and retries idempotently) rather than a silent loss. Mailbox backlogs just delay offline delivery, which the reconnect-sync drains. Duplicates and gaps are handled by the two invariants that run through the whole design — **dedup by message_id** and **order/resync by seq**. And presence, being ephemeral and fan-out-heavy, is the **first thing shed** under load, never taking message delivery down with it. Recovery is almost always "reconnect, resync by seq, retry idempotently."
+
+<h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
+
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Hold a persistent WebSocket per online user on a stateful gateway fleet, route each message to the recipient's gateway via a user→gateway session registry, persist before delivering, push to online recipients and queue for offline ones in a durable per-user mailbox drained on reconnect, guarantee delivery at-least-once with retries-until-ACK and idempotent client dedup by a client-generated message_id (exactly-once display), order by a monotonic per-conversation sequence number, fan group messages out on write with per-member delivery state, and treat presence/typing as ephemeral heartbeat-driven state controlled by throttling and scoping — handing offline out-of-app pushes to the Notification Service."
+  rationale="Real-time push mandates persistent connections, which makes the system stateful and forces the session registry for routing — the core departure from request/response. Persist-before-deliver plus an offline mailbox makes delivery reliable across mobile's constant disconnects. At-least-once + dedup is the only honest way to get exactly-once display over an unreliable network. A per-conversation seq gives a consistent order without trusting clocks and doubles as gap-detection for resync. Group fan-out reuses the News Feed pattern; presence is cheap per event but fan-out-heavy, so it's throttled and shed first. Each choice protects message integrity while scaling the connection layer."
+  alternatives="HTTP polling / long-polling — simple but laggy, wasteful, and not truly push; stateless servers — impossible for held connections, since a connection is state pinned to a gateway; deliver-without-persisting — faster but loses messages on crash; exactly-once wire delivery — unachievable over an unreliable network, so at-least-once + dedup instead; timestamp ordering — inconsistent due to clock skew, so per-conversation seq; pushing every presence/typing event everywhere — floods the system, so throttle, batch, and scope; pushing to every member of a huge group — the celebrity problem, so bounded async fan-out or pull for broadcast scale."
+  revisitWhen="Connection counts or per-conversation throughput outgrow a single sequencer/region and need sharding or geo-distribution; end-to-end encryption is required (changes where messages can be processed and how fan-out works); very large broadcast groups dominate (shift from push to pull); or media-heavy messaging makes the blob pipeline, not the connection layer, the bottleneck."
+/>
+
+Four axes capture the real tension:
+
+- **WebSocket vs polling/long-poll.** WebSockets give true bidirectional push at the cost of stateful gateways and connection management; polling is stateless and simple but laggy and wasteful. At scale, WebSockets win decisively.
+- **At-least-once + dedup vs exactly-once.** Exactly-once delivery is impossible over unreliable networks; at-least-once with idempotent dedup by message_id achieves exactly-once *display*, which is what matters. This is the standard, honest trade.
+- **Per-conversation seq vs global ordering.** A per-conversation sequence gives consistent order where it matters and partitions cleanly; global ordering across all conversations is unnecessary and wouldn't scale. Scope ordering to the conversation.
+- **Presence fan-out vs cost.** Rich, instant presence/typing is delightful but its fan-out can exceed message traffic, so it's throttled, batched, scoped to open conversations, and shed first under load — trading some immediacy for protecting message delivery.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-This section provides a concise 60-second answer covering the key design decisions for a chat system interview.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A chat system looks like CRUD over a messages table, but the server can't wait to be asked — it has to push the message the instant it's sent, so the whole design is built around persistent connections. Every online user holds a WebSocket to a stateful gateway, and because a user is on exactly one gateway, I keep a session registry mapping user to gateway; to deliver a message, the message service persists it, assigns a per-conversation sequence number, looks up the recipient's gateway in the registry, and routes it there to push down the socket. If the recipient is offline, I write the message to their durable per-user mailbox and deliver it when they reconnect and sync — and I hand the out-of-app push notification to a separate notification service. Networks are unreliable, so delivery is at-least-once: retry until the device ACKs, and dedup on a client-generated message id so the user sees each message exactly once. Those same ACKs drive sent, delivered, and read receipts back to the sender. Ordering is by the per-conversation sequence number, never timestamps, because clocks skew — and since the sequence is contiguous, a client that sees a gap just re-syncs the missing messages, the same mechanism that drains the mailbox. Group messages fan out on write to each member with per-member delivery state, and very large groups are the celebrity problem, so I bound the fan-out or switch to pull. Presence and typing are ephemeral heartbeat state whose real cost is fan-out, so I throttle, batch, and scope them, and shed presence before ever touching message delivery. The whole sizing driver is connections: at a hundred million concurrent sockets, I need a thousand stateful gateways — the message rate itself is ordinary."
+</Callout>
 
-<h2 id="knowledge-checks-faq">Knowledge Checks and FAQ</h2>
+Common follow-ups an interviewer will use to go deeper: *Why WebSockets and not polling? How do you route to the right server? How do you handle offline users? How do you guarantee no lost or duplicate messages? How do you order messages? How do groups and presence scale?* Each maps directly to a section above.
 
-This section contains review questions and answers to common interview questions about chat system design.
+<h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
+
+<KnowledgeCheck
+  question="In the capacity model the message rate is ~231k/sec but the headline is ~100M concurrent connections. Why are the connections the real constraint?"
+  options={[
+    "Because 100M is a bigger number than 231k",
+    "Because holding ~100M persistent, stateful WebSocket connections at once is what reshapes the architecture: it forces a fleet of ~1,000 stateful gateway servers, ~1 TB of connection memory, and a session registry to route to the one gateway each user is on. The message write rate (~231k/sec, ~4 TB/day) is an ordinary throughput problem any standard technique handles — so the connection layer, not the message rate, is the hard part and the sizing driver",
+    "Because messages are larger than connections",
+    "Because the connections store all the message history",
+  ]}
+  answer={1}
+  explanation="The message rate and storage are routine — they look like any write-heavy service. What makes chat structurally different is that it must hold tens to hundreds of millions of long-lived, stateful connections simultaneously. That single fact dictates the stateful gateway fleet, the connection memory budget, and the session registry needed to route to a user's specific gateway. You scale chat by managing connections and routing between them, not by adding stateless boxes — which is why the connection count, not the message rate, sizes the system."
+/>
+
+<KnowledgeCheck
+  question="A gateway server holding many connections suddenly crashes. What happens to those users and their in-flight messages?"
+  options={[
+    "The users are logged out and their unread messages are lost",
+    "Their connections drop, and clients automatically reconnect — to another gateway — re-registering in the session registry and syncing by their last-seen seq. In-flight messages are redelivered under at-least-once, and the client dedups any repeats by message_id, so nothing is lost or shown twice. Connection drops are treated as normal, which is why reconnect-and-resync is a built-in part of the design",
+    "All messages must be resent manually by the senders",
+    "The whole system fails over to HTTP polling",
+  ]}
+  answer={1}
+  explanation="Gateways are stateful and connections are expected to drop, so the client's reconnect logic is core, not exceptional: on losing its socket it reconnects (with backoff) to another gateway, re-registers user → gateway in the session registry, and syncs everything after its last-seen seq. Messages that were mid-flight are redelivered (at-least-once) and any duplicates are dropped by message_id dedup. Because messages are persisted before delivery and ordering/catch-up runs off the contiguous seq, a gateway crash costs a brief reconnect, not data."
+/>
+
+<Faq
+  items={[
+    { question: "What is a chat system, at a high level?", answer: "A system that delivers messages between users in real time — 1:1 and group — with delivery and read receipts, presence/last-seen, and durable history, working whether the recipient is online or offline. WhatsApp, Messenger, Slack DMs, and iMessage are examples. The interesting engineering isn't storing messages; it's pushing them in real time, in order, exactly once as the user sees them, across millions of persistent connections." },
+    { question: "Why can't a chat system just use HTTP request/response?", answer: "Because the server has to push a message to the recipient the instant it's sent, and HTTP is client-initiated — the recipient would have to poll constantly (laggy, wasteful) or hold a long-poll open (a hack). A WebSocket is a single connection, upgraded once, that stays open and bidirectional, letting the server push a frame anytime. Real-time delivery requires that persistent push channel." },
+    { question: "What is the session registry and why is it needed?", answer: "A user is connected to exactly one gateway server, and the message service has no way to know which one without help. The session registry is a fast, ephemeral mapping of user → gateway, recorded on connect and consulted on every delivery, so the system can route a message to the specific gateway holding the recipient's connection. It's why chat is stateful — the connection is state pinned to a server — and it's rebuilt from reconnections if lost." },
+    { question: "How are messages delivered to offline users?", answer: "The message is persisted to the durable store first, then — finding no live connection — written to the recipient's mailbox, a per-user durable queue of undelivered messages. When the recipient reconnects, their client syncs from its last-seen sequence number and the mailbox is drained to the device. An out-of-app push notification (handled by the Notification Service) nudges them to reopen the app. Persist-before-deliver means a message is never lost." },
+    { question: "How does the system guarantee no lost or duplicate messages?", answer: "Delivery is at-least-once: the server retries until the recipient's device ACKs, so nothing is lost. Because at-least-once can deliver twice, the client dedups by the client-generated message_id, dropping any redelivery it has already seen. At-least-once on the wire plus idempotent dedup gives exactly-once display — what the user actually cares about. True exactly-once delivery is impossible over an unreliable network; this is how real systems achieve the effect." },
+    { question: "How are messages kept in order?", answer: "Each message gets a monotonic per-conversation sequence number assigned by the server when it's accepted, and all clients order by that seq, never by timestamp (device and server clocks skew). The conversation is the ordering and partition unit, so a single sequencer serializes concurrent sends into one total order everyone agrees on. Because seq is contiguous, a client that sees a gap knows what it missed and re-syncs — the same mechanism that drains the offline mailbox." },
+    { question: "What are delivery and read receipts, technically?", answer: "A small state machine driven by ACKs: a message goes sent (persisted by the server) → delivered (the recipient's device ACKed receipt) → read (the recipient opened the conversation and the client sent a read-ACK). Each transition is an event propagated back to the sender — the one check, two checks, two blue checks you see. Receipts are themselves small messages, ordered and deduped like any other, and read receipts are often privacy-gated." },
+    { question: "How do group chats work?", answer: "A group message is fanned out on write: stored once (keyed by the group conversation), then delivered to each member — pushed to those online via their gateways, written to the mailbox for those offline — with per-member delivery state, which is why you see 'read by 4 of 7'. Small groups are trivial. Very large groups are the celebrity analog of the News Feed: one message becomes thousands of deliveries, so the fan-out is bounded, done asynchronously, and may switch to pull for broadcast-scale groups." },
+    { question: "How does presence (online/last-seen/typing) work and why is it expensive?", answer: "Presence is ephemeral, heartbeat-driven state in a fast store (not the durable message path): a user is 'online' if we've heard a recent heartbeat, last-seen is a timestamp, and typing is a short-lived auto-expiring event. The cost isn't storage but fan-out — every change must notify everyone watching that user, which can exceed message traffic. So presence is throttled, batched, scoped to currently-open conversations, treated as eventually consistent, and shed first under load." },
+    { question: "What sizes the system — message rate or connections?", answer: "Connections. In the capacity model the message rate (~231k/sec, ~4 TB/day) is an ordinary throughput problem, but holding ~100 million persistent WebSocket connections at peak forces ~1,000 stateful gateway servers, ~1 TB of connection memory, and the session registry for routing. You scale chat by managing millions of long-lived stateful connections, not by adding stateless boxes — so the connection count, not the message rate, is the sizing driver." },
+    { question: "What happens when a gateway server crashes?", answer: "Its connections drop, and clients automatically reconnect — to a different gateway — re-registering in the session registry and syncing from their last-seen seq. In-flight messages are redelivered under at-least-once and any duplicates are dropped by message_id dedup, so nothing is lost or shown twice. Connection drops are treated as normal operation, which is why reconnect-with-backoff and resync-by-seq are built into the client, not bolted on." },
+    { question: "How does a chat system relate to the Notification Service?", answer: "They're separate systems with a clean handoff. The chat system owns in-app, real-time delivery over persistent connections; when a recipient is offline, it asks the Notification Service to send an out-of-app push notification ('New message from …') so they know to reopen the app. The chat system also reuses the async fan-out pattern from notifications and the news feed, and the WebSocket fan-out / reconnect-sync patterns from the collaborative document editor." },
+  ]}
+/>
