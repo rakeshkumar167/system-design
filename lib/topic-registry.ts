@@ -28,6 +28,27 @@ export const topicMetas: Record<string, TopicMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "tls-https-certificates": {
+    slug: "tls-https-certificates",
+    categorySlug: "security",
+    title: "TLS/HTTPS and Certificates",
+    description:
+      "How a connection becomes private, tamper-proof, and authenticated — the symmetric/asymmetric crypto split, the TLS handshake, certificates and the PKI chain of trust, certificate lifecycle, and TLS termination.",
+    readingMinutes: 20,
+    concepts: ["TLS handshake", "Certificates & PKI", "Forward secrecy", "TLS termination"],
+    sections: [
+      { id: "overview", label: "What TLS & HTTPS Are", depth: "fundamentals" },
+      { id: "symmetric-asymmetric", label: "Symmetric vs Asymmetric Crypto", depth: "fundamentals" },
+      { id: "tls-handshake", label: "The TLS Handshake", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity: The Cost of TLS", depth: "interview-ready" },
+      { id: "certificates-pki", label: "Certificates & the Chain of Trust", depth: "interview-ready" },
+      { id: "certificate-lifecycle", label: "Issuance, Expiry & Revocation", depth: "advanced" },
+      { id: "https-in-practice", label: "HTTPS in Practice", depth: "interview-ready" },
+      { id: "tls-termination", label: "TLS Termination & mTLS", depth: "advanced" },
+      { id: "pitfalls-best-practices", label: "Pitfalls & Best Practices", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTopic(slug: string): TopicMeta | undefined {

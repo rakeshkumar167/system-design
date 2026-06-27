@@ -5,10 +5,12 @@ import { getTopic, topicMetas } from "@/lib/topic-registry";
 import { getTopicCategory } from "@/lib/topics";
 import { TopicLayout } from "@/components/topic/topic-layout";
 import AuthenticationContent from "@/content/topics/authentication.mdx";
+import TlsContent from "@/content/topics/tls-https-certificates.mdx";
 
 /** Maps each registered topic slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
   authentication: AuthenticationContent,
+  "tls-https-certificates": TlsContent,
 };
 
 export function generateStaticParams() {

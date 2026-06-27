@@ -26,4 +26,18 @@ describe("topic registry", () => {
   it("returns undefined for an unregistered topic", () => {
     expect(getTopic("authorization")).toBeUndefined();
   });
+  it("registers the TLS topic", () => {
+    expect(Object.keys(topicMetas)).toContain("tls-https-certificates");
+  });
+  it("describes the TLS topic's ten sections", () => {
+    expect(getTopic("tls-https-certificates")?.sections).toHaveLength(10);
+  });
+  it("gives every TLS section a unique id and a valid depth", () => {
+    const sections = getTopic("tls-https-certificates")!.sections;
+    const ids = sections.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const s of sections) {
+      expect(["fundamentals", "interview-ready", "advanced"]).toContain(s.depth);
+    }
+  });
 });
