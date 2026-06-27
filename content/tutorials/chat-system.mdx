@@ -1,0 +1,71 @@
+<h2 id="interview-framing">Interview Framing</h2>
+
+This section sets the stage for the chat system interview, covering the problem scope and what interviewers expect.
+
+<h2 id="requirements">Requirements</h2>
+
+This section defines the functional and non-functional requirements for a real-time 1:1 and group chat system.
+
+<h2 id="capacity-estimates">Capacity Estimates</h2>
+
+This section works through the capacity math, revealing that persistent WebSocket connections — not message throughput — are the signature constraint.
+
+<h2 id="entity-model">Entity Model</h2>
+
+This section defines the core data entities: Message, Conversation, Mailbox, and Session Registry.
+
+<h2 id="api-design">API Design</h2>
+
+This section specifies the key APIs including the WebSocket upgrade endpoint and the message send and history endpoints.
+
+<h2 id="high-level-architecture">High-Level Architecture</h2>
+
+This section presents the high-level architecture showing WebSocket gateways, the message service, session registry, and mailbox store.
+
+<h2 id="detailed-flows">Detailed Flows</h2>
+
+This section walks through the send, offline delivery, receipt, and presence update flows step by step.
+
+<h2 id="connection-layer">WebSockets and Connection Management</h2>
+
+This section explains why WebSockets are essential for chat and how the stateful gateway fleet manages millions of persistent connections.
+
+<h2 id="message-delivery">Message Delivery and the Mailbox</h2>
+
+This section covers the online-push path and the offline-mailbox pattern for delivering messages when the recipient is not connected.
+
+<h2 id="delivery-guarantees">Delivery Guarantees and Receipts</h2>
+
+This section describes at-least-once delivery with client ACKs, deduplication by client message ID, and the sent-delivered-read receipt state machine.
+
+<h2 id="ordering-consistency">Ordering and Consistency</h2>
+
+This section explains how per-conversation monotonic sequence numbers ensure messages are displayed in the correct order on all clients.
+
+<h2 id="group-chat-fanout">Group Chat and Fan-out</h2>
+
+This section covers the fan-out-on-write approach for group messages and the tradeoffs involved in delivering to many recipients.
+
+<h2 id="presence-typing">Presence, Typing, and Last-Seen</h2>
+
+This section explains heartbeat-driven presence, typing indicators, and why presence fan-out is costly at scale.
+
+<h2 id="scalability-evolution">Scalability and Evolution</h2>
+
+This section discusses how the system scales horizontally and how the architecture evolves as demand grows.
+
+<h2 id="resiliency-failure-modes">Resiliency and Failure Modes</h2>
+
+This section analyzes failure scenarios such as gateway crashes and session registry partitions, and explains the recovery paths.
+
+<h2 id="tradeoffs-alternatives">Trade-offs and Alternatives</h2>
+
+This section compares architectural choices such as push vs pull, fan-out strategies, and storage options.
+
+<h2 id="interview-summary">Interview Summary</h2>
+
+This section provides a concise 60-second answer covering the key design decisions for a chat system interview.
+
+<h2 id="knowledge-checks-faq">Knowledge Checks and FAQ</h2>
+
+This section contains review questions and answers to common interview questions about chat system design.

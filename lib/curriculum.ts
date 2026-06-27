@@ -102,7 +102,7 @@ export const problems: readonly Problem[] = [
       "Deliver real-time 1:1 and group messages with presence, ordering, and delivery guarantees.",
     difficulty: "Advanced",
     concepts: ["WebSockets", "Message ordering", "Presence", "Delivery semantics"],
-    status: "coming-soon",
+    status: "available",
     sequence: 10,
   },
   {
