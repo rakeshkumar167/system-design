@@ -565,3 +565,26 @@ describe("Authentication flow diagrams", () => {
     expect(screen.getByText(/network round-trip on the hot path/i)).toBeInTheDocument();
   });
 });
+
+import {
+  TlsHandshakeSequence,
+  CertValidationSequence,
+} from "@/components/diagrams/tls-flows";
+
+describe("TLS flow diagrams", () => {
+  it("exposes the TLS handshake to non-visual readers", () => {
+    render(<TlsHandshakeSequence />);
+    expect(
+      screen.getByRole("img", { name: /tls handshake establishing an encrypted session/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/an eavesdropper watching every byte cannot reconstruct/i)).toBeInTheDocument();
+  });
+
+  it("exposes certificate-chain validation to non-visual readers", () => {
+    render(<CertValidationSequence />);
+    expect(
+      screen.getByRole("img", { name: /validating a certificate chain to a trusted root/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/pre-installed in its local trust store/i)).toBeInTheDocument();
+  });
+});
