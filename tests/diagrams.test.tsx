@@ -480,3 +480,34 @@ describe("search autocomplete flow sequences", () => {
     expect(screen.getByRole("img", { name: /typo/i })).toBeInTheDocument();
   });
 });
+
+import { NewsFeedArchitecture } from "@/components/diagrams/news-feed-architecture";
+import {
+  PublishFanoutSequence,
+  ReadFeedSequence,
+  HybridMergeSequence,
+  FeedRankingSequence,
+} from "@/components/diagrams/news-feed-flows";
+
+describe("NewsFeedArchitecture", () => {
+  it("exposes the news feed architecture to non-visual readers", () => {
+    render(<NewsFeedArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /news feed architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/fan-out on write/i)).toBeInTheDocument();
+  });
+});
+
+describe("news feed flow sequences", () => {
+  it("renders the publish, read, hybrid, and ranking sequences", () => {
+    render(<PublishFanoutSequence />);
+    expect(screen.getByRole("img", { name: /publish/i })).toBeInTheDocument();
+    render(<ReadFeedSequence />);
+    expect(screen.getByRole("img", { name: /read/i })).toBeInTheDocument();
+    render(<HybridMergeSequence />);
+    expect(screen.getByRole("img", { name: /hybrid/i })).toBeInTheDocument();
+    render(<FeedRankingSequence />);
+    expect(screen.getByRole("img", { name: /ranking/i })).toBeInTheDocument();
+  });
+});

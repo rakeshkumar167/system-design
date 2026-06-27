@@ -139,6 +139,13 @@ import {
   TrendingUpdateSequence,
   TypoCorrectionSequence,
 } from "@/components/diagrams/search-autocomplete-flows";
+import { NewsFeedArchitecture } from "@/components/diagrams/news-feed-architecture";
+import {
+  PublishFanoutSequence,
+  ReadFeedSequence,
+  HybridMergeSequence,
+  FeedRankingSequence,
+} from "@/components/diagrams/news-feed-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -255,6 +262,11 @@ const teachingComponents = {
   AutocompleteIndexBuildSequence,
   TrendingUpdateSequence,
   TypoCorrectionSequence,
+  NewsFeedArchitecture,
+  PublishFanoutSequence,
+  ReadFeedSequence,
+  HybridMergeSequence,
+  FeedRankingSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
