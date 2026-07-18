@@ -159,6 +159,7 @@ import {
 } from "@/components/diagrams/chat-system-flows";
 import { OAuthAuthCodeSequence, SessionVsTokenSequence } from "@/components/diagrams/authentication-flows";
 import { TlsHandshakeSequence, CertValidationSequence } from "@/components/diagrams/tls-flows";
+import { AuthorizationDecisionSequence, RelationshipCheckSequence } from "@/components/diagrams/authorization-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -293,6 +294,8 @@ const teachingComponents = {
   SessionVsTokenSequence,
   TlsHandshakeSequence,
   CertValidationSequence,
+  AuthorizationDecisionSequence,
+  RelationshipCheckSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

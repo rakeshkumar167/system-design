@@ -570,6 +570,10 @@ import {
   TlsHandshakeSequence,
   CertValidationSequence,
 } from "@/components/diagrams/tls-flows";
+import {
+  AuthorizationDecisionSequence,
+  RelationshipCheckSequence,
+} from "@/components/diagrams/authorization-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -586,5 +590,23 @@ describe("TLS flow diagrams", () => {
       screen.getByRole("img", { name: /validating a certificate chain to a trusted root/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/pre-installed in its local trust store/i)).toBeInTheDocument();
+  });
+});
+
+describe("Authorization flow diagrams", () => {
+  it("exposes the authorization decision to non-visual readers", () => {
+    render(<AuthorizationDecisionSequence />);
+    expect(
+      screen.getByRole("img", { name: /an externalized authorization decision/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/decoupling deciding from enforcing/i)).toBeInTheDocument();
+  });
+
+  it("exposes the relationship-based permission check to non-visual readers", () => {
+    render(<RelationshipCheckSequence />);
+    expect(
+      screen.getByRole("img", { name: /a relationship-based permission check/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Google Zanzibar popularized/i)).toBeInTheDocument();
   });
 });
