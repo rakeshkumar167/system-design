@@ -1,39 +1,236 @@
 <h2 id="overview">What Authorization Is</h2>
 
-Placeholder.
+Once a system knows **who** you are, it still has to decide **what you're allowed to do**. That second decision is **authorization** (authz), and it is a distinct concern from **authentication** (authn), which proves identity. The two are constantly confused because they run back-to-back on every request, but they answer different questions: authn answers *"who is this?"*, authz answers *"may this principal do this?"*. Authorization always runs **after** a verified identity — you cannot meaningfully authorize an anonymous, unproven caller, so a broken or skipped authn step poisons every authz decision downstream.
+
+Every authorization decision is a verdict — **allow** or **deny** — over a small tuple:
+
+- a **subject** — the authenticated principal (a user, a service, an API key);
+- an **action** — the verb (`read`, `transfer`, `delete`);
+- a **resource** — the object acted on (`invoice:8815`, the `/admin` route, a row in a table);
+- a **context** — the surrounding conditions (time of day, source IP, tenant, whether MFA was used).
+
+Framed that way, authorization is a pure function: given `(subject, action, resource, context)`, return `allow | deny`. The whole topic is about *how* systems compute that function — the **models** for expressing the rules (RBAC, ABAC, ReBAC), the **architecture** for evaluating them without scattering `if` statements through the code, the **cost** of doing it on every request, and the **failure modes** (chief among them forgetting to check that *this* user owns *this* object).
+
+<Callout variant="info" title="authn vs authz">
+**Authentication** proves *who you are* (see the [Authentication](/topics/security/authentication) topic — passwords, tokens, MFA). **Authorization** decides *what you may do* — and it always runs **after** authn, because you can't authorize an unknown caller. A single request does both: first verify the identity in the token, then decide whether that identity is permitted the action on the resource. Confusing the two — treating "logged in" as "allowed" — is the root of a whole class of security bugs.
+</Callout>
 
 <h2 id="access-control-models">Access-Control Models</h2>
 
-Placeholder.
+There are four dominant ways to express *who may do what*, and picking the right one is the first design decision. They trade **granularity** against **administrative cost**.
+
+- **ACL (Access Control List)** — each **object** carries a list of who-can-do-what: `file.txt → {alice: read-write, bob: read}`. Dead simple and intuitive (it's how Unix file permissions work), but the rules are **scattered across every object**, so "what can Alice access?" and "revoke Bob everywhere" become expensive scans. ACLs don't scale to millions of objects and thousands of users.
+- **RBAC (Role-Based Access Control)** — users are granted **roles**, and roles carry **permissions**: `alice → billing-admin → {invoice:read, invoice:refund}`. The indirection collapses the user×permission matrix into a handful of roles, which makes assignment, audit, and reasoning tractable. It is the workhorse of enterprise authorization.
+- **ABAC (Attribute-Based Access Control)** — decisions are **computed** by evaluating **policy rules** over **attributes** of the subject, resource, action, and environment: *allow `read` if `subject.department == resource.department`*. Fine-grained and dynamic, at the cost of harder-to-author policies and a need for attribute data at decision time.
+- **ReBAC (Relationship-Based Access Control)** — permissions are derived from a **graph of relationships**: *"a user who is an **editor** of a folder can edit every document **in** that folder."* This is how consumer sharing (Google Drive, GitHub) works, where access flows through ownership, membership, and containment.
+
+<TradeoffTable
+  columns={["Model", "Rule shape", "Best fit", "Weakness"]}
+  rows={[
+    ["ACL", "Per-object list of principals", "Small, flat, object-centric permissions (files, buckets)", "Rules scattered per object; hard to audit or bulk-revoke at scale"],
+    ["RBAC", "User → role → permission", "Enterprise apps with well-defined job functions", "Role explosion when permissions need per-object or contextual nuance"],
+    ["ABAC", "Policy over subject/resource/action/env attributes", "Fine-grained, contextual, dynamic decisions", "Policies and attribute sources are harder to write, test, and reason about"],
+    ["ReBAC", "Graph of relationship tuples", "Shared, hierarchical resources (docs, orgs, folders)", "Needs a central, consistent, hot relationship store"],
+  ]}
+  recommendedRow={1}
+/>
+
+These aren't mutually exclusive: real systems **combine** them — RBAC as the coarse baseline, ABAC conditions layered on for context, and ReBAC for shared-resource hierarchies. Start with RBAC and reach for the others when it strains.
+
+<KnowledgeCheck
+  question="Why do most systems prefer RBAC over per-object ACLs as they grow?"
+  options={[
+    "ACLs are less secure than RBAC because they don't encrypt permissions",
+    "RBAC introduces a layer of indirection — users get roles, roles carry permissions — which collapses a huge user×permission matrix into a few auditable roles. That makes assignment, review, and bulk changes tractable, whereas ACLs scatter the rules across every object, so questions like 'what can this user access?' or 'revoke this person everywhere' require scanning everything",
+    "RBAC allows more permissions per user than ACLs do",
+    "ACLs can only express read and write, while RBAC supports arbitrary actions",
+  ]}
+  answer={1}
+  explanation="The problem with ACLs at scale isn't security, it's manageability: permissions live on each object, so cross-cutting questions and changes are expensive and error-prone. RBAC's user→role→permission indirection turns an unmanageable matrix into a small set of roles you can assign, audit, and change in one place. Both can express arbitrary actions; the difference is how the rules are organized and administered."
+/>
 
 <h2 id="rbac">Role-Based Access Control (RBAC)</h2>
 
-Placeholder.
+RBAC is built from three concepts. A **permission** is a specific action on a resource type — `invoice:read`, `user:delete`. A **role** bundles permissions into a meaningful job function — `billing-admin` might hold `{invoice:read, invoice:refund, report:read}`. **Users are assigned roles**, and a user's effective permissions are the union of their roles' permissions. The indirection is the whole point: you manage a handful of roles instead of a permission list per user, and onboarding someone is "give them the `support-agent` role" rather than wiring up twenty individual grants.
+
+**Role hierarchies** reduce duplication further: `admin` *inherits* `editor`, which inherits `viewer`, so a permission added to `viewer` automatically flows up. **Separation of duties (SoD)** is a governance constraint expressed in RBAC — no single role (or user) should be able to both *create* a payment and *approve* it, so fraud requires collusion. RBAC's strengths are exactly what auditors want: permissions are **explicit, enumerable, and stable**, so "who can refund an invoice?" is a lookup, not an investigation.
+
+Its defining weakness is **role explosion**. The moment permissions need to depend on *which* object or *what* context — "an editor of documents **in the EU region**", "a manager, but only for **their own** team, during **business hours**" — RBAC has no natural home for the condition, so teams mint ever-more-specific roles (`editor-eu`, `editor-us-finance-readonly`) until there are more roles than users. That's the signal to add **ABAC** conditions or model the relationships with **ReBAC**, rather than creating role number 501.
+
+<KnowledgeCheck
+  question="What is 'role explosion' and what does it signal?"
+  options={[
+    "It's when too many users are assigned the admin role",
+    "Role explosion is the proliferation of hyper-specific roles that happens when permissions must depend on the particular object or the request context — RBAC can't express 'only for resources in region X' or 'only during business hours', so teams keep minting narrower roles until there are more roles than users. It signals you've outgrown pure RBAC and should add ABAC conditions or model the access as relationships (ReBAC)",
+    "It's a performance problem where evaluating roles becomes too slow",
+    "It's when a role hierarchy has too many levels of inheritance",
+  ]}
+  answer={1}
+  explanation="RBAC assigns permissions to roles independent of any specific object or context. As soon as real requirements are contextual or per-object, that model has nowhere to put the condition, so the workaround is a new, narrower role for each combination — leading to an unmanageable sprawl of roles. It's a design smell that the access rules are really about attributes or relationships, which ABAC and ReBAC express directly."
+/>
 
 <h2 id="abac">Attribute-Based Access Control (ABAC)</h2>
 
-Placeholder.
+ABAC replaces static role-to-permission mappings with **policy rules evaluated over attributes** at decision time. The inputs are attributes of the **subject** (department, clearance, employment status), the **resource** (owner, classification, tags, region), the **action**, and the **environment** (time, source IP, device posture, whether MFA was satisfied). A policy is a rule over those attributes, for example:
+
+> *Allow `read` on a document if `subject.department == resource.department` **and** `resource.classification != "restricted"` **and** `environment.time` is within business hours.*
+
+Because the decision is **computed** rather than looked up, one policy covers cases that would need a role each under RBAC — it kills role explosion for contextual rules and enables **fine-grained, dynamic** access ("only the owner", "only from a managed device"). The cost is real: policies and their attribute sources are **harder to author, test, and reason about**, and the decision point must have the **attributes available** when it evaluates — which is why the architecture needs a place to fetch them (the PIP, next section). Policy languages like **Rego** (Open Policy Agent) and **Cedar** (AWS) exist precisely to make these rules declarative, testable, and reviewable.
+
+In practice ABAC and RBAC are **complementary**: a role is just one attribute of the subject. A common, powerful pattern is RBAC for the coarse "what job function" and ABAC conditions for the "but only when/where/whose" — the baseline role gates the door and the attribute policy narrows it.
+
+<KnowledgeCheck
+  question="How does ABAC differ from RBAC, and when is it worth the added complexity?"
+  options={[
+    "ABAC is just RBAC with encrypted roles",
+    "ABAC computes each decision by evaluating policy rules over attributes of the subject, resource, action, and environment, instead of looking up static role→permission grants. That makes it fine-grained and context-aware (owner-only, business-hours-only, managed-device-only) and avoids role explosion for contextual rules — worth its harder-to-author policies and attribute plumbing precisely when access depends on the specific object or request context, not just a job function",
+    "ABAC is faster than RBAC because it doesn't need a database",
+    "ABAC removes the need for authentication because attributes prove identity",
+  ]}
+  answer={1}
+  explanation="RBAC maps users to roles to permissions statically; ABAC evaluates rules over attributes at decision time, so it can express per-object and contextual conditions a role can't. That expressiveness is the reason to adopt it — when requirements are 'only the owner', 'only in region X', 'only with MFA' — accepting that policies are harder to write and test and that the decision point needs the attributes available. It complements rather than replaces RBAC (a role is one attribute), and it has nothing to do with encryption or skipping authentication."
+/>
 
 <h2 id="policy-architecture">Policy Architecture: PEP, PDP & Engines</h2>
 
-Placeholder.
+The biggest operational mistake in authorization is **scattering decisions through the code** — an `if (user.role === "admin")` here, a hand-rolled ownership check there. It's unauditable, inconsistent, and impossible to change safely. The fix is to **separate deciding from enforcing**, a structure formalized by four roles:
+
+- **PEP — Policy Enforcement Point.** The chokepoint that *intercepts* the request and *enforces* the verdict (an API gateway, a service middleware, a sidecar). It asks the question and obeys the answer; it contains no policy logic.
+- **PDP — Policy Decision Point.** The *engine* that evaluates the policy against the request and returns `allow | deny`. This is where the rules actually run.
+- **PAP — Policy Administration Point.** Where policies are *authored, versioned, and managed* — the source of truth the PDP loads.
+- **PIP — Policy Information Point.** The *attribute source* the PDP consults for data it doesn't have in hand (the subject's department, the resource's owner).
+
+<AuthorizationDecisionSequence />
+
+**Externalized authorization** puts the PDP in a dedicated **policy engine** that evaluates declarative policy — **OPA (Open Policy Agent)** with its **Rego** language, or **AWS Cedar** — rather than bespoke code. The engine is deployed one of two ways. As a **local sidecar** (a co-located process next to each service): decisions are a **local, sub-millisecond call** with no network hop, which is the common high-performance choice; the policies and data are distributed to every sidecar. Or as a **central service**: one authoritative decision point and one place to see every policy, at the cost of a **network round trip per check** and a hot dependency in the request path. The trade-off — local speed versus central consistency — sets up the capacity story next.
+
+<KnowledgeCheck
+  question="What do the PEP and PDP each do, and why separate them?"
+  options={[
+    "The PEP encrypts the request and the PDP decrypts it",
+    "The Policy Enforcement Point intercepts the request and enforces the verdict but holds no rules; the Policy Decision Point evaluates the policy and returns allow or deny. Separating them keeps authorization logic out of scattered if-statements and in one auditable, changeable place — the enforcement points just ask and obey, so policy is consistent across services and can be updated without touching application code",
+    "The PEP is for authentication and the PDP is for authorization",
+    "They are two names for the same component in different vendors' documentation",
+  ]}
+  answer={1}
+  explanation="The PEP is the enforcement chokepoint (gateway, middleware, sidecar) that asks for a decision and obeys it; the PDP is the engine that actually evaluates policy. Decoupling deciding from enforcing centralizes the rules — one place to author, audit, and change them — so authorization is consistent everywhere and doesn't rot into inconsistent inline checks. The PAP (authoring) and PIP (attribute source) round out the model; none of this is about encryption or authentication."
+/>
 
 <h2 id="capacity-estimates">Capacity: The Cost of Permission Checks</h2>
 
-Placeholder.
+Authorization runs on **every request**, and usually **more than once** per request — a coarse check at the gateway, a business-rule check in the service, and an object-level check at the data layer. So a busy API makes **several times more authz checks than it serves requests**, and if each check evaluates policy from scratch (or worse, makes a network hop to a central PDP), the decision tier can rival the application tier in cost. The dominant lever is a **decision cache**: most checks repeat the same `(subject, action, resource)` within a short window, so caching the verdict turns repeated evaluations into cheap lookups.
+
+<AuthorizationCapacity
+  assumptions={{
+    requestsPerSec: 200000,
+    checksPerRequest: 3,
+    decisionCpuMs: 0.5,
+    cacheHitRate: 0.9,
+    msPerCorePerSec: 1000,
+  }}
+/>
+
+At 200k requests/sec with 3 checks each, that's **600k checks/sec**. Evaluating every one costs ~**300 cores**; a **90%-hit decision cache** drops it to 60k real evaluations and ~**30 cores** — a **10× reduction**. Two lessons follow. First, authz capacity is sized by **checks per second**, not requests per second, so cutting redundant checks and caching decisions matters as much as the raw traffic. Second, the cache buys speed at the price of **staleness**: a permission revoked *now* keeps passing until its cached verdict expires, so the TTL is kept **short** (seconds), and **sensitive or destructive actions bypass the cache** and re-evaluate live. This is the same amortization shape as TLS session resumption — the expensive computation is done once and reused — with the same caveat that reuse means a window of stale state.
 
 <h2 id="relationship-based">ReBAC & Google Zanzibar</h2>
 
-Placeholder.
+Some products don't have roles so much as **relationships**: *the owner of a folder can share it; members of that share can view every document inside; a comment inherits the visibility of its parent.* Expressing this in RBAC or ABAC is painful because permission flows through **chains of ownership, membership, and containment** that change constantly. **Relationship-Based Access Control** models it directly as a **graph of relationship tuples** of the form `(object, relation, subject)`:
+
+```
+(doc:123,   viewer, user:alice)
+(doc:123,   viewer, group:eng#member)   // everyone who is a member of group:eng
+(folder:9,  editor, user:bob)
+(doc:123,   parent, folder:9)           // doc:123 inherits folder:9's grants
+```
+
+A permission question becomes a **`check(user, relation, object)`** call that **walks the graph**: is Alice a `viewer` of `doc:123`? Directly yes — or transitively, because she's a member of a group that is a viewer, or because she can edit the parent folder. **Google Zanzibar** is the system that popularized this at planet scale (it powers Google Drive, YouTube, and Calendar permissions); its design centralizes the tuples in one strongly-consistent store and returns a boolean from a simple check API. Because a UI must not show a document the user just lost access to (or hide one they were just granted), Zanzibar issues **zookies** — consistency tokens that let a read request demand "evaluate against a snapshot at least as fresh as this change" — giving **read-your-writes** consistency without making every check globally linearizable. Open-source implementations — **SpiceDB** and **OpenFGA** — bring the model to everyone.
+
+<RelationshipCheckSequence />
+
+The trade-off is a **central, consistent, and very hot** permission store: every page view can fan out into many `check` calls, so ReBAC systems invest heavily in caching, denormalized "reverse indexes" (to answer "list every doc Alice can view"), and the zookie machinery. It's the right tool for **shared, hierarchical, consumer-scale** resources — and overkill for a back-office app that RBAC handles fine.
+
+<KnowledgeCheck
+  question="What problem does a Zanzibar-style ReBAC system solve that RBAC struggles with?"
+  options={[
+    "It makes authorization checks faster by removing the database",
+    "It models permissions that flow through relationships — ownership, group membership, and containment hierarchies — as a graph of tuples answered by a check(user, relation, object) call that walks the graph. That directly expresses 'members of a folder's share can view its documents' and inheritance, which RBAC can't without exploding into per-object roles; Zanzibar adds a central consistent tuple store and consistency tokens (zookies) so a permission change is immediately reflected",
+    "It replaces authentication with relationship checks",
+    "It only works for social networks and can't express document permissions",
+  ]}
+  answer={1}
+  explanation="ReBAC shines when access is defined by relationships and hierarchies (owner, member, parent) that change constantly and would force RBAC into an explosion of per-object roles. Modeling them as relationship tuples and answering check() by walking the graph expresses inheritance naturally. Zanzibar's contributions are operating this at scale with a central, strongly-consistent tuple store and zookies for read-your-writes consistency — not removing the database, replacing authentication, or being limited to social apps (it powers Drive-style document sharing)."
+/>
 
 <h2 id="enforcement-in-practice">Enforcement in Practice</h2>
 
-Placeholder.
+Authorization must be enforced **in depth**, not at a single gate, because each layer sees different information:
+
+- **At the API gateway** — coarse checks: is the caller authenticated, is the **OAuth scope** sufficient for this API, is the tenant active? This stops obviously-unauthorized traffic early but knows nothing about specific objects.
+- **In the service** — business rules: is this user's role and context allowed to perform this operation? This is where RBAC/ABAC policy typically runs.
+- **At the data layer** — the **object-level** check that's easiest to forget and most dangerous to skip: does *this* subject actually own or have a relationship to *this specific* record? A gateway that confirms you're a logged-in user does **not** confirm that order `#124` is yours.
+
+Two practices deserve emphasis. **OAuth scopes are coarse authorization, not fine-grained access control**: a scope like `orders:read` says an *application* may read orders on your behalf — it does **not** say which orders, so per-object authz still has to run behind it. And in **multi-tenant** systems, every data access must be **tenant-scoped**: a `WHERE tenant_id = ?` filter is an authorization control, and forgetting it on one query leaks one tenant's data to another. The unifying rule is **deny by default** — an unmatched request is denied, never allowed — so a missing rule fails **closed**, not open.
+
+<KnowledgeCheck
+  question="Why isn't a valid OAuth scope at the API gateway sufficient authorization on its own?"
+  options={[
+    "Because scopes expire faster than access tokens",
+    "Because an OAuth scope is coarse — it says an application may perform a class of action on the user's behalf (e.g. read orders), but not which specific objects. The gateway confirms the caller is authenticated and broadly permitted, yet only the data layer can check that this particular record belongs to this subject. Skipping that object-level check is exactly the broken-object-level-authorization (IDOR) bug",
+    "Because gateways can't read OAuth tokens",
+    "Because scopes only work for third-party apps, not first-party ones",
+  ]}
+  answer={1}
+  explanation="Scopes are intentionally broad grants of capability to an application; they gate the class of operation, not individual objects. Enforcement has to continue past the gateway into the service and especially the data layer, where the system can verify ownership or relationship for the specific record. Relying on the scope alone — 'they can read orders, so return order #124' — is the classic IDOR/BOLA vulnerability. This is about granularity of the check, not token expiry or where tokens can be read."
+/>
 
 <h2 id="pitfalls-best-practices">Pitfalls & Best Practices</h2>
 
-Placeholder.
+The failure modes of authorization are well-known and, unlike subtle crypto bugs, mostly about discipline:
+
+<Callout variant="warning" title="Authorization footguns">
+- **Broken Object-Level Authorization (BOLA / IDOR).** The **#1 API vulnerability**: the code checks that you're authenticated but not that the object is *yours*, so changing `GET /orders/123` to `/orders/124` returns someone else's data. **Always enforce object-level ownership at the data layer** — never trust a client-supplied ID.
+- **Failing open.** A bug or timeout in the authz path that returns "allow" is catastrophic. **Deny by default**: unmatched or errored decisions must fail **closed**.
+- **Over-broad grants.** Wildcard roles, `admin` handed out for convenience, service accounts with far more than they use. Apply **least privilege** — grant the minimum, and prefer **time-bound elevation** (just-in-time access) over standing admin.
+- **Role explosion.** Reaching for the 500th narrow role instead of adopting **ABAC** conditions or **ReBAC** relationships. The sprawl itself is the bug.
+- **Confused deputy.** A privileged service performing an action on **attacker-controlled input** without re-checking authorization in the *caller's* context — the service's own high privilege gets abused. Pass and check the **original subject's** authority, don't act on the service's.
+- **Cache staleness vs revocation.** Decision caches make revocation lag. Keep TTLs **short**, and **bypass the cache** for sensitive/destructive actions so they re-evaluate live.
+</Callout>
+
+<DecisionRecord
+  title="The default authorization posture"
+  choice="Use RBAC as the baseline model, add ABAC conditions for contextual and per-object rules, and adopt ReBAC (a Zanzibar-style tuple store) only for shared, hierarchical resources that need it. Externalize decisions into a policy engine (OPA/Rego or Cedar) behind a Policy Enforcement Point, deployed as a local sidecar for low-latency evaluation, with a short-TTL decision cache and live evaluation for sensitive actions. Enforce in depth — coarse checks at the gateway, business rules in the service, and mandatory object-level ownership checks at the data layer — and default-deny everywhere."
+  rationale="RBAC is auditable and easy to reason about, so it's the right default; ABAC handles the contextual cases that would otherwise explode roles; ReBAC is reserved for relationship-heavy sharing where it earns its central store. Externalizing policy into an engine keeps authorization out of scattered inline checks — one auditable, versioned source of truth — and a sidecar makes evaluation a fast local call. Defense in depth with object-level checks closes the BOLA/IDOR hole, and default-deny makes missing rules fail safe."
+  alternatives="Inline authorization in application code — fastest to write, but unauditable, inconsistent, and the source of most authz bugs. A central PDP service instead of sidecars — one source of truth but a network hop and hot dependency on every check. Pure RBAC everywhere — simple but forces role explosion for contextual/shared access. No decision cache — always fresh but far more CPU and latency in the request path. ReBAC for everything — powerful but operationally heavy for apps that don't need relationship graphs."
+  revisitWhen="Role counts balloon toward the number of users (adopt ABAC/ReBAC); a product grows consumer-style sharing and hierarchies (introduce a Zanzibar-style store); compliance demands centralized, provable policy and audit (strengthen the PAP and central logging); or the decision tier's cost or latency becomes a bottleneck (revisit caching, sidecar placement, and checks-per-request)."
+/>
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="In the capacity model, evaluating every check costs ~300 cores but a 90% decision cache cuts it to ~30. What's the headline lesson?"
+  options={[
+    "That authorization is cheap and never needs to be optimized",
+    "That authorization runs on every request and often several times per request, so a busy API makes far more authz checks than it serves requests — and it's sized by checks per second, not requests per second. Because most checks repeat the same subject/action/resource, a short-TTL decision cache (and local sidecar evaluation) amortizes the cost ~10×, at the price of staleness, so sensitive actions bypass the cache and re-evaluate live",
+    "That you should always evaluate every check with no cache for correctness",
+    "That the cache makes the application tier faster",
+  ]}
+  answer={1}
+  explanation="The point is that authorization volume is a multiple of request volume (multiple checks per request across gateway, service, and data layer), so it must be sized by checks/sec and actively optimized. A decision cache exploits the heavy repetition of the same (subject, action, resource) tuples to cut CPU ~10×, mirroring TLS session resumption. The trade-off is staleness — a revoked grant lingers until the TTL expires — which is why TTLs are short and destructive actions skip the cache."
+/>
+
+<Faq
+  items={[
+    { question: "What's the difference between authentication and authorization?", answer: "Authentication (authn) proves who you are — verifying identity with a password, token, or MFA. Authorization (authz) decides what that verified identity may do — evaluating whether the subject is permitted an action on a resource. Authz always runs after authn, because you can't authorize an unknown caller. Treating 'logged in' as 'allowed' — skipping the authz step — is a common and serious bug." },
+    { question: "When should I use RBAC vs ABAC vs ReBAC?", answer: "Use RBAC as the default: users get roles, roles carry permissions — simple, auditable, ideal for well-defined job functions. Add ABAC when decisions depend on attributes and context (owner-only, business-hours-only, region-scoped), which would otherwise explode into too many roles. Use ReBAC (a relationship graph, Zanzibar-style) for shared, hierarchical resources where access flows through ownership, membership, and containment — like document sharing. They combine: RBAC baseline, ABAC conditions, ReBAC for sharing." },
+    { question: "What is role explosion and how do I avoid it?", answer: "Role explosion is the proliferation of hyper-specific roles that occurs when RBAC has to encode per-object or contextual conditions it can't express — you end up with more roles than users (editor-eu, editor-us-readonly, and so on). Avoid it by recognizing when rules are really about attributes (move to ABAC conditions) or relationships (move to ReBAC), instead of minting yet another narrow role." },
+    { question: "What are the PEP, PDP, PAP, and PIP?", answer: "They're the roles that separate deciding from enforcing. The PEP (Policy Enforcement Point) intercepts the request and enforces the verdict but holds no rules. The PDP (Policy Decision Point) is the engine that evaluates policy and returns allow/deny. The PAP (Policy Administration Point) is where policies are authored and versioned. The PIP (Policy Information Point) supplies attributes the PDP needs. Decoupling them keeps authorization consistent and auditable instead of scattered through code." },
+    { question: "What is externalized authorization and what are OPA and Cedar?", answer: "Externalized authorization moves policy out of application code into a dedicated engine that evaluates declarative rules. OPA (Open Policy Agent), with its Rego language, and AWS Cedar are the popular engines. Deploying the engine as a local sidecar makes each decision a fast, in-process call with no network hop (the common high-performance choice); a central service gives one source of truth at the cost of a round trip per check." },
+    { question: "What is IDOR / BOLA and how do I prevent it?", answer: "Broken Object-Level Authorization (BOLA), also called IDOR (Insecure Direct Object Reference), is the top API vulnerability: the code verifies the caller is authenticated but not that the requested object belongs to them, so changing an ID in the URL (/orders/123 to /orders/124) returns someone else's data. Prevent it by enforcing object-level ownership or relationship checks at the data layer for every request — never trust a client-supplied ID as proof of access." },
+    { question: "Are OAuth scopes the same as authorization?", answer: "No. OAuth scopes are coarse-grained: a scope like orders:read grants an application the capability to read orders on a user's behalf, but says nothing about which specific orders. Scopes gate the class of operation at the edge; fine-grained, per-object authorization still has to run in the service and at the data layer. Relying on a scope alone for object access is exactly the BOLA/IDOR mistake." },
+    { question: "How is authorization enforced across a request?", answer: "In depth, at multiple layers: the API gateway does coarse checks (authenticated? scope sufficient? tenant active?), the service applies business rules (role/attribute policy), and the data layer performs the critical object-level check (does this subject own this specific record?). Each layer sees different information, and the object-level check — the one most often skipped — is where ownership is actually verified." },
+    { question: "How do you keep authorization fast at scale?", answer: "Authorization is sized by checks per second, which is a multiple of requests per second (several checks per request). Keep it fast by evaluating policy locally (a sidecar engine, no network hop), caching decisions for repeated (subject, action, resource) tuples with a short TTL, and minimizing redundant checks. The cache trades a small window of staleness for a large CPU reduction, so sensitive or destructive actions bypass it and re-evaluate live." },
+    { question: "What does 'default deny' mean and why does it matter?", answer: "Default deny (fail closed) means any request that doesn't explicitly match an allow rule — or that errors or times out in the authorization path — is denied. It matters because the alternative, failing open, turns a bug, a missing rule, or an outage in the authz service into an accidental grant of access. Denying by default makes the safe outcome the automatic one." },
+    { question: "What is the confused-deputy problem?", answer: "It's when a privileged component is tricked into misusing its authority on behalf of a less-privileged caller. A backend service that holds broad permissions performs an action on attacker-controlled input without re-checking authorization in the original caller's context, so the service's privilege gets borrowed. The fix is to carry and check the original subject's authority for the action, rather than acting purely with the service's own elevated rights." },
+    { question: "What is least privilege in authorization?", answer: "Least privilege means granting each subject the minimum permissions needed to do its job and no more — narrow roles over wildcard ones, scoped service accounts, and just-in-time, time-bound elevation instead of standing admin access. It shrinks the blast radius of a compromised account or token: if a credential leaks, the attacker inherits only a small, specific set of permissions rather than the keys to everything." },
+  ]}
+/>
