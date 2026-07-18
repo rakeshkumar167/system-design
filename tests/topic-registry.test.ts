@@ -24,7 +24,7 @@ describe("topic registry", () => {
     }
   });
   it("returns undefined for an unregistered topic", () => {
-    expect(getTopic("authorization")).toBeUndefined();
+    expect(getTopic("password-hashing")).toBeUndefined();
   });
   it("registers the TLS topic", () => {
     expect(Object.keys(topicMetas)).toContain("tls-https-certificates");
@@ -34,6 +34,20 @@ describe("topic registry", () => {
   });
   it("gives every TLS section a unique id and a valid depth", () => {
     const sections = getTopic("tls-https-certificates")!.sections;
+    const ids = sections.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const s of sections) {
+      expect(["fundamentals", "interview-ready", "advanced"]).toContain(s.depth);
+    }
+  });
+  it("registers the Authorization topic", () => {
+    expect(Object.keys(topicMetas)).toContain("authorization");
+  });
+  it("describes the Authorization topic's ten sections", () => {
+    expect(getTopic("authorization")?.sections).toHaveLength(10);
+  });
+  it("gives every Authorization section a unique id and a valid depth", () => {
+    const sections = getTopic("authorization")!.sections;
     const ids = sections.map((s) => s.id);
     expect(new Set(ids).size).toBe(ids.length);
     for (const s of sections) {

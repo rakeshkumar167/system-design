@@ -14,7 +14,7 @@ export const topicCategories: readonly TopicCategory[] = [
       "The practices and primitives that keep a system and its users safe — from authentication and encryption to threat modeling and a secure delivery pipeline.",
     topics: [
       { slug: "authentication", title: "Authentication", blurb: "JWT, OAuth 2.0, OIDC", status: "available" },
-      { slug: "authorization", title: "Authorization", blurb: "RBAC, ABAC", status: "coming-soon" },
+      { slug: "authorization", title: "Authorization", blurb: "RBAC, ABAC", status: "available" },
       { slug: "tls-https-certificates", title: "TLS/HTTPS and certificates", blurb: "", status: "available" },
       { slug: "password-hashing", title: "Password hashing", blurb: "Argon2/bcrypt", status: "coming-soon" },
       { slug: "encryption-key-management", title: "Encryption and key management", blurb: "", status: "coming-soon" },

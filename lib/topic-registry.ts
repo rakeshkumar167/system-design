@@ -49,6 +49,27 @@ export const topicMetas: Record<string, TopicMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  authorization: {
+    slug: "authorization",
+    categorySlug: "security",
+    title: "Authorization",
+    description:
+      "How a system decides what an authenticated principal may do — the access-control models (ACL, RBAC, ABAC, ReBAC), the policy architecture that separates deciding from enforcing, the cost of permission checks at scale, Google Zanzibar-style relationship checks, and enforcing in depth without object-level holes.",
+    readingMinutes: 22,
+    concepts: ["RBAC", "ABAC", "ReBAC", "Policy engines", "Least privilege"],
+    sections: [
+      { id: "overview", label: "What Authorization Is", depth: "fundamentals" },
+      { id: "access-control-models", label: "Access-Control Models", depth: "fundamentals" },
+      { id: "rbac", label: "Role-Based Access Control (RBAC)", depth: "interview-ready" },
+      { id: "abac", label: "Attribute-Based Access Control (ABAC)", depth: "interview-ready" },
+      { id: "policy-architecture", label: "Policy Architecture: PEP, PDP & Engines", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity: The Cost of Permission Checks", depth: "interview-ready" },
+      { id: "relationship-based", label: "ReBAC & Google Zanzibar", depth: "advanced" },
+      { id: "enforcement-in-practice", label: "Enforcement in Practice", depth: "interview-ready" },
+      { id: "pitfalls-best-practices", label: "Pitfalls & Best Practices", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTopic(slug: string): TopicMeta | undefined {
