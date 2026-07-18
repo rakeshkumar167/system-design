@@ -114,6 +114,20 @@ test("learner can open the TLS security topic", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("learner can open the authorization security topic", async ({ page }) => {
+  await page.goto("/topics");
+  await page.getByRole("link", { name: /authorization/i }).first().click();
+  await expect(
+    page.getByRole("heading", { level: 1, name: /^authorization$/i }),
+  ).toBeVisible();
+  // Navigate to a section via URL fragment (TOC is hidden on mobile viewports)
+  await page.goto("/topics/security/authorization#policy-architecture");
+  await expect(page.locator("#policy-architecture")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /an externalized authorization decision/i }).first(),
+  ).toBeVisible();
+});
+
 test("theme toggle switches between light and dark", async ({ page }) => {
   await page.goto("/");
   const html = page.locator("html");
