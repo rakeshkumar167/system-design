@@ -20,7 +20,7 @@ export const topicCategories: readonly TopicCategory[] = [
       { slug: "encryption-key-management", title: "Encryption and key management", blurb: "AES, KMS, envelope encryption", status: "available" },
       { slug: "owasp-top-10", title: "OWASP Top 10", blurb: "Injection, access control, SSRF", status: "available" },
       { slug: "api-security", title: "API security", blurb: "BOLA, tokens, gateways", status: "available" },
-      { slug: "session-management", title: "Session management", blurb: "", status: "coming-soon" },
+      { slug: "session-management", title: "Session management", blurb: "Cookies, fixation, CSRF", status: "available" },
       { slug: "rate-limiting", title: "Rate limiting", blurb: "", status: "coming-soon" },
       { slug: "secrets-management", title: "Secrets management", blurb: "", status: "coming-soon" },
       { slug: "threat-modeling", title: "Threat modeling", blurb: "STRIDE", status: "coming-soon" },

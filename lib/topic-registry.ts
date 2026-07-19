@@ -154,6 +154,27 @@ export const topicMetas: Record<string, TopicMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "session-management": {
+    slug: "session-management",
+    categorySlug: "security",
+    title: "Session Management",
+    description:
+      "How a server maintains an authenticated identity across stateless HTTP — session IDs and cookie security flags, server-side vs client-side sessions, the session lifecycle and timeouts, the session attacks (hijacking, fixation, CSRF), the cost of session lookups at scale, and the secure-session checklist.",
+    readingMinutes: 22,
+    concepts: ["Session IDs & cookies", "Stateful vs stateless", "Fixation & hijacking", "Timeouts", "CSRF & SameSite"],
+    sections: [
+      { id: "overview", label: "What Session Management Is", depth: "fundamentals" },
+      { id: "session-ids-cookies", label: "Session IDs & Cookies", depth: "interview-ready" },
+      { id: "server-vs-client-side", label: "Server-Side vs Client-Side Sessions", depth: "interview-ready" },
+      { id: "lifecycle-timeouts", label: "Session Lifecycle & Timeouts", depth: "interview-ready" },
+      { id: "session-attacks", label: "Session Attacks: Hijacking, Fixation & CSRF", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity: The Cost of Session Lookups", depth: "interview-ready" },
+      { id: "distributed-sessions", label: "Sessions at Scale", depth: "advanced" },
+      { id: "secure-sessions", label: "Secure Sessions in Practice", depth: "interview-ready" },
+      { id: "pitfalls-best-practices", label: "Pitfalls & Best Practices", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTopic(slug: string): TopicMeta | undefined {

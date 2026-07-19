@@ -24,7 +24,7 @@ describe("topic registry", () => {
     }
   });
   it("returns undefined for an unregistered topic", () => {
-    expect(getTopic("session-management")).toBeUndefined();
+    expect(getTopic("rate-limiting")).toBeUndefined();
   });
   it("registers the TLS topic", () => {
     expect(Object.keys(topicMetas)).toContain("tls-https-certificates");
@@ -104,6 +104,20 @@ describe("topic registry", () => {
   });
   it("gives every API Security section a unique id and a valid depth", () => {
     const sections = getTopic("api-security")!.sections;
+    const ids = sections.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const s of sections) {
+      expect(["fundamentals", "interview-ready", "advanced"]).toContain(s.depth);
+    }
+  });
+  it("registers the Session Management topic", () => {
+    expect(Object.keys(topicMetas)).toContain("session-management");
+  });
+  it("describes the Session Management topic's ten sections", () => {
+    expect(getTopic("session-management")?.sections).toHaveLength(10);
+  });
+  it("gives every Session Management section a unique id and a valid depth", () => {
+    const sections = getTopic("session-management")!.sections;
     const ids = sections.map((s) => s.id);
     expect(new Set(ids).size).toBe(ids.length);
     for (const s of sections) {
