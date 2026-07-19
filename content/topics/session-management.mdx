@@ -1,39 +1,226 @@
 <h2 id="overview">What Session Management Is</h2>
 
-Placeholder.
+**HTTP is stateless**: every request arrives as if the server has never seen the caller before. That's fine for fetching a public page, but the moment a user logs in you need the server to remember, on the *next* request and every one after, that this is the same authenticated person — otherwise it would demand a password on every click. **Session management** is how that memory works. After [authentication](/topics/security/authentication) succeeds *once*, the server establishes a **session** and hands the client a **session id**; the client presents that id on subsequent requests, and the server uses it to recognize the returning user.
+
+The single most important thing to internalize is what that session id *is*: a **bearer credential**. Whoever presents it is treated as the user, no questions asked, for as long as the session lives. It is not a name or a lookup key you can hand out casually — it is, functionally, a **temporary password**. Steal it and you *are* the victim until it expires. Almost everything in this topic follows from taking that seriously: the id must be unguessable, transmitted only over encrypted channels, unreadable to scripts, changed at login, and expired promptly.
+
+<Callout variant="info" title="The session id is a temporary password">
+A session id is a **bearer token**: possession is authentication. Anyone who obtains it — by guessing it, sniffing it off the wire, reading it from JavaScript, or having you use one they planted — becomes you for the rest of the session. Protect it with the same seriousness you'd protect the password itself: high entropy, TLS-only, HttpOnly, regenerated at login, and short-lived.
+</Callout>
 
 <h2 id="session-ids-cookies">Session IDs & Cookies</h2>
 
-Placeholder.
+Because the id is a credential, its **unpredictability** is non-negotiable. It must be generated from a **cryptographically secure random number generator (CSPRNG)** with enough entropy — at least **128 bits** — that an attacker can neither guess a valid one nor brute-force the space. A short or sequential id (`session=1002`) is a catastrophe: an attacker just tries adjacent values. This is the framework's job, not yours; the failure mode is rolling your own with a weak source.
+
+The id is almost always carried in a **cookie**, and the cookie's **security attributes** are a remarkably cheap, powerful line of defense — set them correctly and whole attack classes disappear:
+
+- **HttpOnly** — the cookie is invisible to JavaScript (`document.cookie` can't read it). This blunts **session theft via XSS**: even if an attacker injects a script, it can't exfiltrate the session id.
+- **Secure** — the cookie is sent only over **HTTPS**, never plaintext HTTP, so it can't be sniffed off the wire (pairs with the [TLS](/topics/security/tls-https-certificates) topic).
+- **SameSite** (`Lax` or `Strict`) — the browser won't attach the cookie to **cross-site** requests, which blunts **CSRF** (below).
+- **Domain / Path** scope and a sensible **Max-Age / Expires** — limit where the cookie is sent and how long it lives.
+
+<KnowledgeCheck
+  question="Why must a session id be generated from a CSPRNG with high entropy, and what does the HttpOnly cookie flag protect against?"
+  options={[
+    "So the id compresses well; HttpOnly makes the cookie load faster",
+    "Because the session id is a bearer credential — whoever holds a valid one is authenticated — so it must be unguessable and infeasible to brute-force, which requires a cryptographically secure random source with enough entropy (≥128 bits); a short or sequential id can simply be guessed. HttpOnly makes the cookie unreadable to JavaScript, so an XSS payload can't steal the session id, cutting off a major session-hijacking route",
+    "So the id is unique per server; HttpOnly encrypts the cookie contents",
+    "Entropy prevents replay attacks; HttpOnly prevents CSRF",
+  ]}
+  answer={1}
+  explanation="Possession of the id equals authentication, so predictable ids let an attacker guess or enumerate valid sessions — a CSPRNG with ≥128 bits of entropy makes that infeasible. HttpOnly hides the cookie from JavaScript so injected scripts (XSS) can't read and exfiltrate it. HttpOnly doesn't encrypt anything (that's Secure + TLS) and doesn't stop CSRF (that's SameSite); it specifically defeats script-based session theft."
+/>
 
 <h2 id="server-vs-client-side">Server-Side vs Client-Side Sessions</h2>
 
-Placeholder.
+There are two fundamentally different places to keep the session's *state*, and the choice drives everything about scale and revocation.
+
+- **Server-side (stateful) sessions.** The cookie holds only an **opaque random id**; the actual session data (user id, roles, cart) lives in a **session store** on the server — memory, a database, or (typically) **Redis**. The server can **revoke instantly** by deleting the store entry, and the client never sees the data. The cost: the server must **look the id up on every request**, and it must hold every active session in memory.
+- **Client-side (stateless) sessions.** The state *itself* is packed into a **signed (and often encrypted) cookie** or a **JWT** that the client holds and presents. The server just **verifies the signature** — **no lookup, no session store** — which makes horizontal scaling trivial (any server can validate any request). The costs are real, though: you **can't easily revoke** a token before it expires (there's nothing central to delete), the payload is **size-limited** and **visible** to the client (if only signed, not encrypted), and any change to the data waits for re-issue.
+
+<TradeoffTable
+  columns={["Property", "Server-side (stateful)", "Client-side (stateless)"]}
+  rows={[
+    ["Cookie holds", "Opaque session id", "The signed/encrypted state itself (e.g. JWT)"],
+    ["Per-request cost", "A session-store lookup", "A signature verification — no lookup"],
+    ["Revocation", "Instant (delete the store entry)", "Hard — can't revoke before expiry (needs a blocklist)"],
+    ["Scaling", "Needs a shared store or sticky routing", "Trivial — any server validates any request"],
+    ["Data exposure & size", "Hidden server-side, unlimited", "Client-visible (if unencrypted), size-limited"],
+  ]}
+  recommendedRow={0}
+/>
+
+This is the **sessions-vs-tokens** trade-off from the [Authentication](/topics/security/authentication) topic, seen from the storage side. The rule of thumb: prefer **stateful** sessions when you need reliable **revocation** and central control (most user-facing apps); reach for **stateless** when effortless horizontal scale matters more than instant revocation, and mitigate the revocation gap with **short lifetimes**.
+
+<KnowledgeCheck
+  question="What is the central trade-off between server-side (stateful) and client-side (stateless) sessions?"
+  options={[
+    "Stateful sessions are insecure; stateless sessions are always more secure",
+    "Stateful sessions store an opaque id that points to server-held state, so they can be revoked instantly by deleting the store entry but require a lookup on every request and memory to hold every session. Stateless sessions pack signed/encrypted state into the cookie or a JWT, so they need no lookup and scale horizontally with ease, but can't be revoked before they expire (nothing central to delete) and are size-limited and client-visible. It's revocation and control versus scale and simplicity",
+    "Stateful sessions can't scale at all; stateless sessions can't be used with cookies",
+    "They are identical except stateless sessions are faster to encrypt",
+  ]}
+  answer={1}
+  explanation="The distinction is where the state lives. Server-side keeps it in a store behind an opaque id — enabling instant revocation and central control at the price of a per-request lookup and memory. Client-side puts signed/encrypted state in the client's hands — eliminating the lookup and easing horizontal scale, but making revocation before expiry hard and exposing a size-limited, client-visible payload. Neither is inherently more secure; they trade revocation/control against scale/simplicity."
+/>
 
 <h2 id="lifecycle-timeouts">Session Lifecycle & Timeouts</h2>
 
-Placeholder.
+A session has a life: it's **created at login** (a fresh id issued), used across many requests, and must eventually **end**. Ending it well is where two distinct timeouts matter, and confusing them is a common gap:
+
+- **Idle (inactivity) timeout** — the session expires after a period of *no activity* (say 15–30 minutes). This limits the window on an **abandoned** session — a user who walks away from a shared computer isn't left logged in indefinitely.
+- **Absolute timeout** — a **hard cap** on total session lifetime regardless of activity (say 8–24 hours). This bounds the usefulness of a **stolen** session: even a continuously-used hijacked session is forcibly ended, forcing re-authentication.
+
+You want **both** — the idle timeout catches inactivity, the absolute timeout caps the total blast radius. **Sliding renewal** extends the idle window on each request, keeping active users logged in without lengthening the absolute cap. And **logout must actually invalidate the session server-side**: for a stateful session, delete the store entry so the id is instantly dead; for a stateless token, you can only add it to a **blocklist** or wait for it to expire — which is exactly why stateless logout is weaker.
+
+<KnowledgeCheck
+  question="Why do you want both an idle timeout and an absolute timeout on a session?"
+  options={[
+    "They're the same thing; you only need one",
+    "They limit different risks. An idle (inactivity) timeout expires a session after a period of no activity, limiting an abandoned session (e.g. a walk-away on a shared machine). An absolute timeout caps total lifetime regardless of activity, bounding the usefulness of a stolen session that's being actively used — without it, a hijacked session kept busy could live forever. Using both catches inactivity and caps the maximum blast radius",
+    "The idle timeout is for security and the absolute timeout is for performance",
+    "An absolute timeout replaces the need to invalidate sessions on logout",
+  ]}
+  answer={1}
+  explanation="An idle timeout addresses sessions left unattended, expiring them after inactivity; an absolute timeout addresses sessions that are kept active — including stolen ones — by enforcing a hard maximum lifetime so they can't persist indefinitely. They cover complementary failure modes, so you want both. Neither replaces explicit logout invalidation, which immediately kills the session server-side."
+/>
 
 <h2 id="session-attacks">Session Attacks: Hijacking, Fixation & CSRF</h2>
 
-Placeholder.
+Because the session id is a credential, the attacks all revolve around **obtaining or abusing** it.
+
+- **Session hijacking** — stealing a valid id and replaying it. The two classic routes are **XSS** (a script reads the cookie — defeated by **HttpOnly**) and a **plaintext channel** (sniffing the id off unencrypted HTTP — defeated by **TLS + the Secure flag**).
+- **Session fixation** — a subtler trick where the attacker chooses the id *in advance*. They obtain a valid session id, plant it on the victim (e.g. via a crafted link), and wait for the victim to log in. If the server keeps that same id after authentication, the attacker — who already knows it — is now inside the victim's authenticated session.
+
+<SessionFixationSequence />
+
+  The fix for fixation is simple and mandatory: **regenerate the session id on login** (and on any privilege change), so whatever id existed before authentication is discarded and worthless.
+
+- **CSRF (Cross-Site Request Forgery)** — this one doesn't steal the id at all; it *abuses the browser's automatic cookie behavior*. Because the browser attaches the session cookie to **every** request to your domain, a malicious page can trigger a state-changing request (`POST /transfer`) and the victim's session rides along. The defenses are **SameSite cookies** (the browser won't send the cookie cross-site) and **anti-CSRF tokens** (a secret the attacker's page can't know).
+
+<KnowledgeCheck
+  question="What is session fixation and how is it prevented?"
+  options={[
+    "It's stealing a session id via XSS, prevented by encryption",
+    "It's when an attacker fixes the session id in advance: they obtain a valid id, plant it on the victim (e.g. via a crafted link), and if the server keeps that same id after the victim logs in, the attacker — who already knows it — shares the now-authenticated session. It's prevented by regenerating the session id at login (and on privilege changes), which discards any pre-login id and makes what the attacker planted useless",
+    "It's a CSRF variant prevented only by SameSite cookies",
+    "It's guessing a weak session id, prevented by rate limiting logins",
+  ]}
+  answer={1}
+  explanation="Fixation works by getting the victim to authenticate with an id the attacker already controls; the flaw is a server that upgrades a pre-login id to an authenticated one instead of issuing a fresh id. Regenerating the session id at login breaks the attack because the planted id is thrown away the moment authentication succeeds. That's distinct from hijacking (stealing an id) and CSRF (abusing automatic cookie sending), though all three concern the session credential."
+/>
 
 <h2 id="capacity-estimates">Capacity: The Cost of Session Lookups</h2>
 
-Placeholder.
+The storage choice from earlier has a concrete price. **Stateful sessions require a store lookup on every authenticated request**, so the session store's load scales directly with your total request rate — and you must hold every active session in memory somewhere.
+
+<SessionCapacity
+  assumptions={{
+    requestsPerSec: 300000,
+    activeSessions: 50000000,
+    sessionBytes: 1000,
+    cacheHitRate: 0.95,
+    bytesPerGb: 1000000000,
+  }}
+/>
+
+At 300,000 authenticated requests/sec, a naive stateful design sends **300,000 lookups/sec** straight at the session store, and holding 50 million active sessions at 1 KB each takes **50 GB** of memory. The lookup load is the danger — the session store becomes a hot dependency on every request's critical path. A **session cache** (most requests reuse the same session within seconds) with a 95% hit rate cuts store lookups **20×**, to **15,000/sec**, keeping the store from buckling.
+
+This is the stateful-vs-stateless trade in hard numbers. **Stateful** buys you **instant revocation** and central control, but you pay with a **per-request lookup and gigabytes of memory** — costs you soften with caching and cheap key-value stores. **Stateless** sessions eliminate *both* the lookup and the memory (the state rides in the cookie), which is why they scale so effortlessly — but you give up the ability to revoke a session before it expires. Neither is free; you're choosing which cost to bear.
 
 <h2 id="distributed-sessions">Sessions at Scale</h2>
 
-Placeholder.
+Once you have more than one application server, a new question appears: when a request lands on server B but the session was created on server A, how does B know about it? There are three answers.
+
+- **Sticky sessions (session affinity).** The load balancer pins each user to one server, which keeps their session in local memory. Simple and lookup-free — but **fragile**: if that server restarts or dies, every session on it is lost and those users are logged out, and it undermines even load distribution and smooth deploys. A stopgap, not a foundation.
+- **Shared session store.** All servers read and write sessions in a central store (Redis). Any server can handle any request, revocation is central, and deploys don't drop sessions — at the cost of the network lookup from the capacity section. This is the **standard** approach for stateful sessions.
+- **Stateless sessions.** With the state in the cookie, there's **no server-side session state to share at all** — every server validates every request independently. This is the cleanest horizontal scale, and the reason stateless tokens are popular for large distributed systems — accepting the revocation trade-off.
+
+<Callout variant="warning" title="Sticky sessions are a trap at scale">
+Sticky sessions feel easy — no shared store, no lookup — but they bind a user's session to a single server's memory. That server dying, restarting, or being drained for a deploy logs those users out, and traffic can't rebalance freely. For anything beyond a small deployment, use a **shared session store** (stateful) or go **stateless**; reserve stickiness for cases that genuinely can't avoid it.
+</Callout>
+
+<KnowledgeCheck
+  question="Why are sticky sessions considered fragile compared to a shared session store?"
+  options={[
+    "They use more memory than a shared store",
+    "Sticky sessions pin each user to one server that holds their session in local memory, so if that server restarts, crashes, or is drained for a deploy, those sessions are lost and the users are logged out — and traffic can't be freely rebalanced across servers. A shared session store (e.g. Redis) lets any server handle any request and survives individual server loss, at the cost of a network lookup; stateless sessions avoid shared state entirely",
+    "Sticky sessions can't use cookies, so they're insecure",
+    "A shared store is always faster than local memory",
+  ]}
+  answer={1}
+  explanation="The fragility is the coupling of a session to one server's memory: losing or cycling that server drops its sessions and forces re-login, and it hampers load balancing and rolling deploys. A shared store decouples session state from any single server so requests can go anywhere and survive server loss, trading a network lookup for that resilience. Stateless sessions remove server-side session state altogether. It's about resilience and rebalancing, not raw memory or speed."
+/>
 
 <h2 id="secure-sessions">Secure Sessions in Practice</h2>
 
-Placeholder.
+Putting it together, a secure session is mostly a checklist applied at two moments — login and every subsequent request:
+
+<SecureLoginSessionSequence />
+
+At **login**: verify credentials, then **generate a fresh, high-entropy session id** — crucially **regenerating** it rather than reusing any pre-login id (this kills fixation) — write the session to the store, and return it in a cookie set **HttpOnly + Secure + SameSite**. On **every subsequent request**: the browser returns the cookie automatically, and the server validates the opaque id against the store to recover the identity. Around this, enforce the lifecycle controls: **idle and absolute timeouts**, **regenerate the id again on any privilege elevation**, **always TLS** so the cookie is never exposed, and **invalidate server-side on logout** so the id is instantly dead. None of these is expensive; skipping any one of them reopens a whole attack class from the previous sections.
+
+<KnowledgeCheck
+  question="At login, why regenerate the session id and set the cookie HttpOnly, Secure, and SameSite?"
+  options={[
+    "To make login faster and reduce server memory",
+    "Regenerating the id at login discards any pre-login id, defeating session fixation. The cookie flags each close an attack class: HttpOnly stops JavaScript (XSS) from reading the id, Secure ensures it's only ever sent over HTTPS so it can't be sniffed, and SameSite stops the browser attaching it to cross-site requests, blunting CSRF. Together with TLS, timeouts, and server-side logout invalidation, these are the core of a secure session",
+    "Because the id must change on every request for security",
+    "To encrypt the session data stored on the server",
+  ]}
+  answer={1}
+  explanation="Each measure targets a specific threat: id regeneration at login neutralizes fixation; HttpOnly blocks script-based theft (XSS); Secure prevents plaintext exposure on the wire; SameSite prevents the browser from sending the cookie on cross-site requests (CSRF). They're cheap, standard settings, and omitting any one reopens the corresponding attack. The id doesn't change per request, and these flags aren't about encrypting server-side data."
+/>
 
 <h2 id="pitfalls-best-practices">Pitfalls & Best Practices</h2>
 
-Placeholder.
+Session bugs are consistent and, once you know them, easy to avoid.
+
+<Callout variant="warning" title="Session management footguns">
+- **Predictable or short session ids.** Sequential or low-entropy ids can be guessed or enumerated. Use a CSPRNG with ≥128 bits.
+- **Session id in the URL.** Ids in query strings leak via browser history, server logs, and the `Referer` header. Keep them in cookies, never the URL.
+- **Not regenerating on login.** Reusing a pre-login id enables session fixation. Always issue a fresh id at authentication and on privilege change.
+- **Missing cookie flags.** No HttpOnly (XSS can steal it), no Secure (sniffable), no SameSite (CSRF). Set all three.
+- **No idle or absolute timeout.** Sessions that never expire maximize the value of a stolen id. Enforce both.
+- **Not invalidating on logout.** "Logout" that only clears the client cookie leaves the session alive server-side. Delete it in the store.
+- **Plaintext transport.** A session cookie over HTTP is a credential in the clear. TLS everywhere.
+</Callout>
+
+<DecisionRecord
+  title="The default session-management posture"
+  choice="For most user-facing applications, use server-side (stateful) sessions: an opaque, high-entropy (CSPRNG, ≥128-bit) session id stored in a cookie marked HttpOnly, Secure, and SameSite, backed by a shared session store (e.g. Redis) with a short-TTL cache in front. Regenerate the id on login and on privilege change, enforce both an idle timeout and an absolute timeout, serve exclusively over TLS, and invalidate the session server-side on logout. Add anti-CSRF tokens alongside SameSite for state-changing requests. Choose stateless (signed/encrypted cookie or JWT) sessions only when effortless horizontal scale outweighs the need for instant revocation, and then keep lifetimes short."
+  rationale="Stateful sessions give central control and instant revocation — essential for logout, account compromise, and privilege changes — while the opaque id keeps state off the client. High entropy defeats guessing, the cookie flags defeat XSS theft/sniffing/CSRF, regeneration defeats fixation, timeouts bound abandoned and stolen sessions, and TLS keeps the credential off the wire. A shared store plus cache scales the lookup without the fragility of sticky sessions. Stateless is reserved for scale-dominated cases, where short lifetimes offset weak revocation."
+  alternatives="Stateless JWT sessions everywhere — trivial scaling but no real revocation and client-visible, size-limited payloads. Sticky sessions — no shared store but fragile to server loss and deploys. Long-lived sessions with no timeouts — convenient but maximize a stolen id's value. Session id in the URL — leaks via logs/referrer/history. Skipping id regeneration — leaves fixation open. Client-cleared-only logout — leaves the session alive server-side."
+  revisitWhen="Horizontal scale or multi-region latency makes per-request store lookups costly (consider stateless or better caching); a requirement for instant global revocation appears (favor stateful or add a token blocklist); mobile or third-party API clients need non-cookie tokens (revisit the sessions-vs-tokens choice with Authentication); or a session-related incident prompts tightening timeouts and cookie policy."
+/>
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="In the capacity model, 300k req/s means 300,000 session-store lookups/s and 50 GB for 50M sessions, cut to 15,000 lookups/s by a 95% cache. What's the lesson?"
+  options={[
+    "That stateful sessions are impossible at scale and you must use JWTs",
+    "That stateful sessions cost a store lookup on every authenticated request plus the memory to hold every active session, so the session store is a hot dependency on the critical path — softened ~20× by a session cache. It's the stateful-vs-stateless trade in numbers: stateful buys instant revocation but pays per-request lookup and memory (mitigated by caching), while stateless pays no lookup and scales trivially but can't revoke a session before it expires",
+    "That caching removes the need for a session store entirely",
+    "That memory is the only cost that matters for sessions",
+  ]}
+  answer={1}
+  explanation="The model shows the two costs of stateful sessions — a per-request lookup (300k/s here) and memory for every session (50 GB) — and that a cache absorbs most lookups (down to 15k/s). That quantifies the core trade: stateful gives revocation and control at the price of lookup + memory, which caching mitigates; stateless removes both costs but sacrifices pre-expiry revocation. Caching reduces store load but doesn't eliminate the store, and lookup load, not just memory, is the key constraint."
+/>
+
+<Faq
+  items={[
+    { question: "Why do we need sessions at all?", answer: "Because HTTP is stateless — each request is independent and carries no memory of previous ones. Without a session, a server couldn't tell that the request after login came from the same authenticated user, so it would have to re-authenticate on every click. A session lets the server remember an authenticated identity across requests, referenced by a session id the client presents each time." },
+    { question: "Why is the session id described as a bearer credential?", answer: "Because possession of a valid session id is treated as proof of identity — whoever presents it is served as that user, no further questions asked, until it expires. That makes it functionally a temporary password: anyone who steals it becomes the victim for the session's lifetime. It's why the id must be unguessable, sent only over TLS, hidden from scripts (HttpOnly), regenerated at login, and expired promptly." },
+    { question: "What cookie attributes should a session cookie have?", answer: "HttpOnly (so JavaScript can't read it, blocking XSS-based theft), Secure (so it's only sent over HTTPS and can't be sniffed), and SameSite (Lax or Strict, so the browser won't attach it to cross-site requests, blunting CSRF). Also scope it with an appropriate Domain/Path and set a sensible expiry. These flags are cheap to set and each closes a distinct attack class." },
+    { question: "What's the difference between server-side and client-side sessions?", answer: "Server-side (stateful) sessions store an opaque id in the cookie and keep the real data in a server store (like Redis); they can be revoked instantly by deleting the entry but require a lookup on every request and memory for every session. Client-side (stateless) sessions pack signed/encrypted state into the cookie or a JWT; they need no lookup and scale trivially but can't be revoked before expiry and are size-limited and client-visible. It's revocation and control versus scale and simplicity." },
+    { question: "What's the difference between an idle timeout and an absolute timeout?", answer: "An idle (inactivity) timeout expires a session after a period with no activity, limiting an abandoned session (like a walk-away on a shared computer). An absolute timeout caps total session lifetime regardless of activity, bounding how long a stolen but actively-used session stays valid. You want both: the idle timeout handles inactivity and the absolute timeout caps the maximum blast radius." },
+    { question: "What is session hijacking?", answer: "Session hijacking is stealing a valid session id and replaying it to impersonate the user. The common routes are cross-site scripting (a script reads the cookie — blocked by HttpOnly) and sniffing the id off an unencrypted connection (blocked by TLS plus the Secure flag). Since the id is a bearer credential, a stolen one grants full access until it expires, which is why protecting it in transit and from scripts is essential." },
+    { question: "What is session fixation and how do you stop it?", answer: "In session fixation the attacker fixes the id ahead of time: they obtain a valid session id, plant it on the victim (e.g. via a crafted link), and if the server keeps that same id after the victim logs in, the attacker already knows it and shares the authenticated session. The fix is to regenerate the session id at login (and on privilege changes), so any id present before authentication is discarded and useless." },
+    { question: "How does CSRF relate to session management?", answer: "CSRF (Cross-Site Request Forgery) exploits the fact that browsers automatically attach the session cookie to every request to your domain. A malicious page can trigger a state-changing request and the victim's session rides along, with no need to steal the id. Defenses are SameSite cookies (the browser won't send the cookie on cross-site requests) and anti-CSRF tokens (a per-request secret the attacker's page can't know)." },
+    { question: "How do you keep session lookups from overwhelming the store at scale?", answer: "Stateful sessions require a store lookup per authenticated request, so at high request rates the store becomes a hot dependency. Put a short-TTL session cache in front of it — most requests reuse the same session within seconds, so a high cache hit rate (say 95%) cuts store lookups by an order of magnitude or more. Beyond that, use a fast key-value store like Redis and, if revocation isn't required, consider stateless sessions to remove the lookup entirely." },
+    { question: "What are sticky sessions and why avoid them at scale?", answer: "Sticky sessions (session affinity) pin each user to one server that holds their session in local memory, avoiding a shared store. The problem is fragility: if that server restarts, crashes, or is drained for a deploy, its sessions are lost and those users are logged out, and traffic can't rebalance freely. For anything beyond small deployments, use a shared session store or go stateless; reserve stickiness for cases that truly can't avoid it." },
+    { question: "Why must logout invalidate the session on the server?", answer: "Because the session's validity lives on the server (for stateful sessions) — if logout only clears or overwrites the client's cookie, the original session id is still valid server-side and an attacker who captured it can keep using it. Proper logout deletes the session from the store so the id is immediately dead. For stateless tokens, which have no server entry to delete, you must add the token to a blocklist or rely on a short expiry — a reason stateless logout is weaker." },
+    { question: "Should a session id ever go in the URL?", answer: "No. Session ids in URLs (query strings) leak through browser history, server and proxy logs, and the Referer header sent to other sites, any of which can expose the credential. Keep the session id in a cookie with the proper security flags, never in the URL. Putting credentials in URLs is a classic mistake that turns a private session id into something logged and shared in many places." },
+  ]}
+/>
