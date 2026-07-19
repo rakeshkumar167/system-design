@@ -128,6 +128,20 @@ test("learner can open the authorization security topic", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("learner can open the password hashing security topic", async ({ page }) => {
+  await page.goto("/topics");
+  await page.getByRole("link", { name: /password hashing/i }).first().click();
+  await expect(
+    page.getByRole("heading", { level: 1, name: /^password hashing$/i }),
+  ).toBeVisible();
+  // Navigate to a section via URL fragment (TOC is hidden on mobile viewports)
+  await page.goto("/topics/security/password-hashing#slow-hashing");
+  await expect(page.locator("#slow-hashing")).toBeInViewport();
+  await expect(
+    page.getByRole("img", { name: /hashing a password at registration/i }).first(),
+  ).toBeVisible();
+});
+
 test("theme toggle switches between light and dark", async ({ page }) => {
   await page.goto("/");
   const html = page.locator("html");
