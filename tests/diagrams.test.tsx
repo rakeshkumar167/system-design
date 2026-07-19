@@ -594,6 +594,10 @@ import {
   SessionFixationSequence,
   SecureLoginSessionSequence,
 } from "@/components/diagrams/session-management-flows";
+import {
+  SecureSdlcPipelineSequence,
+  VulnerabilityResponseSequence,
+} from "@/components/diagrams/secure-sdlc-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -718,5 +722,23 @@ describe("Session management flow diagrams", () => {
       screen.getByRole("img", { name: /establishing and validating a secure session/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/it is simply a bearer credential validated server-side every time/i)).toBeInTheDocument();
+  });
+});
+
+describe("Secure SDLC flow diagrams", () => {
+  it("exposes the CI/CD security gates to non-visual readers", () => {
+    render(<SecureSdlcPipelineSequence />);
+    expect(
+      screen.getByRole("img", { name: /security gates in the CI\/CD pipeline/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/shift-left, automated and enforced on every change/i)).toBeInTheDocument();
+  });
+
+  it("exposes the vulnerability-management loop to non-visual readers", () => {
+    render(<VulnerabilityResponseSequence />);
+    expect(
+      screen.getByRole("img", { name: /the vulnerability-management loop/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/turns scattered findings into reliably closed risks/i)).toBeInTheDocument();
   });
 });
