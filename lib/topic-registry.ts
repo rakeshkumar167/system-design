@@ -91,6 +91,27 @@ export const topicMetas: Record<string, TopicMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "encryption-key-management": {
+    slug: "encryption-key-management",
+    categorySlug: "security",
+    title: "Encryption & Key Management",
+    description:
+      "How a system keeps data confidential at rest and in transit — the symmetric/asymmetric split and hybrid encryption, the three data states, envelope encryption and the DEK/KEK key hierarchy, the KMS and HSM, the cost of encryption at scale, key rotation, crypto-shredding, and the operational discipline of managing keys.",
+    readingMinutes: 22,
+    concepts: ["Symmetric/asymmetric", "Envelope encryption", "KMS/HSM", "Key rotation", "Crypto-shredding"],
+    sections: [
+      { id: "overview", label: "What Encryption & Key Management Is", depth: "fundamentals" },
+      { id: "symmetric-asymmetric", label: "Symmetric vs Asymmetric Encryption", depth: "fundamentals" },
+      { id: "data-states", label: "Data at Rest, in Transit, in Use", depth: "interview-ready" },
+      { id: "envelope-encryption", label: "Envelope Encryption & the Key Hierarchy", depth: "interview-ready" },
+      { id: "kms-hsm", label: "KMS & HSMs", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity: The Cost of Encryption", depth: "interview-ready" },
+      { id: "key-rotation-lifecycle", label: "Key Rotation & Lifecycle", depth: "advanced" },
+      { id: "key-management-in-practice", label: "Key Management in Practice", depth: "interview-ready" },
+      { id: "pitfalls-best-practices", label: "Pitfalls & Best Practices", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTopic(slug: string): TopicMeta | undefined {

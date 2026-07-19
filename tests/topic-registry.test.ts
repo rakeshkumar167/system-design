@@ -24,7 +24,7 @@ describe("topic registry", () => {
     }
   });
   it("returns undefined for an unregistered topic", () => {
-    expect(getTopic("encryption-key-management")).toBeUndefined();
+    expect(getTopic("owasp-top-10")).toBeUndefined();
   });
   it("registers the TLS topic", () => {
     expect(Object.keys(topicMetas)).toContain("tls-https-certificates");
@@ -62,6 +62,20 @@ describe("topic registry", () => {
   });
   it("gives every Password Hashing section a unique id and a valid depth", () => {
     const sections = getTopic("password-hashing")!.sections;
+    const ids = sections.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const s of sections) {
+      expect(["fundamentals", "interview-ready", "advanced"]).toContain(s.depth);
+    }
+  });
+  it("registers the Encryption & Key Management topic", () => {
+    expect(Object.keys(topicMetas)).toContain("encryption-key-management");
+  });
+  it("describes the Encryption topic's ten sections", () => {
+    expect(getTopic("encryption-key-management")?.sections).toHaveLength(10);
+  });
+  it("gives every Encryption section a unique id and a valid depth", () => {
+    const sections = getTopic("encryption-key-management")!.sections;
     const ids = sections.map((s) => s.id);
     expect(new Set(ids).size).toBe(ids.length);
     for (const s of sections) {

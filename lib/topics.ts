@@ -17,7 +17,7 @@ export const topicCategories: readonly TopicCategory[] = [
       { slug: "authorization", title: "Authorization", blurb: "RBAC, ABAC", status: "available" },
       { slug: "tls-https-certificates", title: "TLS/HTTPS and certificates", blurb: "", status: "available" },
       { slug: "password-hashing", title: "Password hashing", blurb: "Argon2/bcrypt", status: "available" },
-      { slug: "encryption-key-management", title: "Encryption and key management", blurb: "", status: "coming-soon" },
+      { slug: "encryption-key-management", title: "Encryption and key management", blurb: "AES, KMS, envelope encryption", status: "available" },
       { slug: "owasp-top-10", title: "OWASP Top 10", blurb: "", status: "coming-soon" },
       { slug: "api-security", title: "API security", blurb: "", status: "coming-soon" },
       { slug: "session-management", title: "Session management", blurb: "", status: "coming-soon" },
