@@ -605,6 +605,13 @@ import {
   PlayerRankSequence,
   ShardedRankSequence,
 } from "@/components/diagrams/leaderboard-flows";
+import { MetricsArchitecture } from "@/components/diagrams/metrics-monitoring-architecture";
+import {
+  IngestSampleSequence,
+  RangeQuerySequence,
+  AlertEvaluationSequence,
+  DownsampleRetentionSequence,
+} from "@/components/diagrams/metrics-monitoring-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -789,5 +796,47 @@ describe("Leaderboard diagrams", () => {
       screen.getByRole("img", { name: /compute a global rank across shards/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/approximate the rank from precomputed score-bucket histograms/i)).toBeInTheDocument();
+  });
+});
+
+describe("Metrics and monitoring diagrams", () => {
+  it("exposes the metrics architecture to non-visual readers", () => {
+    render(<MetricsArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /metrics and monitoring architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/shaped by a relentless write firehose in and cheap, recent-range reads out/i)).toBeInTheDocument();
+  });
+
+  it("exposes the ingest flow to non-visual readers", () => {
+    render(<IngestSampleSequence />);
+    expect(
+      screen.getByRole("img", { name: /ingest a batch of samples/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/never blocking the producers that emit them/i)).toBeInTheDocument();
+  });
+
+  it("exposes the range-query flow to non-visual readers", () => {
+    render(<RangeQuerySequence />);
+    expect(
+      screen.getByRole("img", { name: /serve a range query/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/reads touch only recent, contiguous blocks/i)).toBeInTheDocument();
+  });
+
+  it("exposes the alert-evaluation flow to non-visual readers", () => {
+    render(<AlertEvaluationSequence />);
+    expect(
+      screen.getByRole("img", { name: /evaluate an alert rule and fire/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/the for-duration requirement suppresses flapping/i)).toBeInTheDocument();
+  });
+
+  it("exposes the downsample/retention flow to non-visual readers", () => {
+    render(<DownsampleRetentionSequence />);
+    expect(
+      screen.getByRole("img", { name: /downsample and expire old data/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/bounds long-term storage without losing the shape of history/i)).toBeInTheDocument();
   });
 });

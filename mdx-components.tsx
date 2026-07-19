@@ -181,6 +181,13 @@ import {
   PlayerRankSequence,
   ShardedRankSequence,
 } from "@/components/diagrams/leaderboard-flows";
+import { MetricsArchitecture } from "@/components/diagrams/metrics-monitoring-architecture";
+import {
+  IngestSampleSequence,
+  RangeQuerySequence,
+  AlertEvaluationSequence,
+  DownsampleRetentionSequence,
+} from "@/components/diagrams/metrics-monitoring-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -342,6 +349,11 @@ const teachingComponents = {
   TopKQuerySequence,
   PlayerRankSequence,
   ShardedRankSequence,
+  MetricsArchitecture,
+  IngestSampleSequence,
+  RangeQuerySequence,
+  AlertEvaluationSequence,
+  DownsampleRetentionSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
