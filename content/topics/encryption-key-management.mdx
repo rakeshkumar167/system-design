@@ -1,39 +1,222 @@
 <h2 id="overview">What Encryption & Key Management Is</h2>
 
-Placeholder.
+**Encryption** makes data confidential: it transforms plaintext into ciphertext so that only a holder of the right **key** can read it, and gibberish to anyone who steals the disk, the backup, or the network packets. It's the last line of defense — the assumption that, sooner or later, someone gets to your bytes, and when they do those bytes should be worthless. Where the [Password Hashing](/topics/security/password-hashing) topic was about *one-way* storage (you never recover the input), encryption is deliberately **reversible** by design: the whole point is that the legitimate owner *can* get the data back, with the key.
+
+Which is exactly why this topic is really about **keys**, not ciphers. The algorithms — AES, RSA, ECC — are standardized, vetted, and a single library call away; getting them right is mostly "don't roll your own." The hard, system-design part is everything around the key: **generating** it from good randomness, **storing** it so it's not sitting next to the data it protects, **distributing** it to the services that need it without leaking it, **rotating** it on a schedule, and **destroying** it safely — all while never losing it, because a lost key means permanently unreadable data. That asymmetry of difficulty is the theme of the whole topic.
+
+<Callout variant="info" title="The maxim">
+**Encryption is easy; key management is hard.** The cipher is a library call. Protecting, distributing, rotating, and *not losing* the key is the system. Most real-world "encryption" failures aren't broken math — they're a key hardcoded in a repo, a key stored beside the data it protects, or a key nobody can rotate.
+</Callout>
 
 <h2 id="symmetric-asymmetric">Symmetric vs Asymmetric Encryption</h2>
 
-Placeholder.
+There are two families of encryption, and they solve different halves of the problem.
+
+- **Symmetric encryption** uses **one shared secret key** for both encrypting and decrypting. The standard is **AES**, and it's **fast** — modern CPUs have dedicated instructions for it, so it encrypts gigabytes per second. The catch is the *key distribution problem*: everyone who needs to read the data needs the same secret key, and getting that key to them securely is its own challenge.
+- **Asymmetric encryption** uses a **keypair** — a **public key** that anyone can use to encrypt, and a mathematically-linked **private key** that only the owner holds and that alone can decrypt. **RSA** and **ECC** are the common choices. This elegantly solves distribution (publish the public key freely), but it's **orders of magnitude slower** and works only on small payloads.
+
+<TradeoffTable
+  columns={["Property", "Symmetric (AES)", "Asymmetric (RSA/ECC)"]}
+  rows={[
+    ["Keys", "One shared secret key", "Public/private keypair"],
+    ["Speed", "Very fast — bulk data", "Slow — small payloads only"],
+    ["Solves", "Fast confidential storage/transfer", "Key distribution & digital signatures"],
+    ["Weakness", "Distributing the shared key", "Too slow for large data"],
+  ]}
+  recommendedRow={0}
+/>
+
+In practice you don't choose one — you combine them with **hybrid encryption**: use *asymmetric* to securely exchange (or wrap) a fresh *symmetric* key, then use the fast symmetric key for the actual data. That's precisely what [TLS](/topics/security/tls-https-certificates) does in its handshake, and — as the envelope-encryption section shows — it's the same shape used to protect data at rest. Symmetric does the heavy lifting; asymmetric solves getting the symmetric key where it needs to be.
+
+<KnowledgeCheck
+  question="Why do real systems use hybrid encryption instead of picking symmetric or asymmetric?"
+  options={[
+    "Because using two algorithms is always more secure than one",
+    "Because the two families solve different problems: symmetric (AES) is fast enough for bulk data but has a key-distribution problem, while asymmetric (RSA/ECC) solves distribution with a public/private keypair but is far too slow for large payloads. Hybrid encryption uses asymmetric to exchange or wrap a fresh symmetric key, then symmetric for the data — getting fast bulk encryption and easy key distribution at once, which is what TLS and envelope encryption both do",
+    "Because symmetric encryption is insecure and only used for backwards compatibility",
+    "Because asymmetric encryption can encrypt unlimited data but symmetric cannot",
+  ]}
+  answer={1}
+  explanation="Symmetric encryption is fast but needs the same secret key on both ends; asymmetric encryption distributes easily via a public key but is slow and limited to small inputs. Hybrid encryption plays to both strengths — asymmetric moves a symmetric key securely, then symmetric encrypts the bulk data quickly. It's not about stacking algorithms for extra security; it's about combining complementary strengths, exactly as TLS's handshake and at-rest envelope encryption do."
+/>
 
 <h2 id="data-states">Data at Rest, in Transit, in Use</h2>
 
-Placeholder.
+"Is the data encrypted?" is an incomplete question — you have to say *which state* and *against which threat*, because data lives in three, each with its own defense.
+
+- **At rest** — data sitting in storage: databases, object stores, disks, backups. Protected by **full-disk or volume encryption** (defends against a stolen drive), **transparent database encryption (TDE)** (the database encrypts files transparently), or **field-level / application-layer encryption** for the most sensitive columns (so even a compromised database process sees ciphertext for those fields). The threat is someone getting the storage medium or a dump.
+- **In transit** — data moving across a network. Protected by **TLS** (the [TLS/HTTPS](/topics/security/tls-https-certificates) topic covers this in full). The threat is an eavesdropper or man-in-the-middle on the wire.
+- **In use** — data live in a running process's memory, necessarily decrypted to be operated on. The hardest to protect; addressed by **confidential computing** — **secure enclaves / trusted execution environments** that keep data encrypted even in RAM, shielded from the host OS and hypervisor. The threat is a compromised host or a malicious cloud operator.
+
+The interview-level insight: these are independent. Full-disk encryption does nothing against a network eavesdropper; TLS does nothing against a stolen backup; both are useless against a compromised host reading process memory. A serious design names the threat and picks the layer — often all three.
+
+<KnowledgeCheck
+  question="A team says 'all our data is encrypted' because they enabled full-disk encryption. What threat is still unaddressed?"
+  options={[
+    "None — full-disk encryption covers every case",
+    "Full-disk encryption only protects data at rest against someone obtaining the physical drive or a raw disk image. It does nothing for data in transit (a network eavesdropper needs TLS) or data in use (a compromised host reading decrypted data from a running process's memory needs enclaves/confidential computing). And once the disk is mounted and the system running, the data is transparently decrypted for any process with access — so it doesn't stop an application-level or credential compromise either",
+    "It leaves passwords unhashed",
+    "It only fails if the disk is an SSD rather than a spinning disk",
+  ]}
+  answer={1}
+  explanation="The three data states are protected independently. Full-disk encryption defends the at-rest medium against physical theft, but the volume is transparently decrypted once mounted, so a running app or a stolen credential still reads plaintext. Data crossing the network still needs TLS, and data being processed in memory still needs enclaves to resist a compromised host. 'Encrypted' is only meaningful once you name the state and the threat."
+/>
 
 <h2 id="envelope-encryption">Envelope Encryption & the Key Hierarchy</h2>
 
-Placeholder.
+You might think you'd encrypt each object directly with your master key. You don't — that would mean handing the master key to every service that touches data, and rotating it would require re-encrypting everything. **Envelope encryption** solves both with a layer of indirection:
+
+- A per-object **data encryption key (DEK)** encrypts the actual data — fast symmetric AES.
+- A **key encryption key (KEK)**, the master key held in the KMS, **encrypts (wraps) the DEK**.
+- You store the **wrapped DEK right next to the ciphertext**, and use-then-discard the plaintext DEK.
+
+<EnvelopeEncryptSequence />
+
+The elegance is in what this buys you. Only the **KEK is precious** — one key to guard instead of millions of DEKs, and it never leaves the KMS. The **wrapped DEK can safely sit beside the data** it protects, because it's worthless without the KEK to open it (so "key next to data" is fine here — for the *wrapped* key, not the master). And you can **rotate the KEK by simply re-wrapping the DEKs** — a tiny operation on small keys — without touching a single byte of the bulk ciphertext. This generalizes into a **key hierarchy**: a root key protects KEKs, KEKs wrap DEKs, DEKs encrypt data — each level guarding the one below, with the root anchored in hardware.
+
+<KnowledgeCheck
+  question="In envelope encryption, why is it safe to store the wrapped DEK right next to the ciphertext, and what does that arrangement make cheap?"
+  options={[
+    "It isn't safe — the wrapped DEK should be stored in a separate database",
+    "The DEK is stored wrapped (encrypted) under the KEK, which lives only in the KMS, so the wrapped DEK is useless to anyone who steals the data store — they'd still need the KEK to unwrap it. That arrangement makes key rotation cheap: you rotate by re-wrapping the small DEKs under a new KEK, never re-encrypting the bulk data, and only the single KEK ever needs to be guarded",
+    "It's safe because the DEK is hashed, not encrypted, so it can't be reversed",
+    "It's safe only if the data and the DEK are in different cloud regions",
+  ]}
+  answer={1}
+  explanation="A DEK stored next to the data is fine precisely because it's wrapped under the KEK — without the KEK (held in the KMS and never exported) the wrapped DEK reveals nothing. This indirection means the master key is the only thing you must fiercely protect, and rotating it re-wraps the DEKs rather than re-encrypting terabytes of ciphertext. It's encryption, not hashing, and it doesn't depend on physical separation of the wrapped key from the data."
+/>
 
 <h2 id="kms-hsm">KMS & HSMs</h2>
 
-Placeholder.
+If the KEK is the one key that matters, where does it live? In a **Key Management Service (KMS)** — crypto-as-a-service. The defining property is that the KMS **generates, stores, and uses keys so the key material never leaves it**: you don't fetch the KEK and unwrap a DEK yourself; you send the wrapped DEK to the KMS and it returns the plaintext DEK (or performs the encrypt/decrypt on your behalf). The master key is used inside the boundary and never exported, so there's no moment where it's sitting in your application's memory or logs.
+
+Underneath a serious KMS sits an **HSM (Hardware Security Module)** — tamper-resistant hardware, certified to **FIPS 140-2 / 140-3**, that physically guards key material and performs crypto operations. It's the **root of trust**: keys are generated inside it and, by design, cannot be extracted even by an administrator; a physical attack triggers tamper-response that destroys the keys. Cloud providers package all of this as managed services — **AWS KMS, Google Cloud KMS, Azure Key Vault** — and **HashiCorp Vault** offers it self-hosted, typically HSM-backed.
+
+The mental model to carry into an interview: **exactly one component ever touches the master key — the KMS/HSM — and everything else just asks it to wrap and unwrap.** That single chokepoint is what makes the rest of the system's key handling tractable: it's the one place to enforce access control, log every use, and anchor rotation.
+
+<KnowledgeCheck
+  question="What is the defining property of a KMS, and what role does an HSM play?"
+  options={[
+    "A KMS stores your keys in a database and emails them to services on request; an HSM is a faster hard drive for keys",
+    "A KMS performs cryptographic operations so the key material never leaves it — you send it a wrapped key and it returns the plaintext key (or does the encrypt/decrypt), but the master key is never exported. An HSM is the tamper-resistant, FIPS-certified hardware root of trust underneath it, where keys are generated and used and from which they cannot be extracted, even by an administrator",
+    "A KMS is just an environment variable holding the master key; an HSM encrypts network traffic",
+    "A KMS and an HSM are two names for the same thing",
+  ]}
+  answer={1}
+  explanation="The point of a KMS is non-exportability: it uses keys internally and returns results, so the master key never lands in your app's memory, logs, or config. An HSM is the hardware foundation — tamper-resistant, FIPS 140-2/3 certified — that generates and holds keys such that they can't be extracted, providing the root of trust a KMS is built on. They're related layers, not synonyms, and neither hands out the master key."
+/>
 
 <h2 id="capacity-estimates">Capacity: The Cost of Encryption</h2>
 
-Placeholder.
+The instinct is to worry about the cipher's cost, but **AES is nearly free** — hardware-accelerated to gigabytes per second per core. The real cost, and the real bottleneck, is the **KMS call**. A naive design that asks the KMS to unwrap a data key on *every* encrypt/decrypt would generate one KMS call per operation — a network round trip each, against a service with a hard requests-per-second quota. Envelope encryption is what saves you: because one DEK protects many objects, you **cache the plaintext DEK** in memory for a short window and reuse it, so the KMS is consulted per *key*, not per *operation*.
+
+<EncryptionCapacity
+  assumptions={{
+    operationsPerSec: 500000,
+    kmsUnwrapMs: 20,
+    dekCacheHitRate: 0.999,
+    aesEncryptMs: 0.01,
+    msPerCorePerSec: 1000,
+  }}
+/>
+
+At 500,000 operations/sec, a KMS-call-per-op design needs **500,000 KMS calls/sec** — wildly beyond any KMS quota, and a 20 ms network hop on the critical path of every single operation. A **99.9%-hit DEK cache** collapses that to **500 KMS calls/sec** — a **1,000× reduction** — while the actual AES work is a mere ~**5 cores** of nearly-free local compute. Two lessons follow. First, encryption throughput is sized by **KMS calls, not cipher speed** — the cipher is a rounding error, the key service is the constraint, and DEK caching is the lever that makes it scale. Second, that cache is the familiar amortization-with-a-catch: a cached plaintext DEK is a live key in memory, so its **blast radius** (a leaked cache exposes every object that DEK protects, until the TTL expires) is exactly why the TTL is short, the KEK never leaves the KMS, and the most sensitive data gets narrower key scopes.
 
 <h2 id="key-rotation-lifecycle">Key Rotation & Lifecycle</h2>
 
-Placeholder.
+A key is not a set-and-forget value; it has a lifecycle: **generate → activate → rotate → expire → revoke → destroy**. **Rotation** — periodically replacing a key with a fresh one — matters because it bounds two things: the *amount of data* encrypted under any single key (limiting the damage if one key is ever broken or leaked) and the *time window* a compromised key is useful. But rotating naively sounds impossible: re-encrypting petabytes every rotation is a non-starter. Envelope encryption makes it cheap again — you **rotate the KEK and re-wrap the DEKs** (small, fast) while leaving the bulk ciphertext untouched; individual DEKs roll over naturally as data is rewritten.
+
+<Callout variant="warning" title="Crypto-shredding: deleting data by destroying its key">
+Because encrypted data is unreadable without its key, **destroying the key reliably destroys the data** — even if copies are replicated across regions and buried in backups you can't practically reach. This is **crypto-shredding**, and it's the pragmatic answer to "delete this user's data everywhere" (e.g. GDPR erasure): give each user (or tenant) their own key, and to erase them, **destroy that key**. The ciphertext may physically remain, but it becomes permanently unrecoverable noise. The flip side is the standing risk of the whole topic — **lose a key you didn't mean to, and you've crypto-shredded your own data.** Key durability and backup are as vital as key secrecy.
+</Callout>
+
+<KnowledgeCheck
+  question="How does envelope encryption make key rotation practical, and what is crypto-shredding?"
+  options={[
+    "Rotation requires re-encrypting all data each time; crypto-shredding means overwriting the disk with zeros",
+    "With envelope encryption you rotate by generating a new KEK and re-wrapping the small DEKs under it, leaving the bulk ciphertext untouched — so rotation is cheap regardless of data volume. Crypto-shredding is deleting data by destroying its key: since ciphertext is unrecoverable without the key, destroying a per-user or per-tenant key makes that data permanently unreadable everywhere it's replicated, which is how you satisfy 'erase this data' without hunting down every backup",
+    "Rotation is impossible with envelope encryption; crypto-shredding encrypts data twice",
+    "Rotation only rotates the DEKs and always re-encrypts data; crypto-shredding is a backup strategy",
+  ]}
+  answer={1}
+  explanation="Because the KEK only wraps DEKs, rotating it means re-wrapping those small keys, not re-encrypting the underlying data — so rotation cost is independent of how much data you hold. Crypto-shredding leverages the same indirection in reverse: destroy the key and the ciphertext becomes irrecoverable noise, giving a practical 'delete everywhere' for replicated/backed-up data. The corollary is that losing a key unintentionally shreds your own data, so key backup and durability matter as much as secrecy."
+/>
 
 <h2 id="key-management-in-practice">Key Management in Practice</h2>
 
-Placeholder.
+Sound key management is mostly operational discipline around that single KMS chokepoint. On the read path, decryption runs the envelope in reverse — fetch the wrapped DEK, have the KMS unwrap it, decrypt locally, and cache the DEK:
+
+<EnvelopeDecryptSequence />
+
+Around that flow sit the practices that separate a real system from "we called AES":
+
+- **Access control on keys.** Keys are protected resources with their own IAM policies — who may *use* a key to decrypt is distinct from who may *manage* (rotate, delete) it (cross-ref [Authorization](/topics/security/authorization)). Grant the minimum.
+- **Separation of duties.** The people and services that *use* keys shouldn't be able to *export* them; key administrators shouldn't be able to *read* the data. The KMS enforces this split so no single actor holds both halves.
+- **Audit logging.** A KMS logs **every** key use — each decrypt is a recorded event. That log is gold for investigations and anomaly detection: a service suddenly decrypting ten thousand records an hour is a visible signal.
+- **Never hardcode keys.** Keys in source control, container images, or config files are the most common leak of all. Keys belong in the KMS; code asks for them at runtime.
+- **BYOK / HYOK and per-tenant keys.** *Bring/Hold Your Own Key* lets customers supply or retain control of the key protecting their data — a common enterprise-trust requirement. **Per-tenant keys** give isolation (a compromise of one tenant's key exposes only that tenant) and make crypto-shredding a single customer trivial.
+
+<KnowledgeCheck
+  question="Why does a KMS separate the permission to *use* a key from the permission to *manage* it, and why log every key use?"
+  options={[
+    "To make the API more complicated so attackers give up",
+    "Separating 'use' from 'manage' enforces separation of duties and least privilege: a service that must decrypt data gets use-only access and cannot export, rotate, or delete the key, while key administrators can manage keys without reading the underlying data — so no single compromised identity holds both halves. Logging every key use gives a complete audit trail for investigations and anomaly detection, turning the KMS into a chokepoint where unusual decryption activity is visible",
+    "Because using a key is dangerous but managing it is safe, so only management needs control",
+    "To let the KMS charge separately for reads and writes",
+  ]}
+  answer={1}
+  explanation="Splitting use from management means a decrypting service can't exfiltrate or destroy keys and an admin can't read data, so an attacker who compromises one role is still constrained — that's separation of duties plus least privilege at the key layer. And because every decrypt flows through the KMS and is logged, you get an audit trail and a natural place to detect anomalies (a workload suddenly mass-decrypting records). It's about limiting blast radius and gaining visibility, not obfuscation or billing."
+/>
 
 <h2 id="pitfalls-best-practices">Pitfalls & Best Practices</h2>
 
-Placeholder.
+As with password hashing, the disasters here are rarely broken cryptography — they're a handful of predictable mistakes around keys and modes.
+
+<Callout variant="warning" title="Encryption & key-management footguns">
+- **Hardcoded / committed keys.** A key in source control, a Docker image, or a config file is the single most common key leak. Keys live in the KMS; code fetches them at runtime and never logs them.
+- **ECB mode.** Encrypting each block independently means identical plaintext blocks produce identical ciphertext, leaking structure (the infamous "ECB penguin"). Use an **authenticated mode like AES-GCM**, which also detects tampering.
+- **Nonce / IV reuse.** Reusing a nonce (initialization vector) with the same key is catastrophic for stream and GCM modes — it can destroy confidentiality and forge integrity. Use a fresh, unique nonce per encryption.
+- **Home-rolled crypto.** "We XOR with a secret" or a custom scheme is almost always broken. Use vetted libraries and standard modes; never invent your own.
+- **No rotation.** One key, forever, encrypting everything, gives an unbounded blast radius. Rotate on a schedule (re-wrapping DEKs makes it cheap).
+- **KEK in the same blast radius as the data.** The *wrapped* DEK beside the data is fine; the *master key* must live in the KMS/HSM, never in the application database or config.
+- **Losing the key.** No key means permanently unrecoverable data. Key durability and backup are as critical as secrecy — crypto-shredding by accident is still data loss.
+</Callout>
+
+<DecisionRecord
+  title="The default encryption & key-management posture"
+  choice="Encrypt bulk data with authenticated symmetric encryption (AES-GCM) using per-object data keys, and protect those DEKs with envelope encryption under a KEK held in a KMS/HSM (FIPS-validated) that never exports key material. Cache plaintext DEKs briefly to keep KMS calls off the per-operation path, rotate KEKs on a schedule by re-wrapping DEKs, use per-tenant keys for isolation and crypto-shredding, and enforce IAM access control, separation of duties, and full audit logging on every key. Use TLS for data in transit. Never hardcode keys, reuse nonces, use ECB, or roll your own crypto."
+  rationale="AES-GCM gives fast, authenticated confidentiality; envelope encryption means only the KEK must be fiercely guarded and rotation re-wraps small DEKs rather than re-encrypting bulk data; a KMS/HSM makes the master key non-exportable and gives one chokepoint for access control, audit, and rotation. DEK caching sizes the system by KMS calls rather than cipher speed. Per-tenant keys bound blast radius and enable per-customer erasure by crypto-shredding. The pitfalls list closes the common real-world holes that break otherwise-correct cryptography."
+  alternatives="Encrypting data directly with the master key — forces the key onto every service and makes rotation a full re-encryption. No DEK cache — always fresh but a KMS call and network hop per operation, quota-bound and slow. A single global key — simplest, but unbounded blast radius and no per-tenant shredding. Self-managed keys in app config instead of a KMS — no hardware root of trust, easy to leak, hard to rotate/audit. Unauthenticated modes (CBC without a MAC, or ECB) — vulnerable to tampering and structure leaks."
+  revisitWhen="Data volume or op rate grows enough that KMS quotas, DEK cache TTLs, or key scopes need tuning; a compliance regime mandates specific FIPS levels, BYOK/HYOK, or key residency; a tenant-isolation or right-to-erasure requirement appears (adopt per-tenant keys and crypto-shredding); or a stronger standard algorithm/mode (or post-quantum requirement) becomes the norm."
+/>
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="In the capacity model, 500k ops/sec needs 500,000 KMS calls/sec naively but only 500 with a 99.9% DEK cache, while AES is ~5 cores. What's the headline lesson?"
+  options={[
+    "That AES is the bottleneck and should be replaced with a faster cipher",
+    "That encryption throughput is bounded by KMS calls, not the cipher. The AES work is nearly free and hardware-accelerated (~5 cores), but asking the KMS to unwrap a data key on every operation means one network round trip per op against a quota-limited service. Envelope encryption lets one DEK protect many objects, so caching the plaintext DEK cuts KMS traffic ~1,000× — the lever that makes encryption scale — traded against a cached key's blast radius until its short TTL expires",
+    "That you should never cache data keys because it's insecure",
+    "That the KMS should be called twice per operation for redundancy",
+  ]}
+  answer={1}
+  explanation="The cipher is a rounding error; the KMS call — a network hop against a hard quota — is the real constraint. Because envelope encryption reuses one DEK across many objects, caching the plaintext DEK collapses 500,000 KMS calls/sec to 500 (~1,000×), which is what makes high-throughput encryption feasible. The cost is a short-lived key in memory whose blast radius is bounded by the cache TTL, which is why the TTL is short and the KEK stays in the KMS. It's not about a faster cipher or double-calling the KMS."
+/>
+
+<Faq
+  items={[
+    { question: "What's the difference between symmetric and asymmetric encryption?", answer: "Symmetric encryption uses one shared secret key for both encrypting and decrypting (AES) — it's fast and ideal for bulk data, but both sides need the same key, which raises a distribution problem. Asymmetric encryption uses a public/private keypair: anyone can encrypt with the public key, only the private key decrypts (RSA, ECC). It solves distribution but is far slower and limited to small payloads. Most systems combine them as hybrid encryption." },
+    { question: "What is hybrid encryption?", answer: "Hybrid encryption uses asymmetric encryption to securely exchange or wrap a fresh symmetric key, then uses that fast symmetric key to encrypt the actual data. It gets the best of both: easy key distribution from asymmetric and high-speed bulk encryption from symmetric. TLS uses it in its handshake, and envelope encryption at rest is the same pattern — a master key wraps a fast data key that does the real work." },
+    { question: "How is encryption different from hashing?", answer: "Encryption is reversible: with the right key you get the plaintext back, which is the whole point for data you need to read again. Hashing is one-way with no key — you can only recompute and compare, never recover the input — which is why passwords are hashed, not encrypted. Use encryption for confidential data you must read later (with keys to manage); use hashing for verifying values like passwords without ever storing them." },
+    { question: "What does encrypting data 'at rest, in transit, and in use' mean?", answer: "They're the three states data can be in, each protected differently. At rest is stored data (disk/volume encryption, TDE, or field-level encryption). In transit is data on the network (TLS). In use is data live in a process's memory (confidential computing / secure enclaves). They're independent — full-disk encryption doesn't stop a network eavesdropper, TLS doesn't protect a stolen backup — so a design names the threat and picks the layers, often all three." },
+    { question: "What is envelope encryption?", answer: "Envelope encryption uses two layers of keys: a per-object data encryption key (DEK) encrypts the data with fast symmetric crypto, and a key encryption key (KEK), the master key held in a KMS, encrypts (wraps) the DEK. You store the wrapped DEK next to the ciphertext and discard the plaintext DEK after use. Only the KEK must be fiercely guarded, and rotating it re-wraps the small DEKs without re-encrypting the bulk data." },
+    { question: "What's the difference between a DEK and a KEK?", answer: "A DEK (data encryption key) is the key that actually encrypts your data — one per object or per small group, using fast symmetric AES. A KEK (key encryption key) is the master key that encrypts, or 'wraps', the DEKs; it lives in the KMS and never leaves. The DEK does the bulk work and can be stored (wrapped) beside the data; the KEK is the single precious key you protect and rotate." },
+    { question: "What is a KMS and what is an HSM?", answer: "A KMS (Key Management Service) is crypto-as-a-service: it generates, stores, and uses keys so the key material never leaves it — you send a wrapped key and get back the plaintext key or a result, but the master key is never exported. An HSM (Hardware Security Module) is the tamper-resistant, FIPS 140-2/3-certified hardware root of trust underneath, where keys are generated and held such that they can't be extracted even by an admin. AWS KMS, GCP KMS, Azure Key Vault, and Vault provide this." },
+    { question: "Why cache data keys instead of calling the KMS every time?", answer: "Because the cipher is nearly free but the KMS call is a network round trip against a quota-limited service. Unwrapping a DEK on every operation would need one KMS call per op — impossible at scale. Since one DEK protects many objects, caching the plaintext DEK in memory for a short window serves nearly every operation locally, cutting KMS traffic by orders of magnitude. The trade-off is a live key in memory, so the cache TTL is kept short to bound the blast radius." },
+    { question: "How do you rotate keys without re-encrypting everything?", answer: "With envelope encryption, you rotate the KEK and re-wrap the DEKs under the new KEK — a small, fast operation — while leaving the bulk ciphertext untouched. Individual DEKs roll over naturally as data is rewritten. This makes rotation cost independent of data volume, so you can rotate on a schedule to bound how much data any single key protects and how long a compromised key stays useful." },
+    { question: "What is crypto-shredding?", answer: "Crypto-shredding is deleting data by destroying its encryption key. Because ciphertext is unrecoverable without the key, destroying a per-user or per-tenant key makes that data permanently unreadable everywhere it's replicated or backed up — a practical way to satisfy 'erase this data' (like GDPR) without physically locating every copy. The corollary is a warning: losing a key you didn't mean to crypto-shreds your own data, so key durability and backup matter as much as secrecy." },
+    { question: "Why is ECB mode and nonce reuse dangerous?", answer: "ECB mode encrypts each block independently, so identical plaintext blocks yield identical ciphertext, leaking structure (the classic ECB-penguin image). Reusing a nonce/IV with the same key in stream or GCM modes is catastrophic — it can break confidentiality and allow integrity forgery. Use an authenticated mode like AES-GCM with a fresh, unique nonce per encryption, which provides both confidentiality and tamper detection." },
+    { question: "Why is 'encryption is easy, key management is hard' the theme?", answer: "The algorithms are standardized and a single vetted library call away, so getting the cipher right is mostly 'don't roll your own.' Everything hard is around the key: generating it well, storing it away from the data, distributing it without leaks, controlling and auditing its use, rotating it, and — crucially — not losing it. Most real-world encryption failures are key-management failures: a hardcoded key, a key beside its data, or a key nobody can rotate." },
+  ]}
+/>
