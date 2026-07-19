@@ -1,71 +1,373 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-Placeholder.
+A metrics and monitoring system collects numeric measurements from a fleet of machines and services — CPU, request rate, error count, queue depth, latency — stores them over time, draws the dashboards engineers stare at, and pages someone when something breaks. Prometheus, Datadog, InfluxDB, and Google's Monborg/Monarch are all this system. From the outside it looks like "store some numbers and graph them," which undersells it badly: the numbers arrive as a **continuous firehose from millions of sources forever**, every dashboard is a range-aggregation over huge volumes, and an alerting engine must evaluate rules over that data every few seconds without missing a beat.
+
+The hard part is that this is a **write-dominated, time-series problem with a cardinality bomb inside it**. Three forces dominate. First, **ingest throughput**: every monitored series produces a sample every scrape interval, so the system takes in millions of samples per second, continuously, and can never push back on the producers (a monitoring system that drops data or slows down the thing it monitors is worse than useless). Second, **storage economics**: that firehose would be tens of terabytes a day raw, so the design lives or dies on **time-series compression** and **downsampling + retention** to make keeping the data affordable. Third, **cardinality**: a "time series" is identified by a metric name plus a set of **labels** (`http_requests_total{method="GET", status="200", host="web-42"}`), and the number of distinct label combinations — the cardinality — is what actually bounds memory and index size; one careless high-cardinality label (a user ID, a request ID) can multiply your series count by millions and take the whole system down. The reframe to lead with: *graphing numbers is trivial; the design is absorbing a relentless write firehose without ever backpressuring producers, compressing regular time-series data ~8× and downsampling the long tail so storage is affordable, answering range-aggregation queries over recent data fast, and evaluating alert rules continuously — all while keeping cardinality under control, because cardinality, not raw sample volume, is what kills a metrics system.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What are we collecting — **metrics** (regular numeric time series) specifically, as opposed to **logs** (text events) or **traces** (request spans)? They're different systems with different storage; this is metrics.
+- **Push or pull** ingestion — does the server scrape targets, or do agents push? It shapes discovery, target-health, and the short-lived-job story.
+- What **resolution and retention** — samples every 10s kept how long? Raw forever is infeasible; this drives downsampling.
+- How **fresh** must alerts be, and can we tolerate approximate/aggregated history? Freshness sizes alert evaluation; approximate old data enables downsampling.
+- What's the **cardinality budget** — how many active series, and are labels bounded? This is the question that most often separates a system that scales from one that falls over.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "graphing is easy; write firehose + cardinality + storage economics is the problem" reframe · **5 min** requirements (ingest scale, never backpressure, retention, alert freshness) · **5 min** capacity (the firehose: ~20M samples/sec, ~27.6 TB/day raw → ~3.5 TB with compression) · **5 min** data model (metric + labels), cardinality, and the API · **8 min** the TSDB — ingestion path, head block + WAL, and time-series compression · **8 min** downsampling/retention, querying/aggregation, and alerting · **5 min** scaling, failure modes (cardinality explosion!), wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for a compressed time-series store, understand cardinality as the real constraint, and never backpressure producers.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the time-series data model and cardinality, push vs pull ingestion, the compressed time-partitioned TSDB, downsampling and retention, range-aggregation querying, and alert-rule evaluation with notification handoff — plus scaling, failure modes, and trade-offs. **Out of scope:** **logs** and **traces** (the other two pillars of observability — logs are the **Distributed Logging** tutorial; distributed tracing is its own system), the visualization/dashboard front-end beyond the query API it calls, and the anomaly-detection/ML layer some products build on top. This problem shares DNA with the **Distributed Logging** platform (both are write-firehose ingestion pipelines that must never backpressure producers) but diverges sharply on storage: logs are high-cardinality text searched ad hoc, metrics are regular numeric series aggregated over time — which is exactly why metrics get their own compressed time-series store.
 
 <h2 id="requirements">Requirements</h2>
 
-Placeholder.
+Separate what the system must *do* from how *well* it must do it. The functional list is modest; the difficulty is concentrated in the non-functional column — ingest scale, never backpressuring producers, and bounded storage.
+
+<RequirementsTable
+  functional={[
+    "Ingest samples (metric + labels + timestamp + value) from many sources",
+    "Query series over a time range with aggregation (rate, sum, percentile, group-by)",
+    "Serve dashboards from those queries",
+    "Evaluate alert rules continuously and fire notifications",
+    "Downsample old data and enforce retention",
+    "Discover and track the health of monitored targets",
+  ]}
+  nonFunctional={[
+    { goal: "Ingest scale", target: "sustain millions of samples/sec, continuously" },
+    { goal: "No backpressure", target: "never slow or block the producers" },
+    { goal: "Durability", target: "survive a node crash without losing recent samples" },
+    { goal: "Query latency", target: "recent-range dashboards in well under a second" },
+    { goal: "Storage cost", target: "bounded via compression + downsampling + retention" },
+    { goal: "Cardinality", target: "bounded active series — the real memory limit" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **it's overwhelmingly a write problem**: the system continuously ingests every series at every scrape, so the ingestion path and the storage engine must be built for sustained high-throughput **appends**, and — critically — must **never backpressure the producers**, buffering through a WAL/queue instead, because a monitoring system that degrades the systems it watches is unacceptable. Second, **storage must be bounded without losing usefulness**: raw high-resolution data forever is infeasible, so the design leans on aggressive **time-series compression** (points are regular and slow-changing, so they compress ~8×) plus **downsampling and tiered retention** (keep recent data fine-grained, roll up old data to coarse resolution) — because a dashboard showing last year only needs hourly points, not per-second ones. Third, **reads are modest and recent-biased**: dashboards and alerts almost always query the last minutes-to-hours, so queries touch recent, contiguous data and can be fast, and heavy dashboards can be precomputed. Note what's **relaxed**: metrics are **eventually consistent** and **lossy-tolerant at the margin** (a missed scrape leaves a gap, which is fine — you don't retry individual samples forever), and old data is deliberately **approximate** (downsampled). The system trades perfect fidelity of ancient data and per-sample durability guarantees for the ability to absorb an enormous write stream affordably.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-Placeholder.
+Estimates here make the shape of the problem unmistakable: this is a write firehose whose cost is tamed by compression, not a read-latency or storage-of-a-fixed-dataset problem.
+
+<MetricsCapacity
+  assumptions={{
+    monitoredTargets: 1000000,
+    seriesPerTarget: 200,
+    scrapeIntervalSec: 10,
+    rawBytesPerSample: 16,
+    compressedBytesPerSample: 2,
+  }}
+/>
+
+The takeaways. First — the signature lesson — **it's a write firehose**: 1 million targets each exposing ~200 series is **200 million active series**, and scraping every one every 10 seconds is ~**20 million samples per second**, ingested continuously and forever. That's the number that dictates the architecture: the ingestion and storage tiers are built for sustained append throughput, and the read side is a comparative afterthought. Second, **compression is the enabling trick**: at 16 raw bytes per sample the firehose is ~**27.6 TB/day**, which is untenable to retain — but time-series data is extraordinarily compressible because **timestamps are regularly spaced and values change slowly**, so **delta-of-delta timestamp encoding** plus **XOR float compression** (the Facebook "Gorilla" scheme) squeezes each sample to ~**2 bytes** (~**8×**), dropping it to ~**3.5 TB/day**; downsampling and retention then bound the long tail. Third — the one that isn't in the sample math — **cardinality is the real memory limit**: those 200 million *active series* each need an in-memory head chunk and an index entry, so RAM is governed by the *number of distinct series*, not the sample rate. Double the scrape frequency and you double samples but not memory; add one unbounded label and you can 1000× the series count and OOM the box. The capacity story: size for **ingest throughput and storage** (with compression and downsampling as the levers), and guard **cardinality** as the constraint that actually takes systems down — query latency barely registers by comparison.
 
 <h2 id="entity-model">Entity Model</h2>
 
-Placeholder.
+The model is small and unusual: the central object isn't a row but a **time series** — an identity plus an ordered stream of timestamped values. Everything about storage and querying follows from how that identity (metric + labels) and that stream (samples) are structured.
+
+<EntityModel
+  name="TimeSeries"
+  description="A single stream of measurements uniquely identified by a metric name plus a set of key/value labels, holding an ordered sequence of (timestamp, value) samples at a regular interval. The set of all series is the cardinality that bounds memory; each series' samples are stored append-only and compressed. A metric name + one specific label combination = exactly one series."
+  fields={[
+    { name: "metric", type: "string", notes: "the measurement name, e.g. http_requests_total" },
+    { name: "labels", type: "map<string,string>", notes: "dimensions, e.g. {method:GET, status:200, host:web-42} — the identity" },
+    { name: "series_id", type: "uint64", notes: "hash of metric+labels; the key the index maps to samples" },
+    { name: "samples", type: "list<(ts,value)>", notes: "ordered, regularly-spaced (timestamp, float value) points" },
+    { name: "type", type: "enum", notes: "counter (monotonic), gauge (arbitrary), histogram, or summary" },
+  ]}
+  keys="A series is identified by the exact set metric + labels; changing any label value creates a different series. The number of distinct label combinations is the CARDINALITY, which governs index size and in-memory head-chunk count — the dominant memory cost. An inverted index maps each label key=value to the set of series ids that carry it, so a query like {method='GET', status='200'} intersects posting lists to find matching series, then reads their sample chunks. Samples within a series are stored together, ordered by time, and compressed (delta-of-delta timestamps + XOR values). Metric type matters for querying: a counter only goes up (you take its rate), a gauge moves freely (you read it directly), and a histogram is a set of bucket-counter series used to estimate percentiles. The killer anti-pattern is putting an unbounded value (user id, request id, email) in a label — it makes every request a new series and explodes cardinality."
+/>
+
+Two ideas complete the picture. The **inverted (posting-list) index** is what makes label queries possible: for each `key=value` label it stores the set of series that have it, so a selector like `{method="GET", status="200"}` is a set intersection of posting lists — the same structure a text search engine uses, here over labels. And **metric type** drives interpretation: a **counter** is monotonically increasing (you almost never read it raw — you compute its **rate**), a **gauge** is a free-moving value (temperature, queue depth — read directly), and a **histogram** is really a family of bucket-counter series that let you estimate percentiles at query time. The discipline: a series' **identity is its full label set** (so labels must be **bounded**, low-cardinality dimensions), the **cardinality** of distinct series is the memory constraint to respect, and samples are stored **append-only, time-ordered, and compressed** per series.
 
 <h2 id="api-design">API Design</h2>
 
-Placeholder.
+The surface is three endpoints: a high-throughput write to ingest samples, a query endpoint for dashboards and ad-hoc analysis, and a rules endpoint to define alerts. The write is the firehose; the query is where aggregation lives.
+
+<ApiContract
+  method="POST"
+  path="/write"
+  summary="Ingest a batch of samples (remote-write / push, or the receiver behind a scrape)."
+  request={`POST /write
+{ "samples": [
+  { "metric": "http_requests_total",
+    "labels": { "method": "GET", "status": "200", "host": "web-42" },
+    "ts": 1721470000, "value": 138402 } ] }`}
+  response={`HTTP/1.1 204 No Content`}
+  statusCodes={[
+    { code: "204", meaning: "Samples accepted, appended to WAL + head block" },
+    { code: "400", meaning: "Malformed sample or invalid labels" },
+    { code: "429", meaning: "Ingestion limit hit — shed load rather than backpressure (last resort)" },
+  ]}
+  notes="Batched for throughput. In a pull model the server scrapes GET /metrics on each target and this receiver is internal; in a push model agents send here directly. It appends to a durable WAL and the in-memory head, and must sustain millions of samples/sec — 429/load-shed is the safety valve, never blocking a producer's own work."
+/>
+
+<ApiContract
+  method="GET"
+  path="/query"
+  summary="Evaluate a query (instant or range) with label selection and aggregation."
+  request={`GET /query?q=rate(http_requests_total{status="500"}[5m])&start=...&end=...&step=15s`}
+  response={`HTTP/1.1 200 OK
+{ "result": [
+  { "labels": { "host": "web-42" },
+    "values": [ [1721470000, 2.4], [1721470015, 3.1] ] } ] }`}
+  statusCodes={[
+    { code: "200", meaning: "Returns matching series' aggregated values over the range" },
+    { code: "400", meaning: "Query parse error or too-broad selection" },
+    { code: "422", meaning: "Query would scan too many series — cardinality guard" },
+  ]}
+  notes="A query language (PromQL-style) selects series by labels, applies functions (rate, sum, avg, histogram_quantile), and groups by label. Reads are recent-biased and touch contiguous blocks; a cardinality guard rejects queries that would fan out over millions of series. Recording rules can precompute heavy expressions."
+/>
+
+<ApiContract
+  method="POST"
+  path="/rules"
+  summary="Define an alerting (or recording) rule evaluated continuously."
+  request={`POST /rules
+{ "alert": "HighErrorRate",
+  "expr": "rate(http_requests_total{status=\\"500\\"}[5m]) > 10",
+  "for": "10m", "labels": { "severity": "page" } }`}
+  response={`HTTP/1.1 201 Created
+{ "rule": "HighErrorRate", "eval_interval": "30s" }`}
+  statusCodes={[
+    { code: "201", meaning: "Rule registered; evaluated every eval_interval" },
+    { code: "400", meaning: "Invalid expression or duration" },
+  ]}
+  notes="The alerting engine runs expr on a fixed interval; the for duration means the condition must hold that long before firing, which suppresses flapping. Firing alerts are deduplicated, grouped, and routed to notification channels. Recording rules use the same machinery to precompute expensive query results into new series."
+/>
+
+The whole surface is: ingest samples (the firehose), query with aggregation (dashboards + ad hoc), and manage rules (alerting + recording). There's no per-sample read API — you never fetch one point; you always select series and aggregate over a range, which is why the storage is optimized for ordered range scans over compressed chunks, not point lookups.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-Placeholder.
+The architecture is a **write pipeline** feeding a **compressed time-series store**, with a **query engine** and an **alerting engine** reading from it and a **downsampler** keeping storage bounded.
+
+<MetricsArchitecture />
+
+- **Monitored Targets.** The hosts, containers, and services exposing metrics — via an exporter/agent that the server scrapes, or that pushes samples.
+- **Ingestion Service.** Receives (scrapes or accepts) samples, validates labels, and appends them durably. Built for sustained append throughput; never backpressures producers.
+- **Time-Series DB.** The heart: samples land in an in-memory **head block** (backed by a WAL) and are periodically flushed to immutable, time-partitioned, **compressed** blocks, indexed by an inverted label index.
+- **Query Engine.** Parses queries, selects series via the index, range-scans blocks, and applies aggregation functions — recent-biased and fast.
+- **Dashboards.** The read clients issuing PromQL-style queries.
+- **Alerting Engine.** Continuously evaluates rule expressions over recent windows and fires deduplicated, grouped notifications.
+- **Downsampler.** A background job that compacts old raw blocks into lower-resolution rollups and expires data by retention policy.
+
+The decisive boundary is that **the write path is optimized for sustained compressed appends while the read path serves cheap recent-range scans** — the store is deliberately write-and-compression-optimized, the opposite of a general database. Every section that follows elaborates one piece: the data model and cardinality, the ingestion model, the compressed storage engine, downsampling and retention, querying and aggregation, and alerting.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-Placeholder.
+Four flows cover the system: ingesting the firehose, serving a range query, evaluating an alert, and downsampling old data. The first two are the hot request paths; the last two are the continuous background work that makes monitoring useful and affordable.
+
+**Ingest a batch of samples.** The ingestion service receives samples, appends them to a write-ahead log for durability, writes them into the in-memory head block, and periodically flushes a compressed immutable block; the producer gets a fast acknowledgement. The WAL means a crash loses nothing, and the path is built to sustain the firehose without ever blocking producers.
+
+<IngestSampleSequence />
+
+**Serve a range query.** A dashboard sends a label-selected, time-ranged query with an aggregation; the query engine resolves matching series from the index, range-scans the relevant recent blocks, applies the function, and returns. Reads touch only recent, contiguous data.
+
+<RangeQuerySequence />
+
+The remaining two flows — continuous **alert evaluation** and background **downsampling/retention** — are shown in the Alerting and Downsampling deep dives below, where their details belong.
 
 <h2 id="data-model-cardinality">The Data Model & Cardinality</h2>
 
-Placeholder.
+Everything starts with how a measurement is identified. A metric like `http_requests_total` isn't one number — it's a **family of time series**, one per unique combination of **labels**: `http_requests_total{method="GET", status="200", host="web-42"}` and `http_requests_total{method="POST", status="500", host="web-13"}` are two entirely separate series. The metric name plus the exact label set **is** the identity; change any label value and you've named a different series. This dimensional model is what makes metrics powerful — you can slice error rate by status, host, region, endpoint — and it's also the source of the system's single most dangerous failure mode.
+
+That failure mode is **cardinality explosion**. The total number of distinct series — the **cardinality** — is the product of the distinct values across labels, and it directly determines index size and, worse, the number of in-memory head chunks the TSDB must hold (one active chunk per series). Bounded labels are fine: `method` has ~5 values, `status` ~a few dozen, `host` maybe thousands — their product is large but manageable. The catastrophe is putting an **unbounded, high-cardinality value in a label**: `user_id`, `request_id`, `email`, a full URL with query params, a raw error message. Now every user or request mints a *new* series that lives forever in the index and memory, and cardinality jumps from millions to billions — the classic way a metrics system OOMs and falls over, often taking down monitoring exactly when you need it during an incident. The rules that follow: labels must be **bounded, low-cardinality dimensions**; identifiers and free-form text belong in **logs or traces**, not metric labels; and the system should **guard cardinality** actively (limits per metric, alerts on series growth, rejecting or dropping offending labels). The principle: the metric+label model gives dimensional slicing, but **cardinality — the count of distinct series — is the true resource constraint**, so keeping labels bounded is the most important discipline in operating a metrics system.
+
+<KnowledgeCheck
+  question="What is cardinality in a metrics system, and why is it the constraint that most often causes outages?"
+  options={[
+    "Cardinality is the sample rate; high sample rates cause outages by filling disks",
+    "Cardinality is the number of distinct time series — each unique metric + label-set combination — and it governs index size and the count of in-memory head chunks (one per active series), so it's the dominant memory cost. It blows up when an unbounded, high-cardinality value (user_id, request_id, a full URL) is used as a label, minting a new series per user/request and jumping cardinality from millions to billions, OOMing the store. Keeping labels bounded and low-cardinality is the key discipline",
+    "Cardinality is the number of dashboards; too many dashboards overload the query engine",
+    "Cardinality is the retention period; longer retention causes outages",
+  ]}
+  answer={1}
+  explanation="A time series is identified by its metric name plus exact label set, so the number of distinct label combinations — the cardinality — determines how many series the index and in-memory head must track, one active chunk each. That makes cardinality, not sample volume, the memory limit. The disaster is embedding an unbounded value (a user or request id, a URL with parameters) in a label, which creates a new series for every distinct value and explodes cardinality until the store runs out of memory. Identifiers belong in logs/traces; metric labels must stay bounded."
+/>
 
 <h2 id="ingestion-pipeline">Ingestion: Push vs Pull</h2>
 
-Placeholder.
+How samples get from targets into the system is a genuine design fork, and the classic answer surprises people: the dominant model, popularized by Prometheus, is **pull (scraping)** — the monitoring server periodically fetches a `/metrics` endpoint from each target on a fixed interval. Pull has real advantages: the server owns **service discovery** (it decides what to scrape, integrating with Kubernetes/Consul/etc.), a **failed scrape is itself a health signal** (if the target doesn't answer, you know it's down — you get liveness for free), there's no risk of a runaway client flooding you, and targets stay dumb (just expose current values, no delivery logic). The cost: the server needs network reachability to every target, and **short-lived jobs** (a batch job, a serverless function, a CI run) may finish before they're ever scraped.
+
+**Push (remote-write)** inverts it: agents on the targets send samples to the server. Push shines exactly where pull struggles — **short-lived and serverless workloads** (push before you exit), **network-isolated targets** that the server can't reach (they push out through a gateway), and event-driven sources. Its costs mirror pull's benefits: you lose the free liveness signal (silence is ambiguous — down, or just quiet?), and you must defend against a misbehaving client flooding the ingest path. Many production systems support **both**, and use a **push gateway** to bridge short-lived jobs into a pull-based world. Whichever direction, the ingestion tier shares one non-negotiable property from the requirements: it **must never backpressure producers**. It absorbs bursts through an in-memory buffer and a **write-ahead log**, and if it's truly overwhelmed it **sheds load** (drops samples, returns 429) rather than slowing down — because the cardinal rule is that monitoring must not degrade the systems it monitors. The principle: **pull** gives you discovery and free target-health at the cost of reachability and short-job gaps; **push** covers short-lived and isolated workloads at the cost of the liveness signal and flood risk; and either way ingestion **buffers and sheds, never backpressures**.
+
+<KnowledgeCheck
+  question="What is the key trade-off between pull (scrape) and push ingestion, and what must ingestion never do?"
+  options={[
+    "Pull is always faster than push; ingestion must never compress data",
+    "Pull (the server scrapes targets on an interval) gives built-in service discovery and a free liveness signal — a failed scrape means the target is down — but needs network reachability and misses short-lived jobs that finish between scrapes. Push (agents send samples) covers short-lived, serverless, and network-isolated workloads but loses the free liveness signal and must guard against a client flooding it. Either way, ingestion must never backpressure producers: it buffers through a WAL and sheds load rather than slowing the monitored systems",
+    "Push is only for logs and pull is only for metrics; ingestion must never use a WAL",
+    "They are identical; ingestion must never store more than one sample per series",
+  ]}
+  answer={1}
+  explanation="Pull centralizes discovery and turns a missed scrape into a health signal, at the cost of needing to reach every target and missing jobs that end between scrapes; push handles short-lived and unreachable workloads but forfeits the free liveness signal and risks a flooding client. Many systems run both plus a push gateway. The invariant across both is that a monitoring system must never backpressure the producers it watches — it absorbs bursts in a buffer/WAL and, if overwhelmed, sheds load rather than degrading the monitored systems."
+/>
 
 <h2 id="tsdb-storage">Time-Series Storage & Compression</h2>
 
-Placeholder.
+The storage engine is purpose-built and looks nothing like a general database. Incoming samples for each series first land in an in-memory **head block** — the current, still-growing chunk — with every write also appended to a **write-ahead log** on disk so a crash can be replayed with zero loss. Periodically (say every couple of hours) the head is cut and **flushed to an immutable, time-partitioned block** on disk: data is organized into non-overlapping time windows, each block self-contained with its own index and chunks. Immutability is a gift — blocks are written once and never modified, so there's no in-place update complexity, compaction just merges adjacent blocks, and retention is "delete the old block." This is the same **LSM-ish, append-only, time-partitioned** shape you'd want for any write-heavy store, specialized for time.
+
+The magic is the **compression**, and it's the reason a metrics store is affordable. Time-series data has two properties that make it extraordinarily compressible. First, **timestamps are regularly spaced** — a scrape every 10 seconds means deltas are almost always exactly 10s, so instead of storing 8-byte timestamps you store the **delta-of-delta**: the change in the interval, which is usually **zero** and encodes in a single bit. Second, **consecutive values change slowly** — CPU is 40.1% then 40.2% — so the **XOR of successive float values** has mostly leading/trailing zero bits, which pack tightly. This pair of techniques — delta-of-delta timestamps + XOR floats — is the **Facebook "Gorilla"** scheme, and it takes a 16-byte (timestamp, value) sample down to **~1.3–2 bytes on average**, an ~8–12× reduction, with no loss. That's what turns ~27.6 TB/day of raw firehose into ~3.5 TB. The principle: store samples **append-only in immutable, time-partitioned blocks** (WAL for durability, head block in memory for the hot window), and exploit the **regularity of time series** with **delta-of-delta timestamp** and **XOR value** compression to shrink the data ~8×, because keeping the firehose is only affordable once it's compressed.
+
+<KnowledgeCheck
+  question="Why does time-series data compress so well, and how do delta-of-delta and XOR encoding work?"
+  options={[
+    "It doesn't compress well; metrics systems just buy more disks",
+    "Because timestamps are regularly spaced and consecutive values change slowly. Delta-of-delta stores the change in the interval between samples — with a fixed scrape interval that's almost always zero, so it takes about a bit instead of 8 bytes. XOR encoding stores the XOR of successive float values, which for slowly-changing metrics has mostly zero bits and packs tightly. Together (the Gorilla scheme) they shrink a 16-byte sample to ~1.3–2 bytes, ~8×, losslessly — which is what makes retaining the firehose affordable",
+    "Because old samples are deleted immediately, so nothing needs compressing",
+    "Because all samples are identical, so only one value is stored",
+  ]}
+  answer={1}
+  explanation="Regularity is the key: fixed scrape intervals make timestamp deltas constant, so the delta-of-delta (the change in the delta) is almost always zero and encodes in ~a bit rather than 8 bytes; and metric values move in small steps, so XORing consecutive floats yields mostly zero bits that compress hard. This Gorilla-style pair reduces a 16-byte (timestamp, value) pair to roughly 1.3–2 bytes with no loss — an ~8× win that turns tens of TB/day of raw data into a few TB. It's lossless compression exploiting structure, not deletion or deduplication of identical points."
+/>
 
 <h2 id="downsampling-retention">Downsampling & Retention</h2>
 
-Placeholder.
+Compression makes a day of data affordable; **downsampling and retention** make *years* of data affordable. The insight is that **resolution needs decay with age**: you want per-second detail for the last few hours (to debug a live incident), but for a dashboard showing the last year, hourly points are not just enough — they're all the screen can render anyway. So the system keeps **raw, high-resolution** data only for a recent window, and **downsamples** older data into progressively coarser **rollups**: raw 10-second points get aggregated into 1-minute rollups, then 5-minute, then 1-hour, each storing summary statistics (min, max, sum, count, and often specific quantiles) per interval so the aggregations dashboards ask for still work.
+
+<DownsampleRetentionSequence />
+
+**Retention** is the policy layer on top: each resolution tier has a lifetime — raw for, say, 15 days, 5-minute rollups for 90 days, 1-hour rollups for 2 years — after which blocks are dropped. Because storage is immutable time-partitioned blocks, both downsampling (read old raw blocks, write rollup blocks) and expiry (delete blocks past their tier's lifetime) are clean batch operations. Long-term rollups are often shipped to cheaper **object storage** (a remote long-term store) while recent hot data stays on fast local disk — a storage tiering that mirrors the **Distributed Logging** platform's hot/warm/cold tiers. The trade-off is **fidelity vs cost**: downsampling permanently loses the fine detail of old data (you can't recover the exact per-second spike from last March), which is precisely the bargain you want, since nobody debugs a live incident with year-old per-second data. The principle: **decay resolution with age** — keep recent data raw, roll up old data into coarser summaries, and expire by tier — so total storage stays bounded no matter how long you retain history, trading irrecoverable fine detail of the distant past for affordability.
 
 <h2 id="query-aggregation">Querying & Aggregation</h2>
 
-Placeholder.
+Queries are where the dimensional model pays off, and they have a characteristic shape: **select series by labels, over a time range, then aggregate**. A query like `sum(rate(http_requests_total{status="500"}[5m])) by (host)` reads as: take the `http_requests_total` series with `status="500"`, compute each one's **per-second rate** over 5-minute windows, then **sum** them **grouped by host**. Three families of function dominate. **Rate/increase** turn a monotonic **counter** into the meaningful thing — requests *per second* — because the raw counter value (ever-climbing, reset on restart) is useless directly. **Aggregations** (sum, avg, min, max, count) collapse many series into fewer, `by (label)` controlling the grouping. And **percentiles** come from **histograms**: since you can't average percentiles, latency is recorded as bucketed counter series and `histogram_quantile` estimates p50/p99 from the buckets at query time.
+
+Two properties keep queries fast. First, **reads are recent-biased**: dashboards and alerts overwhelmingly ask about the last minutes to hours, so a query selects a handful of series via the inverted index and range-scans their **recent, contiguous** compressed chunks — a sequential read of a small amount of data, not a scan of the whole store. Second, **heavy queries are precomputed**: a dashboard that aggregates millions of series (`sum by (region)` across a fleet) is expensive to run live on every refresh, so a **recording rule** evaluates the expression on a schedule and writes the result into a **new, low-cardinality series** that the dashboard reads cheaply — trading a little staleness and storage for a massive query speedup. The guardrail is the **cardinality of the query itself**: a selector that matches millions of series (a too-broad label match) can blow up the query engine, so the system limits or rejects queries that would fan out too far. The principle: queries **select-by-label, range-scan recent compressed chunks, and aggregate** (rate for counters, histograms for percentiles); keep them fast by exploiting **recency** and by **precomputing** heavy aggregations with recording rules — while guarding against **high-cardinality queries** that fan out over too many series.
+
+<KnowledgeCheck
+  question="Why must you take the rate of a counter, and how are percentiles computed in a metrics system?"
+  options={[
+    "You read counters directly; percentiles are stored as a single averaged value",
+    "A counter only ever increases (and resets on restart), so its raw value is meaningless — you take its rate/increase over a window to get the useful per-second quantity. Percentiles can't be averaged, so latency is recorded as a histogram: a set of bucket-counter series, and histogram_quantile estimates p50/p99 from the bucket counts at query time. Queries select series by label, range-scan recent compressed chunks, and aggregate — with recording rules precomputing heavy expressions",
+    "Counters are gauges; percentiles are computed by scanning every raw request log",
+    "You take the rate to save storage; percentiles are the same as averages",
+  ]}
+  answer={1}
+  explanation="A counter is monotonic and resets on process restart, so its instantaneous value conveys nothing on its own — the meaningful signal is its rate of change (requests per second), computed over a window with rate/increase. Percentiles are not averageable, so latency is captured as histogram buckets (counter series per bucket), and histogram_quantile derives p50/p99 from those bucket counts at query time. Queries generally select by label, scan recent contiguous chunks, and aggregate, with recording rules precomputing expensive results into new low-cardinality series."
+/>
 
 <h2 id="alerting">Alerting</h2>
 
-Placeholder.
+Dashboards are for humans looking; **alerting** is the system watching so humans don't have to. An alerting engine holds a set of **rules**, each an expression plus a threshold (`rate(errors[5m]) > 10`), and **evaluates every rule on a fixed interval** (say every 30 seconds) against the recent data — effectively running the same range queries continuously and checking the condition. The subtlety that makes alerting *usable* rather than maddening is the **`for` duration**: an alert doesn't fire the instant its condition is true, but only after it has stayed true for a specified time (e.g. 10 minutes). This **suppresses flapping** — a momentary spike, a single bad scrape, a brief blip won't page anyone; only a sustained problem does.
+
+<AlertEvaluationSequence />
+
+Once a rule fires, the raw firing isn't sent straight to a human — a separate stage handles **notification management** (in Prometheus this is Alertmanager): **deduplication** (the same alert firing from many replicas becomes one notification), **grouping** (twenty hosts failing the same rule become one grouped page, not twenty), **routing** (severity and labels decide who's paged, emailed, or Slacked), **silencing** (mute known issues or maintenance windows), and **inhibition** (a "datacenter down" alert suppresses the hundred "host unreachable" alerts it obviously causes). The actual delivery — the push notification, SMS, or email — is then handed off to notification channels, which is the **Notification Service** problem (retries, dedup, multi-channel fan-out) from earlier in the curriculum. The trade-off woven through alerting is **sensitivity vs noise**: shorter `for` durations and tighter thresholds catch problems faster but page on noise; longer ones are quieter but slower — and an alerting system that cries wolf gets ignored, which is its own kind of outage. The principle: evaluate rules **continuously over recent windows**, use a **`for` duration to suppress flapping**, and **dedup, group, route, silence, and inhibit** firing alerts before handing delivery to a notification service — tuning sensitivity so alerts are trustworthy, because a noisy alerting system is a useless one.
+
+<KnowledgeCheck
+  question="What does the alerting 'for' duration accomplish, and why are firing alerts deduplicated and grouped?"
+  options={[
+    "The for duration speeds up evaluation; dedup/grouping compress the data",
+    "The for duration requires a rule's condition to hold continuously for a set time before the alert fires, which suppresses flapping so a momentary spike or a single bad scrape never pages anyone. Deduplication collapses the same alert firing from many replicas into one notification, and grouping turns many entities failing the same rule (twenty hosts) into a single page instead of twenty — so on-call gets one meaningful, trustworthy notification rather than a storm, since a noisy alerting system gets ignored",
+    "The for duration deletes old alerts; grouping routes alerts to storage",
+    "The for duration is the retention of alert history; dedup prevents cardinality explosion",
+  ]}
+  answer={1}
+  explanation="The for duration is an anti-flapping control: the condition must stay true for the specified period before firing, so transient blips don't generate pages. Beyond firing, a notification-management stage deduplicates identical alerts from redundant sources into one, groups many related firings (many hosts, one rule) into a single notification, and routes/silences/inhibits — all to keep alerts signal-rich. This matters because an alerting system that pages on noise gets muted or ignored, defeating its purpose; delivery itself is handed to a notification service."
+/>
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Placeholder.
+Don't build the globally-federated, long-term-tiered system on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single TSDB node", "One team, thousands of series, days of retention", "Simple, but one box caps ingest/cardinality and is a SPOF; local retention only"],
+    ["HA pair (replicated scrape)", "Need monitoring to survive a node loss", "Two nodes scrape/ingest the same targets; dedup at query time; 2× cost"],
+    ["Sharded by series + remote long-term store", "Cardinality/ingest exceeds one node; long retention", "Shard series across nodes; ship downsampled blocks to object storage; a query layer that fans out"],
+    ["Global/federated multi-cluster", "Many clusters/regions; a single pane of glass", "Per-cluster TSDBs + a global query layer aggregating across them; cross-cluster query complexity"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the wall you're hitting. A **single TSDB** is genuinely enough for a lot — a compressed store on one beefy box handles millions of series and is how many teams run Prometheus — but it caps ingest and cardinality at one machine and is a single point of failure with only local retention. **HA pairs** (two identical servers scraping the same targets, deduplicated at read time) buy availability so monitoring survives a node loss — table stakes for production. The center of gravity for scale is **sharding series across nodes with a remote long-term store**: distribute the cardinality and ingest load, and offload downsampled history to cheap object storage (Thanos/Cortex/Mimir-style), keeping each node's working set bounded while retaining years affordably. Only genuinely large orgs need **global federation** — per-cluster TSDBs with a global query layer stitching them into one view — paying cross-cluster query complexity for a single pane of glass. Most systems are well-served by "HA pair, shard when cardinality demands it, tier old data to object storage."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-Placeholder.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. The monitoring system's guiding rule is uncomfortable but essential: **monitoring must be more reliable than the things it monitors, and must never take them down** — so ingestion degrades by shedding load, never by backpressuring, and the scariest failure is the system killing itself with cardinality.
+
+<FailureMatrix
+  rows={[
+    { failure: "Ingest node crash", impact: "Recent in-memory samples at risk", detection: "Health check / WAL age", mitigation: "Write-ahead log on every write; HA pair ingesting in parallel", recovery: "Replay the WAL to rebuild the head; peer covers the gap" },
+    { failure: "Cardinality explosion", impact: "TSDB OOM — monitoring itself down", detection: "Series-count growth / memory alerts", mitigation: "Per-metric series limits; drop/relabel offending labels; reject at ingest", recovery: "Purge the runaway series; block the bad label source" },
+    { failure: "Scrape target unreachable", impact: "Gaps in that target's series", detection: "up == 0 (failed scrape is a signal)", mitigation: "Alert on target down; gaps are expected, not retried forever", recovery: "Scraping resumes when the target returns" },
+    { failure: "Query overload / expensive query", impact: "Query engine slow or OOM", detection: "Query duration / series-scanned limits", mitigation: "Cardinality guard rejects too-broad queries; recording rules precompute", recovery: "Kill the query; cache/precompute the heavy dashboard" },
+    { failure: "Producer flood / burst", impact: "Ingest overwhelmed", detection: "Ingest rate / buffer depth", mitigation: "Buffer via WAL; shed load (429) rather than backpressure producers", recovery: "Burst drains from buffer; rate-limit the source" },
+    { failure: "Downsampler / compaction lag", impact: "Storage grows; queries slower", detection: "Block backlog / disk usage", mitigation: "Prioritize compaction; scale the downsampler; alert on disk", recovery: "Backlog compacts; old blocks expire" },
+    { failure: "Alerting engine down", impact: "Alerts not evaluated — silent failures", detection: "Meta-monitoring: watch the watcher (dead-man's switch)", mitigation: "Run alerting HA; a heartbeat alert that pages if it stops firing", recovery: "Failover; evaluation resumes" },
+  ]}
+/>
+
+The theme: **degrade by shedding, never by backpressuring; and monitor the monitor.** Ingest crashes are survived by the WAL (replay the head) and an HA peer covering the gap. Cardinality explosion — the signature self-inflicted outage — is contained *before* it happens with per-metric series limits, relabeling to drop bad labels, and rejecting offending series at ingest, because once the box OOMs you've lost visibility exactly when you need it. A failed scrape isn't really a failure — it's the **liveness signal** the pull model gives you for free, and gaps are expected rather than retried forever. Overload on either the write or read side is met by **load-shedding and cardinality guards**, never by slowing producers. And the subtlest failure is the **alerting engine silently dying** — if the watcher stops watching, nothing tells you — so you need **meta-monitoring**: a **dead-man's switch** (a heartbeat alert that fires *unless* the pipeline is healthy) and an HA alerting setup. Because the store is append-only with a WAL and immutable blocks, data recovery is usually "replay the WAL or fail to the peer," while the operational discipline is keeping cardinality bounded and watching the watcher.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-Placeholder.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Ingest samples (pull/scrape for discovery + free target-health, push for short-lived/isolated workloads) into a purpose-built time-series store: an in-memory head block backed by a WAL, flushed to immutable, time-partitioned, compressed blocks (delta-of-delta timestamps + XOR values, ~8×), indexed by an inverted label index; downsample old data into coarser rollups and expire by tiered retention, tiering long-term data to object storage; serve label-selected, range-aggregated queries (rate for counters, histograms for percentiles) with recording rules precomputing heavy dashboards; and evaluate alert rules continuously with a for-duration to suppress flapping, dedup/group/route firing alerts, and hand delivery to a notification service — all while guarding cardinality as the true resource limit and never backpressuring producers."
+  rationale="Monitoring is a write-firehose problem, so the store is optimized for compressed appends and recent-range reads, not general queries; time-series regularity makes ~8× compression the lever that keeps the firehose affordable, and downsampling/retention bound the long tail. Pull gives discovery and free liveness; a WAL plus load-shedding keeps ingestion durable without ever backpressuring producers. Cardinality, not sample rate, is the memory constraint, so bounding labels and guarding series counts is the central discipline. Alerting's for-duration and dedup/group/route make it trustworthy rather than noisy."
+  alternatives="A general-purpose SQL/NoSQL database for metrics — works small but can't match a TSDB's compression or ingest throughput and struggles with the dimensional model. Storing raw data forever — simple but financially impossible; downsampling is required. Push-only ingestion — loses the free liveness signal and service discovery pull provides. Unbounded labels for rich slicing — the cardinality-explosion trap that OOMs the store. No for-duration on alerts — pages on every transient blip until on-call mutes everything. One node — simplest but a SPOF that caps cardinality and offers no HA. Reusing the logging pipeline for metrics — both are firehoses, but metrics' numeric regularity wants a compressed time-series store, not a text search index."
+  revisitWhen="Cardinality or ingest outgrows one node (shard series; enforce stricter label limits); retention requirements grow (add a remote long-term object store and more downsampling tiers); you go multi-cluster/region (federate with a global query layer); alert noise or misses appear (tune for-durations, thresholds, and add a dead-man's switch); or you need logs/traces correlation (integrate, but keep them as separate stores)."
+/>
+
+Four axes capture the real tension:
+
+- **Pull vs push ingestion.** Pull gives service discovery and free target-health but needs reachability and misses short jobs; push covers short-lived/isolated workloads but loses the liveness signal. Most systems do both.
+- **Compress/downsample vs keep raw.** Compression + downsampling make retention affordable at the cost of losing fine detail of old data; keeping everything raw is faithful but financially impossible. Decay resolution with age.
+- **Bounded vs rich labels.** Bounded labels keep cardinality (and the system) alive; rich high-cardinality labels give more slicing but risk OOM. Bound labels; put identifiers in logs/traces.
+- **Sensitive vs quiet alerting.** Short for-durations catch issues fast but page on noise; long ones are trustworthy but slower. Tune for signal, because a noisy alerting system gets ignored.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-Placeholder.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A metrics system looks like storing numbers and graphing them, but it's really a write-firehose problem with a cardinality bomb inside it. Every monitored series emits a sample each scrape interval, so I'm ingesting on the order of twenty million samples a second continuously — about two hundred million active series scraped every ten seconds — and the ingestion path must never backpressure the producers, so it buffers through a write-ahead log and sheds load if overwhelmed rather than slowing anything down. That firehose would be twenty-eight terabytes a day raw, so the store is purpose-built for time series: samples hit an in-memory head block backed by the WAL, then flush to immutable, time-partitioned, compressed blocks. Compression is the whole game — because timestamps are evenly spaced and values change slowly, delta-of-delta timestamps plus XOR-encoded floats, the Gorilla scheme, shrink a sample from sixteen bytes to about two, roughly eight times, which is what makes keeping the data affordable. Then downsampling and tiered retention bound the long tail: recent data stays high-resolution, old data rolls up to one-minute, five-minute, hourly, and expires by age. Queries select series by labels through an inverted index, range-scan recent compressed chunks, and aggregate — rate for counters, histograms for percentiles — with recording rules precomputing heavy dashboards. Alerting evaluates rules continuously, uses a for-duration to suppress flapping, and dedups, groups, and routes firing alerts before handing delivery to a notification service. The thing I never stop watching is cardinality: a time series is a metric plus its label set, so an unbounded label like a user or request ID explodes the series count and OOMs the store — cardinality, not sample volume, is what actually kills a metrics system, so labels stay bounded and I put identifiers in logs, not metrics."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why is cardinality the real constraint, and how does it blow up? Why pull instead of push — and when push? Why is the storage engine append-only and how does the compression work? Why downsample, and what do you lose? How do you compute rates and percentiles? Why the for-duration on alerts? How do you keep monitoring from taking down what it monitors?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="What does the capacity model reveal about the nature of a metrics system?"
+  options={[
+    "It's a read-latency problem dominated by dashboard queries",
+    "It's a write-firehose and storage problem: ~200M active series scraped every 10s is ~20M samples/sec ingested continuously, which raw would be ~27.6 TB/day — made affordable by ~8× time-series compression (delta-of-delta + XOR) to ~3.5 TB/day, then downsampling and retention for the long tail. Reads are modest recent-range scans. The system is sized by ingest throughput and storage, and its memory is bounded by cardinality (distinct series), not by sample volume or query latency",
+    "It's a storage-of-a-fixed-dataset problem like a data warehouse",
+    "It's dominated by the number of alert rules being evaluated",
+  ]}
+  answer={1}
+  explanation="The numbers show a relentless, continuous write load (~20M samples/sec) whose raw size (~27.6 TB/day) is only tenable because time-series data compresses ~8× and old data is downsampled and expired. Reads are comparatively light and recent-biased. So the architecture is driven by sustained append throughput and storage economics, with cardinality — the count of distinct series — as the true memory constraint, not query latency, dataset size, or rule count."
+/>
+
+<KnowledgeCheck
+  question="Why must a monitoring system never backpressure the producers it monitors, and how does it avoid doing so?"
+  options={[
+    "It should backpressure producers to guarantee no data is lost",
+    "Because a monitoring system that slows or blocks the systems it watches would degrade the very things it's meant to observe — unacceptable, especially during an incident. So ingestion absorbs bursts through an in-memory buffer and a write-ahead log, and if it's truly overwhelmed it sheds load (drops samples, returns 429) rather than slowing producers. Losing some samples leaves a harmless gap; slowing production traffic does not",
+    "It doesn't matter; monitoring runs on separate hardware so it can't affect producers",
+    "It avoids backpressure by scraping less often permanently",
+  ]}
+  answer={1}
+  explanation="The cardinal rule is that monitoring must not harm the monitored systems; if the ingest path pushed back on producers, a monitoring hiccup could slow real user traffic, worst of all during an outage. The system therefore buffers through a WAL and, under extreme load, sheds load — dropping samples and returning 429 — because a gap in metrics is tolerable while backpressuring production is not. It's a deliberate choice of lossiness over interference, not a hardware guarantee."
+/>
+
+<Faq
+  items={[
+    { question: "What is a metrics and monitoring system?", answer: "It collects numeric measurements (time series) from many hosts and services, stores them compressed over time, serves dashboards via range-aggregation queries, and evaluates alert rules to page on-call when something breaks. Prometheus, Datadog, and InfluxDB are examples. The engineering challenge isn't graphing — it's absorbing a continuous firehose of samples affordably, keeping cardinality bounded, and evaluating alerts reliably." },
+    { question: "How is a time series identified?", answer: "By a metric name plus a set of key/value labels — http_requests_total{method=\"GET\", status=\"200\", host=\"web-42\"} is one series, and changing any label value names a different one. This dimensional model lets you slice a metric by status, host, region, and so on. The number of distinct label combinations is the cardinality, which is the system's dominant resource constraint." },
+    { question: "What is cardinality and why does it matter so much?", answer: "Cardinality is the number of distinct time series (unique metric + label-set combinations). It governs index size and the count of in-memory head chunks (one per active series), so it's the main memory cost — more than sample volume. It explodes when an unbounded value (user id, request id, a URL with parameters) is used as a label, minting a new series per value and OOMing the store. Keeping labels bounded is the single most important operational discipline." },
+    { question: "Should monitoring use push or pull ingestion?", answer: "Pull (the server scrapes targets on an interval) is the dominant model: it centralizes service discovery and gives a free liveness signal — a failed scrape means the target is down — but needs network reachability and misses short-lived jobs. Push (agents send samples) covers short-lived, serverless, and network-isolated workloads but loses the free liveness signal and risks flooding. Many systems support both plus a push gateway; either way, ingestion never backpressures producers." },
+    { question: "Why is monitoring a write-heavy problem?", answer: "Because every monitored series emits a sample every scrape interval, continuously — around 20 million samples per second in the capacity model, ingested forever. Reads (dashboards and alerts) are comparatively light and biased toward recent data. So the architecture is built for sustained high-throughput appends and cheap recent-range scans, the opposite of a read-optimized general database." },
+    { question: "How does time-series compression work?", answer: "It exploits two properties of metric data: timestamps are regularly spaced, so storing the delta-of-delta (the change in the interval) is almost always zero and takes about a bit instead of 8 bytes; and values change slowly, so XORing consecutive floats yields mostly zero bits that pack tightly. This Gorilla scheme shrinks a 16-byte (timestamp, value) sample to roughly 1.3–2 bytes losslessly — about 8× — which is what makes keeping the firehose affordable." },
+    { question: "What is downsampling and why do it?", answer: "Downsampling aggregates old high-resolution data into coarser rollups — 10-second points into 1-minute, then 5-minute, then hourly summaries — because resolution needs decay with age: you want per-second detail for a live incident but only hourly points for a year-long dashboard. Combined with tiered retention (drop each resolution after a lifetime), it bounds total storage no matter how long you retain history, at the cost of permanently losing fine detail of the distant past." },
+    { question: "How are the storage blocks organized?", answer: "Samples land in an in-memory head block, with every write also appended to a write-ahead log for durability; periodically the head is flushed to an immutable, time-partitioned block on disk with its own index and compressed chunks. Immutability makes compaction, retention (delete old blocks), and crash recovery (replay the WAL) simple. It's an append-only, LSM-like design specialized for time." },
+    { question: "How do you query metrics — what's a rate and a percentile?", answer: "A query selects series by labels over a time range and applies functions. A counter only increases and resets on restart, so you take its rate/increase over a window to get a meaningful per-second value. Percentiles can't be averaged, so latency is recorded as a histogram — bucketed counter series — and histogram_quantile estimates p50/p99 from the buckets at query time. Aggregations like sum/avg with 'by (label)' collapse and group series." },
+    { question: "How does alerting avoid paging on every blip?", answer: "With the 'for' duration: a rule's condition must stay true continuously for a specified time (say 10 minutes) before the alert fires, so momentary spikes and single bad scrapes don't page anyone. Firing alerts are then deduplicated (same alert from many replicas becomes one), grouped (many hosts failing one rule become one page), routed by severity, and silenced/inhibited — so on-call gets trustworthy, signal-rich notifications, because a noisy alerting system gets ignored." },
+    { question: "How do you keep the monitoring system from taking down what it monitors?", answer: "Ingestion never backpressures producers: it buffers bursts through a write-ahead log and, if overwhelmed, sheds load (drops samples, returns 429) rather than slowing the monitored systems — a gap in metrics is harmless, degrading production traffic is not. And you guard cardinality aggressively (series limits, relabeling, rejecting bad labels) so the store can't OOM itself, since losing monitoring during an incident is the worst possible time." },
+    { question: "How is this different from a logging system?", answer: "Both are write-firehose ingestion pipelines that must never backpressure producers, but they store different data. Metrics are regular numeric time series aggregated over time, so they get a compressed, time-partitioned time-series store (delta-of-delta + XOR) optimized for range aggregation. Logs are high-cardinality text events searched ad hoc, so they get an inverted-text-index search store. Metrics, logs, and traces are the three pillars of observability, and each warrants its own system." },
+    { question: "What happens if the alerting engine itself dies?", answer: "That's the subtlest failure — if the watcher stops watching, nothing tells you, and problems go unnoticed. The defenses are meta-monitoring: run alerting in HA, and use a dead-man's switch — a heartbeat alert that is expected to fire continuously and pages precisely when it stops, proving the pipeline is alive. You monitor the monitor, because silent alerting failure is worse than a loud one." },
+  ]}
+/>
