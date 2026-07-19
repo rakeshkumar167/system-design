@@ -574,6 +574,10 @@ import {
   AuthorizationDecisionSequence,
   RelationshipCheckSequence,
 } from "@/components/diagrams/authorization-flows";
+import {
+  PasswordRegistrationSequence,
+  PasswordVerificationSequence,
+} from "@/components/diagrams/password-hashing-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -608,5 +612,23 @@ describe("Authorization flow diagrams", () => {
       screen.getByRole("img", { name: /a relationship-based permission check/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/Google Zanzibar popularized/i)).toBeInTheDocument();
+  });
+});
+
+describe("Password hashing flow diagrams", () => {
+  it("exposes password registration hashing to non-visual readers", () => {
+    render(<PasswordRegistrationSequence />);
+    expect(
+      screen.getByRole("img", { name: /hashing a password at registration/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/a stolen database reveals no usable passwords/i)).toBeInTheDocument();
+  });
+
+  it("exposes password verification to non-visual readers", () => {
+    render(<PasswordVerificationSequence />);
+    expect(
+      screen.getByRole("img", { name: /verifying a password at login/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/recomputed and compared in constant time/i)).toBeInTheDocument();
   });
 });
