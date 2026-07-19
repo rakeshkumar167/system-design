@@ -30,6 +30,7 @@ import { ChatSystemCapacity } from "@/components/learning/chat-system-capacity";
 import { AuthenticationCapacity } from "@/components/learning/authentication-capacity";
 import { TlsCapacity } from "@/components/learning/tls-capacity";
 import { AuthorizationCapacity } from "@/components/learning/authorization-capacity";
+import { PasswordHashingCapacity } from "@/components/learning/password-hashing-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -199,6 +200,7 @@ const teachingComponents = {
   AuthenticationCapacity,
   TlsCapacity,
   AuthorizationCapacity,
+  PasswordHashingCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
