@@ -36,6 +36,7 @@ import { OwaspRiskCapacity } from "@/components/learning/owasp-top-10-capacity";
 import { ApiSecurityCapacity } from "@/components/learning/api-security-capacity";
 import { SessionCapacity } from "@/components/learning/session-management-capacity";
 import { SecureSdlcCapacity } from "@/components/learning/secure-sdlc-capacity";
+import { LeaderboardCapacity } from "@/components/learning/leaderboard-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -217,6 +218,7 @@ const teachingComponents = {
   ApiSecurityCapacity,
   SessionCapacity,
   SecureSdlcCapacity,
+  LeaderboardCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
