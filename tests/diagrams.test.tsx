@@ -582,6 +582,10 @@ import {
   EnvelopeEncryptSequence,
   EnvelopeDecryptSequence,
 } from "@/components/diagrams/encryption-key-management-flows";
+import {
+  InjectionAttackSequence,
+  SsrfAttackSequence,
+} from "@/components/diagrams/owasp-top-10-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -652,5 +656,23 @@ describe("Envelope encryption flow diagrams", () => {
       screen.getByRole("img", { name: /decrypting data with envelope encryption/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/consulted per data key, not per object/i)).toBeInTheDocument();
+  });
+});
+
+describe("OWASP attack flow diagrams", () => {
+  it("exposes the SQL injection attack to non-visual readers", () => {
+    render(<InjectionAttackSequence />);
+    expect(
+      screen.getByRole("img", { name: /a SQL injection attack/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/sends the query and the values on separate channels/i)).toBeInTheDocument();
+  });
+
+  it("exposes the SSRF attack to non-visual readers", () => {
+    render(<SsrfAttackSequence />);
+    expect(
+      screen.getByRole("img", { name: /a server-side request forgery attack/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/allow only an explicit list of permitted destinations/i)).toBeInTheDocument();
   });
 });
