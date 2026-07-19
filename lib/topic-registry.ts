@@ -112,6 +112,27 @@ export const topicMetas: Record<string, TopicMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "owasp-top-10": {
+    slug: "owasp-top-10",
+    categorySlug: "security",
+    title: "OWASP Top 10",
+    description:
+      "The industry-standard awareness list of the most critical web-application security risks — what the 2021 list is and how to use it, the top three (broken access control, cryptographic failures, injection) in depth, a defense-in-depth capacity model, the remaining risks including SSRF, and the cross-cutting defenses that tie the Security topics together.",
+    readingMinutes: 24,
+    concepts: ["Broken access control", "Injection", "Cryptographic failures", "SSRF", "Defense in depth"],
+    sections: [
+      { id: "overview", label: "What the OWASP Top 10 Is", depth: "fundamentals" },
+      { id: "the-list", label: "The 2021 Top 10 at a Glance", depth: "fundamentals" },
+      { id: "broken-access-control", label: "A01: Broken Access Control", depth: "interview-ready" },
+      { id: "cryptographic-failures", label: "A02: Cryptographic Failures", depth: "interview-ready" },
+      { id: "injection", label: "A03: Injection", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity: Defense in Depth by the Numbers", depth: "interview-ready" },
+      { id: "design-config-components", label: "A04–A06: Design, Configuration & Components", depth: "advanced" },
+      { id: "remaining-risks", label: "A07–A10: Auth, Integrity, Logging & SSRF", depth: "interview-ready" },
+      { id: "pitfalls-best-practices", label: "Cross-Cutting Defenses & Best Practices", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTopic(slug: string): TopicMeta | undefined {

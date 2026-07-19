@@ -9,6 +9,7 @@ import TlsContent from "@/content/topics/tls-https-certificates.mdx";
 import AuthorizationContent from "@/content/topics/authorization.mdx";
 import PasswordHashingContent from "@/content/topics/password-hashing.mdx";
 import EncryptionContent from "@/content/topics/encryption-key-management.mdx";
+import OwaspTop10Content from "@/content/topics/owasp-top-10.mdx";
 
 /** Maps each registered topic slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -17,6 +18,7 @@ const content: Record<string, ComponentType> = {
   authorization: AuthorizationContent,
   "password-hashing": PasswordHashingContent,
   "encryption-key-management": EncryptionContent,
+  "owasp-top-10": OwaspTop10Content,
 };
 
 export function generateStaticParams() {
