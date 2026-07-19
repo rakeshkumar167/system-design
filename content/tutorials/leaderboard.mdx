@@ -1,71 +1,380 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-Placeholder.
+A leaderboard ranks players (or posts, or drivers, or songs) by a score and shows who's on top. Every game, fitness app, trading platform, and social feed has one. From the outside it's the most familiar query in computing: `SELECT player, score FROM scores ORDER BY score DESC LIMIT 10`. Point that at a thousand players and you're done. Point it at fifty million players whose scores change thousands of times a second, and it falls apart in two distinct ways — the sort becomes a repeated full scan, and, worse, the moment someone asks *"what's **my** rank?"* you're computing `COUNT(*) WHERE score > mine` over the entire table on every request.
+
+The hard part is **maintaining a live ranking at scale that answers two different questions cheaply**: the **top-K** (the leaders — one shared, cacheable answer) and an **arbitrary player's exact rank** (a personal answer, different for every one of millions of users, e.g. "you're #4,271,908 of 50 million"). A batch `ORDER BY` is fine for the first and catastrophic for the second, because rank is a *global* property — it depends on everyone else's score — so a naive rank lookup scans or counts the whole dataset. The reframe to lead with: *it looks like `ORDER BY score DESC`, but sorting isn't the problem — the problem is keeping a ranking continuously up to date under a firehose of score changes while answering both "who are the leaders" and "where does this specific player stand" in milliseconds. The move is to hold the ranking in a **sorted set** (a skip list, as in a Redis ZSET) that stays ordered incrementally — giving O(log N) updates, O(log N) rank lookups, and O(log N + K) top-K reads — and then to solve what that data structure makes hard: global rank across shards, time-windowed boards, and durability behind an in-memory index.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What are we ranking, and is the score **absolute** (set to a value) or **incremental** (add points as they're earned)? It changes the write API (`ZADD` vs `ZINCRBY`).
+- Do we need only the **top-K**, or also an **individual player's rank** and the players **around** them? The second is what forces a sorted set over a cached top list.
+- How many players and how often do scores change? This sizes the write load and whether one node suffices.
+- **Time windows** — all-time only, or daily / weekly / per-season boards? Windows multiply the write and storage story.
+- How **fresh** and how **exact** must rank be? A rank that's approximate or a second stale is usually fine — a crucial relaxation at scale.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "sorting is easy, live ranking with per-player rank is the problem" reframe · **5 min** requirements (latency, write/read scale, freshness, exact vs approximate rank) · **5 min** capacity (the board fits in RAM; it's throughput-bound, read-heavy) · **5 min** entity model and the API (submit, top-K, rank) · **8 min** the sorted set — the centerpiece — with ZINCRBY / ZREVRANGE / ZREVRANK and their O(log N) costs · **8 min** scaling: sharding, approximate global rank, and time windows · **5 min** persistence/source-of-truth, failure modes, wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for a sorted set and know why per-player rank is the hard query, not whether you can write `ORDER BY`.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the sorted set and its operations, the read and write paths, top-K and per-player rank (with neighbors), sharding and **approximate global rank**, **time-windowed** boards, a durable **source of truth** behind the in-memory index, plus scaling, failure modes, and trade-offs. **Out of scope:** the game or app that *produces* the scores and its anti-cheat/validation (we assume scores arrive already validated — a manipulated score is an upstream concern), the social graph for friends-only boards beyond noting it as a filtered view, and the analytics warehouse that mines historical scores. This problem reuses intuition from earlier tutorials — the in-memory-index-plus-durable-store shape echoes the **Distributed Cache**, the write firehose resembles **Distributed Logging**, and the approximate-rank trade rhymes with sketch-based counting — but centers them on *ranking*.
 
 <h2 id="requirements">Requirements</h2>
 
-Placeholder.
+Separate what the system must *do* from how *well* it must do it. The functional list is short; the difficulty lives in the non-functional column — latency, scale, and the tension between exact and approximate rank.
+
+<RequirementsTable
+  functional={[
+    "Submit or increment a player's score",
+    "Return the top-K players by score",
+    "Return a specific player's current rank",
+    "Return the players immediately above and below a player",
+    "Support time-windowed boards (daily / weekly / all-time)",
+    "Reflect score changes in the ranking in near real time",
+  ]}
+  nonFunctional={[
+    { goal: "Latency", target: "reads and writes in tens of ms" },
+    { goal: "Write scale", target: "tens of thousands of score updates/sec" },
+    { goal: "Read scale", target: "read-heavy — top-K + rank views dominate" },
+    { goal: "Freshness", target: "updates visible within ~a second" },
+    { goal: "Rank accuracy", target: "exact when cheap; approximate at scale is OK" },
+    { goal: "Durability", target: "scores survive an index-node loss" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **both query shapes must be fast**: the top-K is one shared answer (easy to cache), but a **per-player rank** is different for every user and can't be precomputed for all of them — so the data structure itself must answer "how many players outrank X" in O(log N), which is exactly what a sorted set does and a plain list or a cached top-10 does not. Second, **the load is real-time and read-heavy**: scores stream in continuously (so the ranking must update incrementally, not rebuild), and rank/top-K views vastly outnumber updates, so reads must be cheap and cacheable. Third, and most liberating, **rank can usually be approximate**: telling a player they're "#4,271,908" versus "#4,271,950" out of 50 million is indistinguishable to them, and this single relaxation is what makes **sharded** leaderboards tractable — exact global rank across shards is expensive, approximate is cheap. Note what's **relaxed**: the ranking is **eventually consistent** (a score appearing a second late is fine), and exact global rank is sacrificed at scale. The system trades perfect, instantaneous, exact global rank for fast incremental updates and cheap top-K and per-player rank.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-Placeholder.
+Estimates here deliver a surprising and clarifying result: the data is **tiny**, so this is not a storage problem — it's a **throughput** problem, and the throughput is dominated by reads.
+
+<LeaderboardCapacity
+  assumptions={{
+    players: 50000000,
+    bytesPerEntry: 100,
+    scoreUpdatesPerDay: 5000000000,
+    readsPerUpdate: 10,
+    opsPerNode: 100000,
+  }}
+/>
+
+The takeaways. First — the clarifying one — **the whole ranked set fits in memory**: 50 million players at ~100 bytes each (member id, score, and skip-list pointers) is only ~**5 GB**, small enough to live comfortably in the RAM of a single node. Storage is *never* the binding constraint for a leaderboard; that's why an in-memory sorted set is the natural home, not a disk-based database. Second, **it's throughput-bound and read-heavy**: ~5 billion score updates a day is ~**57,870 writes/sec**, and with ~10 rank/top-K views per update the read load is ~**578,704/sec** — roughly **10× the writes** — for ~**636,574 ops/sec** total. Because every sorted-set operation is **O(log N)** (a few dozen pointer hops even at 50M entries), a single node sustains ~100k ops/sec, so ~**7 nodes** of a replicated in-memory set carry the entire load. Third, and the design consequence: since the data is small and reads dominate, you **scale reads by replicating** the set and **cache the hot top-K** — and the genuinely hard problems that remain are **hot boards** (one viral leaderboard exceeding a node's write throughput), **cross-shard global rank**, and **time-window fan-out**, none of which is about raw storage. The capacity story: a leaderboard is easy to *store* and hard to *serve fast under a stream of updates* — plan for throughput, not terabytes.
 
 <h2 id="entity-model">Entity Model</h2>
 
-Placeholder.
+The model is deliberately small. The heart of it is the **ScoreEntry** — a player's identity paired with their current score — and the key idea is that the **sorted set is a derived, in-memory read structure** materialized from those entries, while the durable record of every score lives in a separate store.
+
+<EntityModel
+  name="ScoreEntry"
+  description="One player's standing on one leaderboard: the player identifier (the sorted-set member), their current score (the sort key), and the metadata needed to display and window them. The set of ScoreEntries for a board is materialized into a sorted set keyed by score; the durable history of score changes lives in the source-of-truth store, from which the sorted set can be rebuilt."
+  fields={[
+    { name: "player_id", type: "string", notes: "the sorted-set member — unique per player" },
+    { name: "score", type: "int/float", notes: "the ranking key; higher (or lower) sorts first" },
+    { name: "board_id", type: "string", notes: "which leaderboard/window, e.g. board:global or board:daily:2026-07-20" },
+    { name: "display_name", type: "string", notes: "shown in the board; hydrated separately, not the sort key" },
+    { name: "updated_at", type: "datetime", notes: "when the score last changed — for tie-breaking and freshness" },
+  ]}
+  keys="A ScoreEntry is keyed by (board_id, player_id) and sorted by score. In the sorted set, player_id is the member and score is the score — so ZADD/ZINCRBY update in O(log N), ZREVRANGE reads the top-K in O(log N + K), and ZREVRANK returns a player's rank in O(log N). Ties (equal scores) are broken deterministically — commonly by encoding a timestamp into the score's low bits or by lexicographic member order — so ranks are stable. The source of truth is a durable ScoreEvent log/table: each submitted or incremented score is written there durably, and the sorted set is a derived index rebuilt from it after a failure. Player profile data (display name, avatar) lives in a separate store and is hydrated onto the top-K/neighbor results at read time, keeping the sorted set's entries small so the whole board fits in RAM."
+/>
+
+Two supporting ideas complete the picture. The **ScoreEvent** is the durable atom: one submitted or incremented score (`player_id`, `board_id`, value, timestamp), appended to the source-of-truth store — this is what makes a Redis loss survivable, since the sorted set can be replayed from it. And **player profile data** (display name, avatar, country) is kept *out* of the sorted set and joined onto the ~10 results a query actually returns, so the ranked structure stays as small as possible (member + score only) and therefore stays in RAM. The discipline: the sorted set is a **derived, rebuildable, read-optimized index** holding just identity and score; the durable **source of truth** is the append-only ScoreEvent record; and display data is **hydrated at read time**, never stored in the hot ranking structure.
 
 <h2 id="api-design">API Design</h2>
 
-Placeholder.
+The surface is three endpoints: a write to submit a score, and two reads — the top-K and a player's rank. The reads dominate traffic and are the ones that must be trivially fast and cacheable.
+
+<ApiContract
+  method="POST"
+  path="/scores"
+  summary="Submit or increment a player's score on a board."
+  request={`POST /scores
+{ "board_id": "global", "player_id": "p_8842", "delta": 150 }`}
+  response={`HTTP/1.1 202 Accepted
+{ "player_id": "p_8842", "score": 12450 }`}
+  statusCodes={[
+    { code: "202", meaning: "Score updated in the sorted set; durably recorded asynchronously" },
+    { code: "400", meaning: "Missing board/player or invalid score" },
+  ]}
+  notes="Use delta for incremental scoring (ZINCRBY) or an absolute value for set-to (ZADD, typically keep-if-higher for high-score semantics). The write updates the in-memory sorted set synchronously (O(log N)) and emits an event so the durable store records it off the hot path. Assumed already validated upstream — anti-cheat is out of scope."
+/>
+
+<ApiContract
+  method="GET"
+  path="/leaderboard/top"
+  summary="Return the top-K players on a board."
+  request={`GET /leaderboard/top?board_id=global&limit=10`}
+  response={`HTTP/1.1 200 OK
+Cache-Control: public, max-age=1
+{ "board_id": "global", "top": [
+  { "rank": 1, "player_id": "p_17", "name": "Ada",  "score": 998200 },
+  { "rank": 2, "player_id": "p_92", "name": "Lin",  "score": 991050 } ] }`}
+  statusCodes={[
+    { code: "200", meaning: "Returns the top-K by score (ZREVRANGE), profile-hydrated" },
+    { code: "400", meaning: "Unknown board or oversized limit" },
+  ]}
+  notes="The hottest read and one shared answer for all users, so it's briefly cacheable (max-age ~1s). A ZREVRANGE 0..K-1 over the sorted set — O(log N + K) — with display names hydrated from the profile store onto the K results."
+/>
+
+<ApiContract
+  method="GET"
+  path="/leaderboard/rank/{player_id}"
+  summary="Return a player's rank and the players around them."
+  request={`GET /leaderboard/rank/p_8842?board_id=global&window=2`}
+  response={`HTTP/1.1 200 OK
+{ "player_id": "p_8842", "rank": 4271908, "score": 12450,
+  "neighbors": [
+    { "rank": 4271907, "player_id": "p_5501", "score": 12451 },
+    { "rank": 4271909, "player_id": "p_9930", "score": 12449 } ] }`}
+  statusCodes={[
+    { code: "200", meaning: "Rank via ZREVRANK (O(log N)); neighbors via a range read around it" },
+    { code: "404", meaning: "Player not on this board" },
+  ]}
+  notes="The query a plain ORDER BY can't serve cheaply: a per-user answer for any of millions of players. ZREVRANK gives the exact rank directly; a ZREVRANGE around that rank returns neighbors. On a sharded board this rank may be approximate (see Sharding & Approximate Rank)."
+/>
+
+The whole surface is: submit a score (the write), read the top-K (the shared hot read), and read a player's rank with neighbors (the per-user read). There's no batch job in the request path — ranking is maintained incrementally by the sorted set on every write, so reads never compute anything, they just read the already-ordered structure.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-Placeholder.
+The architecture is an **in-memory sorted set** doing the ranking, a **cache** absorbing the hottest reads, and a **durable store** behind it as the source of truth — with an async path keeping the two in sync.
+
+<LeaderboardArchitecture />
+
+- **Game Client.** Submits scores as they're earned and requests the top-K and the player's own rank.
+- **Leaderboard Service.** Stateless; translates API calls into sorted-set operations (`ZINCRBY`, `ZREVRANGE`, `ZREVRANK`) and hydrates results with profile data.
+- **Top-K Cache.** Fronts the service for the global top-K — one shared answer, so a ~1s cache absorbs the bulk of read traffic.
+- **Sorted Set.** The ranked structure held **in memory** (a Redis ZSET / skip list). Small (~5 GB), replicated for read scale, and the thing that makes updates and rank queries O(log N).
+- **Score Stream.** The async channel carrying every score change from the service toward durable storage.
+- **Score DB.** The **durable source of truth** — every score event recorded so the sorted set can be rebuilt after a loss.
+
+The decisive boundary is that **the sorted set serves live ranking from memory while the database durably records the truth asynchronously** — the fast index and the durable log are deliberately separated, and the sorted set is treated as a rebuildable derived structure, not the system of record. Every section that follows elaborates one piece: how the sorted set works, how updates and the two read shapes map to O(log N) operations, how sharding and approximate rank scale it, how time windows are keyed, and how the durable store makes the in-memory index recoverable.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-Placeholder.
+Four flows cover the system: the write path, the two read shapes, and the cross-shard rank computation that scaling forces.
+
+**Submit a score update.** The client submits a score; the service applies it to the sorted set with an O(log N) `ZINCRBY` and emits an event that is durably persisted to the database off the hot path, then acknowledges the client. The in-memory index updates synchronously; durability is asynchronous.
+
+<SubmitScoreSequence />
+
+**Read the top-K.** The client asks for the leaders; the service checks the top-K cache and, on a miss, reads `ZREVRANGE 0 K-1` from the sorted set, populates the cache, and returns. Because the top-K is one shared answer, the cache absorbs most of this traffic.
+
+<TopKQuerySequence />
+
+**Look up a player's rank and neighbors.** The client asks where a specific player stands; the service calls `ZREVRANK` for the exact rank in O(log N), then a range read around that position for the neighbors, and returns "you're #N" with the surrounding players. This is the per-user query a sorted set answers directly and a scan cannot.
+
+<PlayerRankSequence />
+
+**Compute a global rank across shards.** When the board is sharded, top-K merges each shard's local top list, but exact global rank requires counting how many players outscore you on *every* shard; the coordinator fans out a `ZCOUNT` above the player's score to each shard and sums them — and in practice approximates from precomputed histograms because doing it exactly per request is costly.
+
+<ShardedRankSequence />
 
 <h2 id="sorted-sets">Sorted Sets: The Core Data Structure</h2>
 
-Placeholder.
+The sorted set is the whole design, and understanding *why* it's the right structure is the centerpiece of a strong answer. A **sorted set** stores unique members each associated with a **score**, and keeps them **continuously ordered by that score**. The canonical implementation — Redis's ZSET — is a **skip list** (plus a hash map from member to score). A skip list is a linked list with multiple express lanes: probabilistically, each node appears in higher levels less often, so you can "skip" over large stretches and locate any position in **O(log N)** expected time, while still supporting ordered traversal. The companion hash map gives O(1) "what's this member's score" lookups.
+
+That structure is exactly matched to the four things a leaderboard does, and every one is **O(log N)** or better:
+
+- **`ZADD` / `ZINCRBY`** — set or increment a member's score, re-positioning it in the order: **O(log N)**.
+- **`ZREVRANGE start stop`** — read a contiguous slice by rank, e.g. the top 10: **O(log N + K)** for K results.
+- **`ZREVRANK member`** — the killer feature: return a member's **rank** (its position in the order) directly: **O(log N)**.
+- **`ZSCORE member`** — a member's score: **O(1)** via the hash map.
+
+Contrast the alternatives. A **SQL table** with `ORDER BY score` needs an index to avoid a full sort, but computing an arbitrary row's *rank* still means `COUNT(*) WHERE score > x` — an index range scan that's O(rank), potentially tens of millions of rows, per query. A plain **sorted array** gives O(log N) rank via binary search but **O(N)** inserts (shifting elements) — hopeless under a write stream. A **heap** gives you the top element cheaply but not arbitrary rank or ordered ranges. The skip list is the one structure that makes *all four* operations logarithmic simultaneously, which is why "use a sorted set / Redis ZSET" is the expected core of the answer. The principle: a leaderboard needs incremental ordered updates **and** arbitrary-position rank queries at once, and a skip-list-backed sorted set is the data structure that delivers both in O(log N) — turning "recompute the ranking" into "read the already-maintained order."
+
+<KnowledgeCheck
+  question="Why is a sorted set (skip list) the right structure for a leaderboard rather than a SQL ORDER BY or a sorted array?"
+  options={[
+    "Because sorted sets compress the data to fit more players in memory",
+    "Because a leaderboard needs both incremental ordered updates and arbitrary-position rank queries, and a skip-list-backed sorted set makes all of them O(log N): ZADD/ZINCRBY to update, ZREVRANGE for the top-K (O(log N + K)), and — crucially — ZREVRANK to get any member's rank directly. A SQL table can sort but computing an arbitrary row's rank is a COUNT/scan of O(rank) rows per query, and a sorted array gives O(log N) rank but O(N) inserts under a write stream",
+    "Because a sorted array can't store scores, only members",
+    "Because SQL databases cannot return the top 10 rows",
+  ]}
+  answer={1}
+  explanation="The defining requirement is maintaining a live order under constant updates while answering an arbitrary member's rank cheaply. A skip list does both: logarithmic updates keep the order current, and ZREVRANK returns a position directly in O(log N) rather than counting how many rows outrank a player. SQL can do the top-K well but per-player rank degrades to an O(rank) count/scan; a sorted array has O(N) inserts. Only the sorted set makes update, range, and rank all logarithmic at once — it's about operation complexity, not compression or a SQL limitation on LIMIT."
+/>
 
 <h2 id="score-updates">Real-Time Score Updates</h2>
 
-Placeholder.
+The write path is a single sorted-set operation, but the details matter. The choice between **`ZADD` (set)** and **`ZINCRBY` (increment)** follows the scoring model: incremental games ("+150 points") use `ZINCRBY`, which atomically adds to the current score and re-orders the member in one O(log N) step; "record the best result" boards use a **conditional set** (update only if the new score is higher — `ZADD GT`), so a worse later attempt doesn't lower a high score. Atomicity matters: `ZINCRBY` is a single atomic operation, so concurrent increments to the same player don't lose updates the way a read-modify-write would.
+
+Two scaling concerns ride on the write path. The first is the **hot key / hot board** problem: a single wildly popular leaderboard (a global board, or one player being hammered with updates) concentrates writes on one node, and a sorted set for one board lives on one node — so that board's write throughput is capped by that node. Mitigations: **shard the board** (next section) so writes spread across nodes, **batch/coalesce** rapid updates to the same player in a short window before applying, or absorb bursts through the **score stream** and apply them asynchronously. The second is the **durability timing**: the write updates the in-memory set first for a fast response, then records to the durable store. **Write-behind** (ack after the in-memory update, persist asynchronously) is fast but risks losing the last few updates if a node dies before they're persisted; **write-through** (persist before ack) is safe but slower. Leaderboards usually accept write-behind because a lost score is quickly re-earned and eventual re-sync corrects it — but a *money* leaderboard (a trading contest) would choose write-through. The principle: apply updates as **single atomic sorted-set operations** (increment or conditional-set), and consciously choose the **durability point** (write-behind for speed, write-through for safety) while planning for **hot boards** via sharding, batching, or stream-buffered application.
+
+<KnowledgeCheck
+  question="Why use ZINCRBY for incremental scoring, and what is the hot-board problem?"
+  options={[
+    "ZINCRBY is faster than ZADD because it skips the sort; there is no hot-board problem",
+    "ZINCRBY atomically adds to a player's score and re-orders them in one O(log N) operation, so concurrent increments don't lose updates the way a read-modify-write (read score, add, write back) would. The hot-board problem is that a single very popular board's sorted set lives on one node, so its write throughput is capped by that node — mitigated by sharding the board across nodes, coalescing rapid updates, or buffering bursts through the score stream and applying them asynchronously",
+    "ZINCRBY stores scores durably, so no database is needed; hot boards are a caching issue",
+    "ZINCRBY is only for decrementing scores; the hot-board problem is about read caching",
+  ]}
+  answer={1}
+  explanation="ZINCRBY is chosen for atomicity, not raw speed: it folds the read-add-write into one atomic step so simultaneous increments to the same player both count, avoiding lost updates. Separately, because one board's sorted set is single-homed, a viral board concentrates writes on one node and hits its throughput ceiling — the hot-key problem. You spread it by sharding the board, coalescing bursts of updates to the same member, or ingesting through the stream and applying asynchronously. ZINCRBY isn't durable on its own, which is why the durable store still records every change."
+/>
 
 <h2 id="rank-queries">Top-K & Rank Queries</h2>
 
-Placeholder.
+The two reads look similar but have very different characteristics, and treating them differently is what keeps the system fast. The **top-K** is `ZREVRANGE 0 K-1` — read the K highest-scoring members in order, O(log N + K). Its defining property is that it's the **same answer for everyone**, so it's aggressively **cacheable**: a 1-second cache on the global top-10 collapses a flood of identical reads into one sorted-set operation per second per replica. The top-K is the easy read.
+
+The **per-player rank** is the interesting one, because it's a **different answer for every user** and therefore *not* cacheable across users. This is where the sorted set earns its place: `ZREVRANK player` returns that player's exact position — "you are #4,271,908" — directly in O(log N), with no scan and no per-user precomputation. To show the player in context (the "you're here" strip with players just above and below), a `ZREVRANGE` around the returned rank fetches the neighbors. Both operations are logarithmic, so even a rank query for the 40-millionth player is a few dozen pointer hops. The subtlety at scale is that on a **single** sorted set the rank is **exact and trivial**; the difficulty only appears once the board is **sharded** across nodes, where no single node knows the global position — the next section's problem. The principle: serve the shared **top-K from a short-lived cache** over a range read, and serve **per-player rank directly from the sorted set** with `ZREVRANK` plus a neighbor range — the per-player rank being precisely the query that justifies a sorted set over a cached top list, since it can't be precomputed for millions of distinct users.
+
+<KnowledgeCheck
+  question="Why is the top-K cacheable but a per-player rank is not, and how is each served?"
+  options={[
+    "Both are cached identically; rank is just a slower top-K",
+    "The top-K is the same answer for every user, so a short-lived cache over a ZREVRANGE 0..K-1 absorbs most of that traffic. A per-player rank is a different answer for each of millions of users, so it can't be shared across users — but a sorted set answers it directly with ZREVRANK in O(log N) (no scan), plus a ZREVRANGE around that rank for the neighbor strip. The per-player rank is exactly the query that justifies a sorted set over a cached top list",
+    "Rank queries are cacheable but top-K is not, because top-K changes more often",
+    "Neither is cacheable, so both must scan the whole dataset per request",
+  ]}
+  answer={1}
+  explanation="Cacheability follows from whether the answer is shared. The global top-K is identical for all users, so a ~1s cache turns a read storm into one range read per replica per second. A player's rank is personal — unique per user — so cross-user caching doesn't help; instead the sorted set returns it directly via ZREVRANK in O(log N), and a small range read supplies neighbors. That direct arbitrary-position lookup, impossible to precompute for millions of users and costly to scan in SQL, is the whole reason a sorted set is used."
+/>
 
 <h2 id="sharding-scale">Sharding & Approximate Rank</h2>
 
-Placeholder.
+One sorted set on one node handles a remarkable amount — millions of players, hundreds of thousands of ops/sec — but eventually a board outgrows a single node's memory or, more often, its **write throughput** (the hot-board ceiling). Then you **shard**: partition the players across N sorted sets on N nodes, typically by hashing `player_id`. Sharding fixes write and memory scaling, but it **breaks the two reads in different ways**, and articulating that asymmetry is the mark of a strong answer.
+
+**Top-K survives sharding cheaply.** The global top-K is the merge of each shard's *local* top-K: ask every shard for its top K (each an O(log N + K) read), then merge the N small lists and take the overall top K. With N shards and small K that's trivial, so leaders are still fast.
+
+**Exact global rank does not.** A player's global rank is "how many players, across *all* shards, outscore them" — but each shard only knows its own members, and the player lives on just one shard. Computing it exactly means fan-out: send the player's score S to **every** shard, have each return `ZCOUNT (S, +inf)` (how many of its members beat S), and sum the counts plus one. That's correct but costs a scatter-gather to every shard on every rank query — expensive at scale and getting worse as shards grow. So production systems **approximate**: maintain a coarse **score-bucket histogram** per shard (counts of players in score ranges, cheap to keep and periodically refreshed), and estimate a rank by summing the histogram buckets above the player's score across shards — an O(buckets) lookup, no per-query fan-out. Since a rank of "#4,271,908" versus "#4,271,950" is meaningless to the user, this approximation is essentially free accuracy-wise and hugely cheaper. The principle: **shard by player to scale writes and memory**, accept that **top-K merges cheaply** while **exact cross-shard rank requires a costly fan-out count**, and lean on the requirement that **rank may be approximate** — using per-shard score histograms to estimate global rank without scatter-gather.
+
+<KnowledgeCheck
+  question="After sharding a leaderboard by player, why does top-K stay cheap while exact global rank becomes expensive — and what's the fix?"
+  options={[
+    "Both become cheap; sharding has no downside for rank",
+    "Top-K is just the merge of each shard's local top-K — a few small range reads merged — so leaders stay fast. But a player's global rank means counting how many players outscore them across ALL shards, and each shard only knows its own members, so exact rank requires fanning out a ZCOUNT above the score to every shard and summing (a scatter-gather per query). The fix leans on rank being allowed to be approximate: keep per-shard score-bucket histograms and estimate the rank by summing buckets above the score, avoiding per-query fan-out",
+    "Top-K becomes expensive and rank becomes cheap after sharding",
+    "Sharding stores each player on every shard, so rank is a single local lookup",
+  ]}
+  answer={1}
+  explanation="Sharding splits players across nodes, so top-K only needs each shard's local top merged — cheap. Global rank, however, is inherently cross-shard: it counts everyone who outscores the player, but no single shard has the full picture, so an exact answer requires querying every shard (ZCOUNT above the score) and summing — a scatter-gather that scales poorly. Because users can't tell an approximate rank from an exact one at these magnitudes, systems precompute per-shard score histograms and sum buckets above the player's score to estimate rank without any per-request fan-out."
+/>
 
 <h2 id="time-windows">Time-Windowed Leaderboards</h2>
 
-Placeholder.
+Real products rarely want only an all-time board; they want **daily**, **weekly**, **monthly**, and **seasonal** boards ("today's top players", "this week's leaders"). The clean model is **one sorted set per window**, keyed by the period: `board:daily:2026-07-20`, `board:weekly:2026-W29`, `board:global`. A score submission then **fans out** to the currently-active windows — a single "+150" writes to the daily, weekly, and all-time sets — so each window maintains its own independent ranking, and a query just targets the relevant key.
+
+Two consequences follow. First, **write amplification**: with W active windows, each score update becomes W sorted-set writes. This is usually fine (W is small — daily, weekly, all-time), but it's the cost to name, and it's why you don't create windows you won't query. Second, **expiry**: past daily boards mostly stop being interesting, so window sets are given a **TTL** and expire automatically (yesterday's daily board evaporates after a retention period), or are archived to the durable store and dropped from memory — which keeps total memory bounded even though windows multiply the number of sets. **Rolling windows** ("last 24 hours" rather than "calendar today") are harder: a true sliding window means old scores must *leave* the set as they age, which a plain sorted set doesn't do on its own — so they're approximated with fine-grained buckets (e.g. per-hour sets summed over the last 24) or handled with a time-decayed score. The principle: model each time window as its **own keyed sorted set** with a **TTL**, **fan out** each score to the active windows (accepting bounded write amplification), and approximate true rolling windows with bucketed sub-periods rather than trying to age individual entries out of one set.
 
 <h2 id="persistence-truth">Persistence & the Source of Truth</h2>
 
-Placeholder.
+An in-memory sorted set is fast but **volatile** — a node restart or crash can lose it — so the design must be explicit that **the sorted set is an index, not the system of record**. Every score change is durably written to a **source-of-truth store** (a database or an append-only log of ScoreEvents), and the sorted set is treated as a **derived structure that can be rebuilt** from that record. This is the same discipline as a search index or a cache in front of a database: the fast structure is disposable, the durable log is authoritative.
+
+That makes recovery conceptually simple: if a sorted-set node is lost, **replay the scores from the durable store** to reconstruct the ranking (load current scores per player and `ZADD` them back), or fail over to a **replica**. Redis-style systems also offer their own persistence (snapshots and append-only files) that speed recovery by reloading a recent state rather than replaying from scratch — but the external source of truth remains the backstop, because you never want the *ranking* store to also be the *only* copy of the scores. The tension is the familiar one from the write-path section: **write-behind** persistence keeps writes fast but risks losing the last few unpersisted updates on a crash (acceptable when a lost point is quickly re-earned), while **write-through** guarantees durability at higher write latency (for stakes where a lost score matters). The principle: treat the sorted set as a **rebuildable derived index** and keep an independent **durable source of truth** for scores, so a node loss is recovered by **replaying or failing over** rather than by data loss — choosing the persistence timing to match how costly a lost update is.
+
+<KnowledgeCheck
+  question="Why is the sorted set treated as a derived index with a separate durable source of truth?"
+  options={[
+    "Because sorted sets can't store numbers durably at all",
+    "Because an in-memory sorted set is volatile — a crash or restart can lose it — so it must not be the only copy of the scores. Every score change is durably recorded to a source-of-truth store (a database or append-only ScoreEvent log), and the sorted set is a rebuildable index: after a node loss you replay scores from the durable store or fail over to a replica. Write-behind persistence keeps writes fast (risking the last few updates) while write-through trades latency for guaranteed durability",
+    "Because the database ranks faster than the sorted set, which is just a cache of the top 10",
+    "Because the source of truth computes ranks and the sorted set only stores names",
+  ]}
+  answer={1}
+  explanation="The sorted set lives in memory for speed but is volatile, so making it the sole store of scores would risk losing them on a crash. The design keeps an independent durable record of every score and treats the sorted set as a derived, rebuildable index — recovered by replay or replica failover, optionally sped up by the store's own snapshot/AOF persistence. The durability timing (write-behind vs write-through) is chosen by how much a lost update costs. The database isn't doing the ranking, and the sorted set holds the full board, not just a top-10 cache."
+/>
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Placeholder.
+Don't build the sharded, histogram-approximated, multi-window system on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["SQL table + ORDER BY", "A small board, low update rate", "Full sort per top-K and an O(rank) COUNT for per-player rank — dies under updates and rank queries"],
+    ["Single in-memory sorted set", "Real-time updates; need per-player rank", "One node caps write throughput and holds the whole board; volatile without a durable backstop"],
+    ["Replicated sorted set + cache + durable store", "Read-heavy load; durability", "Replicas for read scale, a top-K cache, and async persistence to the source of truth"],
+    ["Sharded sets + approximate rank + time windows", "A board too hot/large for one node; windowed boards", "Shard by player; cross-shard top-K merge; histogram-approximated global rank; per-window fan-out"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the wall you're hitting. A **SQL `ORDER BY`** is fine for a small board but re-sorts per query and computes per-player rank with an O(rank) count — it collapses under both updates and rank lookups. A **single in-memory sorted set** is the pivotal move: real-time O(log N) updates and, crucially, O(log N) per-player rank — but one node caps write throughput and the set is volatile. The center of gravity for a real system is a **replicated sorted set with a top-K cache and a durable store behind it** — reads scale across replicas, the hot top-K is cached, and the durable log makes the in-memory index recoverable. Only genuine scale — a board too hot or too large for one node, or many time windows — needs **sharding with approximate cross-shard rank and per-window fan-out**, paying scatter-gather-or-approximate rank and write amplification for it. Most leaderboards live happily at "replicated sorted set, cache, durable store."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-Placeholder.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. The leaderboard's guiding rule: **the sorted set is a rebuildable index, so most failures degrade or recover rather than lose data — provided the durable source of truth is intact.**
+
+<FailureMatrix
+  rows={[
+    { failure: "Sorted-set node crashes", impact: "A board (or shard) unavailable", detection: "Health check / replica lag", mitigation: "Replica failover; the set is derived, not the source of truth", recovery: "Promote replica or rebuild from the durable store" },
+    { failure: "Durable store write lag", impact: "Recent scores not yet persisted", detection: "Stream/consumer backlog metric", mitigation: "Buffer events in the stream; serve from the in-memory set", recovery: "Backlog drains; persistence catches up" },
+    { failure: "Hot board exceeds node throughput", impact: "Write latency climbs on one board", detection: "Per-board QPS / latency monitors", mitigation: "Shard the board; coalesce updates; buffer via the stream", recovery: "Rebalance shards; autoscale" },
+    { failure: "Cache stampede on top-K", impact: "Read spike hits the sorted set", detection: "Cache hit-rate drop", mitigation: "Single-flight the top-K refresh; short TTL; serve stale", recovery: "Cache repopulates; one read per replica per interval" },
+    { failure: "Shard imbalance", impact: "One shard hotter than others", detection: "Per-shard load skew", mitigation: "Hash players evenly; split hot shards", recovery: "Resplit / rehash the affected shard" },
+    { failure: "Duplicate / out-of-order score event", impact: "Score double-counted or regressed", detection: "Event ids / version checks", mitigation: "Idempotent apply; conditional-set (keep-if-higher); monotonic versions", recovery: "Re-derive from the durable log if needed" },
+    { failure: "Rank appears slightly wrong", impact: "Approximate rank off by a little", detection: "Reconcile against exact periodically", mitigation: "Accept approximation; refresh histograms", recovery: "Next histogram rebuild tightens it" },
+  ]}
+/>
+
+The theme: **derive, don't depend; degrade, don't lose.** Because the sorted set is a derived index over a durable log, a crashed node is recovered by promoting a replica or replaying scores — no data loss as long as the source of truth holds. Persistence lag is ridden out on the in-memory set while the stream backlog drains. Hot boards and shard imbalance are throughput problems answered by sharding, coalescing, and rebalancing. The top-K cache is protected from stampedes by single-flighting its refresh and serving slightly stale results. Correctness hazards — duplicate or out-of-order score events — are contained by **idempotent, conditional, versioned application** so a replayed or late event can't double-count or lower a score, with the durable log as the ultimate arbiter. And the deliberately-accepted "failure," an approximate rank being slightly off, isn't really one: it's the design trade, corrected on the next histogram refresh. Because scores are durably logged and the ranking is rebuildable, recovery is almost always "fail over, replay, or rebalance."
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-Placeholder.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Maintain each leaderboard as an in-memory sorted set (a Redis ZSET / skip list) so updates (ZINCRBY), top-K reads (ZREVRANGE), and per-player rank (ZREVRANK) are all O(log N); front the shared top-K with a short-lived cache; record every score durably to a source-of-truth store via an async stream so the sorted set is a rebuildable derived index; replicate for read scale; and when a board outgrows one node, shard by player — merging per-shard top-K and approximating global rank from per-shard score histograms — while modeling time windows as separate keyed sorted sets with TTLs."
+  rationale="The hard part is a live ranking that answers both the shared top-K and an arbitrary player's rank cheaply under a stream of updates, and a skip-list sorted set makes all of update, range, and rank logarithmic — which SQL and arrays can't do simultaneously. The board is tiny (~5 GB), so it lives in RAM and the system is throughput-bound and read-heavy, met by replication plus a top-K cache. A durable store keeps the volatile index recoverable. Sharding scales writes/memory, and because rank may be approximate, histograms avoid per-query scatter-gather. Windows are independent sets so each has its own clean ranking."
+  alternatives="SQL ORDER BY + COUNT for rank — simple but a per-query sort and an O(rank) count, dying under updates and rank lookups. A cached top-K list only — serves leaders but can't answer an arbitrary player's rank, which is the defining query. A sorted array — O(log N) rank but O(N) inserts under a write stream. Exact cross-shard rank via fan-out on every query — correct but a scatter-gather per request that scales poorly, so histogram approximation is preferred. Making the sorted set the only store — fast but loses scores on a crash; a durable source of truth is required. One giant set for all windows — loses the clean per-window ranking that separate keyed sets give."
+  revisitWhen="A board's write rate or size exceeds a single node (shard it); exact rank becomes a product requirement (accept the fan-out cost or tighten histogram granularity); true rolling windows are needed (bucket sub-periods or time-decay scores); scores carry real stakes like money (switch write-behind to write-through); or friends/segment boards dominate (materialize filtered sub-boards rather than ranking the global set per query)."
+/>
+
+Four axes capture the real tension:
+
+- **Sorted set vs SQL.** The sorted set makes update, range, and rank all O(log N); SQL sorts per query and counts O(rank) rows for per-player rank. The sorted set wins decisively for live ranking.
+- **Exact vs approximate rank.** Exact cross-shard rank needs a per-query fan-out count; approximate rank from histograms is far cheaper and indistinguishable to users at scale. Approximate wins once sharded.
+- **Write-behind vs write-through.** Write-behind is fast but can lose the last few updates on a crash; write-through is durable but slower. Choose by how costly a lost score is.
+- **One set per window vs one set.** Per-window sets give clean independent rankings and easy TTL expiry at the cost of write fan-out; a single set can't express multiple windows. Per-window wins when you need windows.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-Placeholder.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A leaderboard looks like `ORDER BY score DESC`, but sorting isn't the hard part — keeping a live ranking under a stream of score changes is, and especially answering an arbitrary player's rank, which a naive design computes by counting everyone who outscores them. So the core is a sorted set — a Redis ZSET backed by a skip list — where updates with ZINCRBY, the top-K with ZREVRANGE, and a player's exact rank with ZREVRANK are all O(log N). The board is small — fifty million players is about five gigabytes — so it lives in memory; the system is throughput-bound and read-heavy, so I replicate the set for read scale and cache the shared top-K for about a second, while per-player rank is served directly from the set since it can't be cached across users. Every score is also written durably to a source-of-truth store through an async stream, so the sorted set is a rebuildable index, not the system of record — a crashed node fails over to a replica or replays from the log. When a board gets too hot or too big for one node, I shard by player: top-K just merges each shard's local top, but exact global rank would need a scatter-gather count across shards, so I approximate it from per-shard score histograms — which is fine because a rank of four-million-something is indistinguishable exact or approximate. Time windows like daily and weekly are separate keyed sorted sets with TTLs that each score fans out to. The one rule I keep: the sorted set is derived and rebuildable, and the durable log is the truth."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why a sorted set over SQL or an array? Why is per-player rank the hard query? How do you get the top-K cheaply and why cache it but not rank? What breaks when you shard, and how do you compute global rank then? How do time windows work? What's the source of truth and how do you recover the in-memory set?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="What does the capacity model reveal about where a leaderboard's difficulty lies?"
+  options={[
+    "The dataset is huge, so storage and disk I/O are the main challenge",
+    "That difficulty is about throughput, not storage: 50 million players is only ~5 GB, so the whole ranked set fits in RAM and storage is never the constraint. Because sorted-set ops are O(log N), a node sustains ~100k ops/sec, and with reads ~10× writes the system is read-heavy at ~636k ops/sec — carried by a handful of replicated in-memory nodes. The real hard problems are hot boards, cross-shard global rank, and time-window fan-out, none of which is about raw data volume",
+    "That the system needs petabytes of storage like a web crawler",
+    "That writes dominate reads, so it's a write-scaling problem",
+  ]}
+  answer={1}
+  explanation="The model shows the board is tiny (~5 GB, fits in memory) and every operation is logarithmic, so the constraint is operations per second — and reads (top-K and rank views) dominate writes ~10:1. That points to replication for read scale plus caching the shared top-K, not to storage engineering. The genuinely hard parts are throughput hotspots and the cross-shard rank computation, confirming a leaderboard is easy to store and hard to serve fast under a stream of updates."
+/>
+
+<KnowledgeCheck
+  question="If an in-memory sorted-set node crashes, why isn't the leaderboard data lost?"
+  options={[
+    "It is lost — leaderboards can't survive a crash",
+    "Because the sorted set is a derived, rebuildable index, not the system of record: every score change is durably written to a source-of-truth store (a database or append-only log). After a crash the ranking is restored by failing over to a replica or replaying scores from the durable store, optionally sped up by the store's own snapshot/AOF persistence. The durable log, kept independent of the volatile ranking structure, is what makes recovery lossless",
+    "Because sorted sets are automatically backed up to every client",
+    "Because the top-K cache holds a full copy of all players",
+  ]}
+  answer={1}
+  explanation="The design deliberately separates the fast, volatile ranking index from the durable record of scores. Since every score is persisted to an independent source of truth, a lost node is recovered by promoting a replica or replaying the durable log to rebuild the sorted set — no data loss. Redis-style snapshot/AOF persistence can accelerate this, but the external durable store is the backstop. The cache holds only the top-K, not the whole board, so it can't be the recovery source."
+/>
+
+<Faq
+  items={[
+    { question: "What is a leaderboard system, at its core?", answer: "It maintains a live ranking of players (or any entities) by a score and answers two queries fast: the top-K leaders and an individual player's rank (with the players around them). The interesting engineering isn't sorting — it's keeping the ranking continuously up to date under a stream of score changes and answering an arbitrary player's rank in milliseconds, which a batch ORDER BY can't do cheaply." },
+    { question: "Why not just use SQL ORDER BY score DESC?", answer: "It works for a small board, but at scale it re-sorts per top-K query and, worse, computes a per-player rank with COUNT(*) WHERE score > mine — an O(rank) index scan that can touch tens of millions of rows, per request. Under a stream of score updates plus many rank lookups, that collapses. A sorted set maintains the order incrementally and answers rank directly in O(log N)." },
+    { question: "What is a sorted set and why is it the right structure?", answer: "A sorted set stores unique members each with a score and keeps them ordered by score. Implemented as a skip list (as in Redis ZSET), it makes updates (ZADD/ZINCRBY), top-K reads (ZREVRANGE), and — crucially — a member's rank (ZREVRANK) all O(log N), with O(1) score lookups via a companion hash map. It's the one structure that makes incremental updates and arbitrary-position rank queries both logarithmic, which is exactly what a leaderboard needs." },
+    { question: "How do you get a specific player's rank efficiently?", answer: "With ZREVRANK, which returns a member's position in the sorted order directly in O(log N) — no scan and no per-user precomputation. To show the player in context, a ZREVRANGE around that rank fetches the neighbors just above and below. This per-player rank is the query that justifies a sorted set over a simple cached top-K list, because it's a different answer for every one of millions of users." },
+    { question: "Why is the top-K cacheable but per-player rank isn't?", answer: "The top-K is the same answer for everyone, so a short-lived cache (about a second) over a ZREVRANGE collapses a read storm into one operation per replica per interval. A player's rank is unique to that user, so caching it across users doesn't help — but the sorted set answers it directly with ZREVRANK in O(log N), so it doesn't need caching. Different query shapes, served differently." },
+    { question: "How big does the data get, and does it fit in memory?", answer: "Small. Fifty million players at roughly 100 bytes each (member id, score, skip-list pointers) is only about 5 GB — easily held in the RAM of one node. Storage is never the binding constraint for a leaderboard, which is why an in-memory sorted set is the natural home; the challenge is operations per second, and it's read-heavy, so you replicate for read scale and cache the top-K." },
+    { question: "What happens when a single board is too hot or too big for one node?", answer: "You shard it, usually by hashing the player id across N sorted sets on N nodes, which spreads write throughput and memory. Top-K stays cheap — merge each shard's local top-K — but exact global rank becomes expensive because it requires counting how many players outscore you across all shards, so it's usually approximated (next answer)." },
+    { question: "How do you compute a global rank across shards?", answer: "Exactly, you'd send the player's score to every shard, have each return a ZCOUNT of members above that score, and sum them — a scatter-gather on every rank query, which scales poorly. So production systems approximate: keep a coarse per-shard score-bucket histogram and estimate rank by summing buckets above the player's score, with no per-query fan-out. Since a rank of '#4,271,908' vs '#4,271,950' is indistinguishable to a user, the approximation is effectively free." },
+    { question: "How are daily, weekly, and all-time boards implemented?", answer: "As separate sorted sets, one per window, keyed by the period (board:daily:2026-07-20, board:weekly:2026-W29, board:global). Each score submission fans out to the currently active windows, so every board maintains its own independent ranking. Windowed sets get a TTL so old ones expire automatically (or are archived), keeping memory bounded; the cost is write amplification proportional to the number of active windows." },
+    { question: "Is the leaderboard the source of truth for scores?", answer: "No. The in-memory sorted set is volatile, so it's treated as a derived, rebuildable index, and every score change is written durably to a separate source-of-truth store (a database or append-only ScoreEvent log). If a node is lost, the ranking is recovered by failing over to a replica or replaying from the durable store. Making the ranking structure the only copy of the scores would risk losing them on a crash." },
+    { question: "How fresh and how accurate does a leaderboard need to be?", answer: "Usually eventually consistent and approximately ranked. A score appearing a second late is fine, and an approximate rank at large magnitudes is indistinguishable from exact — and both relaxations are what make the system scale (incremental updates and sharded, histogram-based rank). Where stakes are high, such as a money-prize contest, you tighten toward exact rank and durable, write-through updates at the cost of latency." },
+    { question: "How do you avoid double-counting a score or lowering a high score?", answer: "Apply updates idempotently and conditionally. For incremental scoring, ZINCRBY is atomic so concurrent increments don't lose updates; for best-result boards, a conditional set (keep-if-higher, e.g. ZADD GT) prevents a worse later attempt from lowering the record; and event ids or monotonic versions let you ignore duplicate or out-of-order events. The durable log is the final arbiter, so a board can always be re-derived if an anomaly slips through." },
+    { question: "How is this different from a system that just stores scores?", answer: "Storing scores is a trivial key-value write. A leaderboard's job is the ranking on top of those scores — keeping millions of entries continuously ordered and answering top-K and arbitrary per-player rank in milliseconds under a firehose of updates. That ordering-and-ranking requirement is why the sorted set, replication, caching, sharding with approximate rank, and windowed sets all exist; the raw storage is the easy part." },
+  ]}
+/>
