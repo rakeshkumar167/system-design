@@ -124,4 +124,18 @@ describe("topic registry", () => {
       expect(["fundamentals", "interview-ready", "advanced"]).toContain(s.depth);
     }
   });
+  it("registers the Secure SDLC topic", () => {
+    expect(Object.keys(topicMetas)).toContain("secure-sdlc");
+  });
+  it("describes the Secure SDLC topic's ten sections", () => {
+    expect(getTopic("secure-sdlc")?.sections).toHaveLength(10);
+  });
+  it("gives every Secure SDLC section a unique id and a valid depth", () => {
+    const sections = getTopic("secure-sdlc")!.sections;
+    const ids = sections.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const s of sections) {
+      expect(["fundamentals", "interview-ready", "advanced"]).toContain(s.depth);
+    }
+  });
 });

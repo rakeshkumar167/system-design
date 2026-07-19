@@ -12,6 +12,7 @@ import EncryptionContent from "@/content/topics/encryption-key-management.mdx";
 import OwaspTop10Content from "@/content/topics/owasp-top-10.mdx";
 import ApiSecurityContent from "@/content/topics/api-security.mdx";
 import SessionManagementContent from "@/content/topics/session-management.mdx";
+import SecureSdlcContent from "@/content/topics/secure-sdlc.mdx";
 
 /** Maps each registered topic slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -23,6 +24,7 @@ const content: Record<string, ComponentType> = {
   "owasp-top-10": OwaspTop10Content,
   "api-security": ApiSecurityContent,
   "session-management": SessionManagementContent,
+  "secure-sdlc": SecureSdlcContent,
 };
 
 export function generateStaticParams() {

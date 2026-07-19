@@ -28,7 +28,7 @@ export const topicCategories: readonly TopicCategory[] = [
         slug: "secure-sdlc",
         title: "Secure SDLC",
         blurb: "SAST, DAST, dependency scanning, penetration testing",
-        status: "coming-soon",
+        status: "available",
       },
     ],
   },

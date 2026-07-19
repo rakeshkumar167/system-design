@@ -175,6 +175,27 @@ export const topicMetas: Record<string, TopicMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "secure-sdlc": {
+    slug: "secure-sdlc",
+    categorySlug: "security",
+    title: "Secure SDLC",
+    description:
+      "How to build security into every phase of software delivery rather than bolting it on at the end — threat modeling at design, secure coding and SAST, the DAST/IAST/SCA testing taxonomy, CI/CD and supply-chain security, the economics of shifting left, secure deployment and runtime, and verification and response.",
+    readingMinutes: 23,
+    concepts: ["Shift-left", "SAST/DAST/SCA", "Threat modeling", "CI/CD security", "Vulnerability management"],
+    sections: [
+      { id: "overview", label: "What a Secure SDLC Is", depth: "fundamentals" },
+      { id: "requirements-design", label: "Requirements & Design: Threat Modeling", depth: "interview-ready" },
+      { id: "secure-implementation", label: "Implementation: Secure Coding & SAST", depth: "interview-ready" },
+      { id: "security-testing", label: "Testing: SAST, DAST, IAST & SCA", depth: "interview-ready" },
+      { id: "supply-chain", label: "CI/CD & Supply-Chain Security", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity: The Economics of Shifting Left", depth: "interview-ready" },
+      { id: "deploy-runtime", label: "Deployment, Runtime & Operations", depth: "advanced" },
+      { id: "verification-response", label: "Verification & Response", depth: "interview-ready" },
+      { id: "pitfalls-best-practices", label: "Pitfalls & Best Practices", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTopic(slug: string): TopicMeta | undefined {
