@@ -187,6 +187,21 @@ test("learner can open the API security topic", async ({ page }) => {
   await expect(page.locator("#authorizing-requests")).toBeInViewport();
 });
 
+test("learner can open the session management security topic", async ({ page }) => {
+  await page.goto("/topics");
+  await page.getByRole("link", { name: /session management/i }).first().click();
+  await expect(
+    page.getByRole("heading", { level: 1, name: /^session management$/i }),
+  ).toBeVisible();
+  // Navigate to a section via URL fragment (TOC is hidden on mobile viewports)
+  await page.goto("/topics/security/session-management#session-attacks");
+  // Assert the embedded diagram first so layout settles before the viewport check.
+  await expect(
+    page.getByRole("img", { name: /a session fixation attack/i }).first(),
+  ).toBeVisible();
+  await expect(page.locator("#session-attacks")).toBeInViewport();
+});
+
 test("theme toggle switches between light and dark", async ({ page }) => {
   await page.goto("/");
   const html = page.locator("html");
