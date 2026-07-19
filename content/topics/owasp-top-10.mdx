@@ -1,39 +1,232 @@
 <h2 id="overview">What the OWASP Top 10 Is</h2>
 
-Placeholder.
+The **OWASP Top 10** is the single most recognized document in application security: a ranked list of the ten most critical risks to web applications, published by the **Open Worldwide Application Security Project**. It exists because most breaches aren't exotic — they exploit the same handful of well-understood weaknesses over and over, and a shared, prioritized list of those weaknesses lets teams focus on what actually gets exploited in the wild. It's refreshed every few years as the data shifts; the **2021** edition is current.
+
+Two things make it more than a listicle. First, it's **data-backed**: the ranking is built from analyzing hundreds of thousands of real applications and CVEs, tempered by a practitioner survey for emerging risks the raw data hasn't caught up to yet. Second, it lists **categories of risk**, not individual bugs — "Injection" or "Broken Access Control," not "the SQL bug in the login form." That's what makes it a durable framework rather than a changelog.
+
+The critical thing to get right is **how to use it**. The Top 10 is an **awareness baseline** — a floor, a shared vocabulary, a "are we at least covered against the obvious?" It is emphatically *not* a complete checklist, a certification, or a substitute for **threat modeling** your specific system. Teams that treat "we passed the Top 10" as "we are secure" miss everything specific to their design. It's where you *start* thinking about security, not where you stop.
+
+<Callout variant="info" title="A floor, not a ceiling">
+The OWASP Top 10 is a **baseline for awareness**, not a compliance checklist and not a threat model. It tells you the risks that hit *everyone*, so you can make sure you're not obviously exposed — a floor to clear before you reason about the threats specific to your own system. "We covered the Top 10" is the beginning of a security program, never the end of one.
+</Callout>
 
 <h2 id="the-list">The 2021 Top 10 at a Glance</h2>
 
-Placeholder.
+Here is the whole map before we dive into the most important entries. It's worth seeing all ten together, because the recurring lesson is how much they *overlap* — many real incidents are two or three of these at once.
+
+<TradeoffTable
+  columns={["Rank", "Category", "What it is"]}
+  rows={[
+    ["A01", "Broken Access Control", "Users can act outside their intended permissions — read or change data that isn't theirs"],
+    ["A02", "Cryptographic Failures", "Sensitive data left unprotected — no/weak encryption, weak hashing, bad TLS, mismanaged keys"],
+    ["A03", "Injection", "Untrusted input is interpreted as code — SQL injection, XSS, command injection"],
+    ["A04", "Insecure Design", "A missing or flawed control in the design itself, not a coding bug"],
+    ["A05", "Security Misconfiguration", "Insecure defaults, verbose errors, open buckets, unnecessary features enabled"],
+    ["A06", "Vulnerable & Outdated Components", "Using dependencies with known vulnerabilities (e.g. Log4Shell)"],
+    ["A07", "Identification & Authentication Failures", "Weak login, no MFA, broken session management"],
+    ["A08", "Software & Data Integrity Failures", "Trusting unverified code/data — insecure deserialization, compromised CI/CD"],
+    ["A09", "Security Logging & Monitoring Failures", "Can't detect, respond to, or investigate what was never logged"],
+    ["A10", "Server-Side Request Forgery (SSRF)", "The server is tricked into making requests to attacker-chosen destinations"],
+  ]}
+  recommendedRow={0}
+/>
+
+The **2021 shifts** tell a story. **Broken Access Control** climbed to **#1** — authorization, done wrong, is now the most common serious flaw. **Cryptographic Failures** (renamed from "Sensitive Data Exposure" to name the *cause* rather than the *symptom*) sits at #2. And three categories were new or newly promoted: **Insecure Design** (a recognition that some flaws are architectural, not typos), **Software and Data Integrity Failures** (supply-chain attacks like SolarWinds), and **SSRF** (voted up by practitioners as it exploded alongside cloud metadata endpoints).
+
+<KnowledgeCheck
+  question="What is the OWASP Top 10, and how should a team use it?"
+  options={[
+    "A certification you pass to prove an application is secure",
+    "A data-backed, community-driven awareness list of the ten most critical categories of web-application security risk, refreshed every few years. It should be used as a baseline and shared vocabulary — a floor to make sure you're not obviously exposed to the risks that hit everyone — and as a starting point for threat modeling your specific system, not as a complete checklist or a substitute for one",
+    "A list of specific bugs to grep your codebase for before each release",
+    "A ranking of security tools you should buy in priority order",
+  ]}
+  answer={1}
+  explanation="The Top 10 is an awareness document listing categories of risk (not individual bugs, tools, or a certification), built from real-world data plus a practitioner survey. Its correct use is as a baseline — a common language and a floor of coverage — and a launch point for reasoning about your own system's threats. Treating 'we covered the Top 10' as proof of security is the classic misuse; it's where a security program starts, not where it ends."
+/>
 
 <h2 id="broken-access-control">A01: Broken Access Control</h2>
 
-Placeholder.
+At number one is **Broken Access Control**: the application fails to enforce what an authenticated user is actually allowed to do. Authentication proved *who* the user is; access control decides *what they may do* — and when that enforcement is missing, weak, or client-side, users act outside their permissions. The most common concrete form is **IDOR / BOLA** (Insecure Direct Object Reference / Broken Object-Level Authorization): the app checks that you're logged in but not that the object is *yours*, so changing `GET /orders/123` to `/orders/124` returns someone else's order.
+
+The failure has several faces: **missing function-level authorization** (a normal user calling an admin-only endpoint that was merely hidden from the UI), **forced browsing** to unprotected pages, privilege escalation by tampering with a role in a token or cookie, and metadata manipulation. The through-line is trusting the client — the URL, the hidden field, the JWT claim — instead of enforcing on the server.
+
+The defense is exactly the [Authorization](/topics/security/authorization) topic: enforce access control **server-side, on every request, at the object level**, and **deny by default** so anything not explicitly allowed is refused. There's no client-side shortcut — hiding a button is not a control.
+
+<KnowledgeCheck
+  question="Why did Broken Access Control become the #1 OWASP risk, and what's its most common form?"
+  options={[
+    "Because encryption is too hard to implement correctly",
+    "Because applications frequently fail to enforce, server-side and per-object, what an authenticated user is allowed to do — trusting client-supplied IDs, tokens, or hidden UI instead. Its most common form is IDOR/BOLA: the app confirms you're logged in but not that the requested object belongs to you, so changing an ID in the URL (/orders/123 to /orders/124) returns another user's data. The fix is server-side, object-level authorization with deny-by-default",
+    "Because passwords are commonly stored in plaintext",
+    "Because most sites forget to enable HTTPS",
+  ]}
+  answer={1}
+  explanation="Broken Access Control rose to #1 because authorization is enforced incorrectly so often — typically by trusting the client rather than checking, server-side, that this specific user may act on this specific object. IDOR/BOLA is the canonical example: authentication passes but the object-ownership check is missing. Enforcing per-object authorization on every request, deny-by-default, is the remedy — the subject of the Authorization topic. Plaintext passwords and missing TLS are different categories (A02)."
+/>
 
 <h2 id="cryptographic-failures">A02: Cryptographic Failures</h2>
 
-Placeholder.
+Number two, **Cryptographic Failures**, covers everything that leaves sensitive data unprotected because cryptography was absent, weak, or misused. The 2021 rename — from "Sensitive Data Exposure" to "Cryptographic Failures" — deliberately shifts attention from the *symptom* (exposed data) to the *cause* (the crypto that should have protected it and didn't). It's a catch-all that ties directly to three other topics in this series.
+
+The failures cluster into a few kinds: **no encryption at all** (sensitive data in plaintext, at rest or in transit), **weak or fast password hashing** (storing passwords with MD5 or unsalted SHA-256 instead of a slow, salted function), **broken transport security** (old TLS versions, invalid certificates, downgrade-able connections), **weak algorithms or modes** (MD5, DES, ECB), and **key mismanagement** (hardcoded keys, keys committed to source control, no rotation).
+
+Each maps cleanly to a dedicated topic: protecting data confidentiality and managing keys is [Encryption & Key Management](/topics/security/encryption-key-management); storing credentials safely is [Password Hashing](/topics/security/password-hashing); securing data in transit is [TLS/HTTPS](/topics/security/tls-https-certificates). If those three are done right, A02 is largely handled — which is why "Cryptographic Failures" is best read as a pointer to getting the fundamentals of each right.
+
+<KnowledgeCheck
+  question="What does the 2021 rename from 'Sensitive Data Exposure' to 'Cryptographic Failures' emphasize?"
+  options={[
+    "That data exposure no longer matters, only algorithms do",
+    "That the category is about the root cause — absent, weak, or misused cryptography (no encryption, fast/unsalted password hashing, broken TLS, weak algorithms like MD5/ECB, mismanaged or hardcoded keys) — rather than the symptom of exposed data. Naming the cause points teams at the concrete fixes, which map to the encryption/key-management, password-hashing, and TLS fundamentals",
+    "That only data in transit is in scope now, not data at rest",
+    "That cryptography should be avoided because it's too failure-prone",
+  ]}
+  answer={1}
+  explanation="The rename moves focus from the outcome (sensitive data got exposed) to why it happened (a cryptographic failure — missing/weak encryption, poor password hashing, broken TLS, weak modes, or key mismanagement). That framing is more actionable and maps directly onto the mechanisms covered by the Encryption & Key Management, Password Hashing, and TLS topics. It covers data both at rest and in transit, and the answer is to use cryptography correctly, not avoid it."
+/>
 
 <h2 id="injection">A03: Injection</h2>
 
-Placeholder.
+**Injection** — long the reigning #1, now third — happens when an application takes untrusted input and lets an interpreter treat it as **code** instead of **data**. The classic is **SQL injection**: user input is concatenated into a query string, so a value like `' OR 1=1 --` changes the *meaning* of the SQL and the database runs the attacker's logic. The same root cause produces **cross-site scripting (XSS)** (attacker input becomes `<script>` executed in a victim's browser), **OS command injection**, and LDAP or NoSQL injection.
+
+<InjectionAttackSequence />
+
+The single root cause is **mixing code and data**, and so is the single fix: **keep them separate**. For databases, use **parameterized queries / prepared statements**, which send the query structure and the values on different channels so input can never be parsed as command syntax. For XSS, use **context-aware output encoding** (encode data for the HTML, attribute, or JavaScript context it lands in) and a Content Security Policy. Input validation (allowlists) is valuable defense in depth, but it is *not* a substitute for parameterization — the reliable fix is architectural: the interpreter must never see attacker input as code.
+
+<KnowledgeCheck
+  question="What is the root cause of injection, and why are parameterized queries the reliable fix while input validation alone is not?"
+  options={[
+    "The cause is slow databases; parameterized queries are just faster",
+    "The cause is mixing code and data — untrusted input gets concatenated into a command (SQL, HTML/JS, a shell) and the interpreter executes it as code. Parameterized queries send the query structure and the values on separate channels, so input can never be parsed as command syntax no matter its content — an architectural fix. Input validation (allowlists) helps as defense in depth but can be bypassed and doesn't change that the interpreter still parses concatenated input as code",
+    "The cause is missing authentication; parameterized queries authenticate the user",
+    "The cause is weak encryption; parameterized queries encrypt the input",
+  ]}
+  answer={1}
+  explanation="Injection is fundamentally about an interpreter treating attacker-controlled data as executable code because the two were combined into one string. Parameterization separates the code (query template) from the data (bound values), so the input is never interpreted as syntax — a structural guarantee. Validation reduces risk but is a filter that can be evaded and doesn't remove the underlying code/data mixing, so it complements rather than replaces parameterized queries and output encoding."
+/>
 
 <h2 id="capacity-estimates">Capacity: Defense in Depth by the Numbers</h2>
 
-Placeholder.
+A recurring truth across all ten risks is that **no single control is perfect** — every defense has bypasses, gaps, and bad days. What makes systems actually secure is **layering independent controls** so that an attack has to defeat *all* of them, and because the layers are independent, their effects **multiply**. A little arithmetic makes the payoff vivid.
+
+<OwaspRiskCapacity
+  assumptions={{
+    attackAttemptsPerDay: 1000000,
+    blockRatePerLayer: 0.9,
+    layers: 3,
+  }}
+/>
+
+Suppose a million automated attacks hit your app each day and each control you deploy blocks 90% of them. One control sounds strong — until you notice it still lets **100,000** attacks through. Add a second independent layer and 1% get through; a third and only 0.1% do — **1,000** per day. That's a **100× improvement** over a single control and a **1,000× reduction** versus none, purely from stacking three imperfect defenses. This is why the Top 10's fixes are meant to **stack**, not compete: for injection you validate input *and* parameterize queries *and* run the database with least privilege *and* monitor for anomalies — each layer catches what the previous one missed.
+
+Two lessons follow. First, **defense in depth is multiplicative**, so there's enormous leverage in adding independent layers rather than perfecting one. Second — and this is why **A09 Security Logging & Monitoring** is itself a Top 10 item — the residual never reaches zero. Even excellent layering leaves ~1,000 attacks a day getting through, so you *must* be able to see and respond to what slips past. Layering shrinks the problem; monitoring catches the remainder.
 
 <h2 id="design-config-components">A04–A06: Design, Configuration & Components</h2>
 
-Placeholder.
+The middle of the list covers three "whole-system" risks that live above any single line of code.
+
+- **A04 Insecure Design** is a flaw in the *design itself* — a control that should have existed but was never conceived, as opposed to a control that was implemented buggily. No amount of careful coding fixes a design that, say, never planned for account-recovery abuse. The remedy is proactive: **threat modeling**, secure design patterns, and shifting security **left** into the design phase where missing controls are cheap to add.
+- **A05 Security Misconfiguration** is the gap between "software installed" and "software hardened": default credentials left in place, verbose error messages leaking stack traces, an open S3 bucket, unnecessary features and ports enabled, missing security headers. The fix is **secure defaults**, systematic hardening, and least functionality — turn off what you don't need and don't ship development settings to production.
+- **A06 Vulnerable and Outdated Components** is running dependencies with *known* vulnerabilities — the **Log4Shell** class, where a flaw in a ubiquitous library exposes everyone who hasn't patched. Modern apps are mostly third-party code, so the fix is **software composition analysis (SCA) / dependency scanning** to inventory and flag vulnerable packages, plus a process to patch promptly.
+
+<Callout variant="warning" title="An insecure design is not an insecure implementation">
+A01–A03 are often *implementation* bugs — the control exists but was coded wrong. **A04 Insecure Design** is different and can't be patched away: the control was never there. You can implement a flawed design flawlessly and still be insecure. That's why security has to enter at design time (threat modeling), not just code review — you can't test or patch your way to a control that was never designed.
+</Callout>
+
+<KnowledgeCheck
+  question="How does Insecure Design (A04) differ from the other risks, and what addresses it?"
+  options={[
+    "It's the same as a coding bug and is fixed by better input validation",
+    "It's a flaw in the design itself — a needed control that was never conceived — rather than a control implemented incorrectly. You can build a flawed design perfectly and still be insecure, so it can't be patched or tested away after the fact. It's addressed proactively, by threat modeling and secure design patterns during the design phase (shifting security left), not by code-level fixes alone",
+    "It only applies to legacy systems and is irrelevant to new ones",
+    "It's a misconfiguration that's fixed by turning on secure defaults",
+  ]}
+  answer={1}
+  explanation="Insecure Design is architectural: the weakness is a missing or fundamentally flawed control, not a buggy implementation of an existing one. Because the control was never designed in, no amount of careful coding, testing, or patching creates it — the fix is to catch it during design via threat modeling and secure patterns. That's distinct from misconfiguration (A05, hardening/defaults) and from implementation bugs like injection (A03)."
+/>
 
 <h2 id="remaining-risks">A07–A10: Auth, Integrity, Logging & SSRF</h2>
 
-Placeholder.
+The final four round out the list, and each connects to a broader theme.
+
+- **A07 Identification and Authentication Failures** — weaknesses in proving identity: permitting weak or breached passwords, no **MFA**, exposed session IDs, broken logout or session fixation. This is the [Authentication](/topics/security/authentication) topic's domain — verify identity robustly and manage sessions and tokens correctly.
+- **A08 Software and Data Integrity Failures** — trusting code or data whose integrity you never verified: **insecure deserialization** of attacker-controlled objects, auto-updates pulled without signature checks, and compromised **CI/CD** pipelines — the **supply-chain** class exemplified by **SolarWinds**. The defense is verifying integrity with digital signatures and trusted sources before you execute or ingest anything.
+- **A09 Security Logging and Monitoring Failures** — you cannot detect, respond to, or investigate what you never recorded. Inadequate logging lets breaches **dwell undetected for months**; it's the reason the residual attacks from the capacity model matter. Log security-relevant events, monitor them, and alert.
+- **A10 Server-Side Request Forgery (SSRF)** — an attacker makes the **server** issue requests on their behalf, classically to reach an internal-only address the attacker couldn't touch directly, such as the **cloud metadata endpoint** that hands out instance credentials.
+
+<SsrfAttackSequence />
+
+SSRF's rise tracks the cloud: a server that fetches a user-supplied URL becomes a proxy into the internal network. The defense is to never fetch arbitrary URLs — use an **allowlist** of permitted destinations and block requests to internal and link-local ranges.
+
+<KnowledgeCheck
+  question="What is SSRF, why has it grown more dangerous in cloud environments, and how is it defended?"
+  options={[
+    "It's a client-side script attack defended by encoding HTML output",
+    "Server-Side Request Forgery tricks the server into making requests to attacker-chosen destinations — often an internal-only address like the cloud metadata endpoint, which returns instance credentials the attacker could never reach directly. It's more dangerous in the cloud because that metadata service exposes secrets to any local request. The defense is to not fetch arbitrary user-supplied URLs: allowlist permitted destinations and block internal/link-local address ranges",
+    "It's a denial-of-service attack defended by rate limiting alone",
+    "It's a password attack defended by multi-factor authentication",
+  ]}
+  answer={1}
+  explanation="SSRF abuses the server as a confused deputy: it fetches an attacker-controlled URL and returns the result, letting the attacker reach internal services — most damagingly the cloud metadata endpoint that vends credentials. Cloud environments made this far worse because that endpoint trusts local requests. Mitigation is to constrain outbound requests to an explicit allowlist and block internal ranges, rather than fetching whatever URL a user supplies. It's not XSS, DoS, or a password attack."
+/>
 
 <h2 id="pitfalls-best-practices">Cross-Cutting Defenses & Best Practices</h2>
 
-Placeholder.
+Step back from the ten and the same handful of mistakes — and the same handful of defenses — recur across all of them.
+
+<Callout variant="warning" title="Recurring mistakes behind the Top 10">
+- **Trusting client input.** URLs, hidden fields, headers, and tokens are all attacker-controllable. Validate and authorize on the **server**, always.
+- **Blocklists instead of allowlists.** Trying to enumerate "bad" input is a losing game; permit a known-good set and reject the rest.
+- **Security by obscurity.** A hidden endpoint or an unlinked admin page is not a control. Assume the attacker knows your design.
+- **"We'll add security later."** Bolted-on security misses design-level flaws (A04). Build it in from the start.
+- **No logging or monitoring.** If you can't see attacks, you can't stop the ones that get through (A09).
+</Callout>
+
+Against those, a small set of **cross-cutting defenses** knocks out whole classes of the Top 10 at once:
+
+- **Validate input and encode output** — the antidote to injection (A03) and much of XSS.
+- **Least privilege and deny-by-default** — contains broken access control (A01) and limits blast radius everywhere.
+- **Defense in depth** — layer independent controls so no single failure is fatal (the capacity model's lesson).
+- **Secure defaults and hardening** — closes misconfiguration (A05).
+- **Keep components patched** — closes vulnerable-component risk (A06); automate dependency scanning.
+- **Log, monitor, and alert** — the detection layer for everything that slips through (A09).
+- **Shift security left** — threat model and design securely (A04), so controls exist before code does.
+
+<DecisionRecord
+  title="Treating the OWASP Top 10 as a baseline woven into the SDLC"
+  choice="Use the OWASP Top 10 as a security baseline embedded across the whole software lifecycle, not a pre-release checklist. Threat-model during design (A04), enforce server-side object-level authorization with deny-by-default (A01), use parameterized queries and output encoding (A03), get the crypto fundamentals right via the encryption/hashing/TLS practices (A02), harden configuration and scan dependencies in CI (A05/A06), verify software and data integrity in the pipeline (A08), require robust authentication and MFA (A07), guard outbound requests with allowlists (A10), and log and monitor security events throughout (A09). Layer these as independent controls (defense in depth) and treat the list as a floor, then threat-model beyond it."
+  rationale="The Top 10 concentrates on the risks that actually cause breaches, so covering them removes the most common exposure cheaply. Weaving them into design, build, and run — rather than checking them off before launch — catches the architectural risks (A04) that a late checklist misses, and layering independent controls makes the whole system resilient to any single failure. Logging and monitoring acknowledge that no set of controls is perfect, providing detection for the residual."
+  alternatives="Treating the Top 10 as a pass/fail checklist at release — catches implementation bugs but misses insecure design and gives false confidence. Ignoring it for a bespoke threat model — thorough but slow and easy to overlook the common risks everyone shares. Buying a single tool (a WAF) and calling it done — one layer with bypasses, no defense in depth. Chasing the newest exotic attacks while the Top 10 basics remain unaddressed — misallocated effort against what actually gets exploited."
+  revisitWhen="OWASP publishes a new edition (re-map categories and rankings); the system adds a new trust boundary, integration, or data class that warrants fresh threat modeling; an incident or pentest reveals a class of weakness the current controls miss; or compliance requires mapping controls to a specific framework."
+/>
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="In the capacity model, three independent 90% controls cut a million daily attacks from 100,000 (one control) to 1,000. What are the two lessons?"
+  options={[
+    "That one strong control is always enough, and monitoring is unnecessary",
+    "First, defense in depth is multiplicative: because independent layers each catch what the last missed, stacking three imperfect 90% controls beats one by 100× and beats none by 1,000× — so there's huge leverage in adding independent layers rather than perfecting one. Second, the residual never reaches zero (~1,000/day still get through), which is exactly why security logging and monitoring (A09) is its own Top 10 item — you must detect and respond to what slips past",
+    "That controls should replace each other rather than stack",
+    "That attackers give up after the first control blocks them",
+  ]}
+  answer={1}
+  explanation="The arithmetic shows independent controls multiply — three 90% layers let only 0.1% through, a 100× gain over one control and 1,000× over none — so the winning strategy is layering, not seeking a single perfect defense. But layering only shrinks the residual; it never eliminates it, so you need logging and monitoring to catch the attacks that still get through. That's why A09 is on the list alongside the preventive controls."
+/>
+
+<Faq
+  items={[
+    { question: "What is the OWASP Top 10?", answer: "It's a data-backed, community-driven awareness document from the Open Worldwide Application Security Project listing the ten most critical categories of web-application security risk. It's refreshed every few years (2021 is current), ranked from real-world data plus a practitioner survey, and describes categories of risk rather than individual bugs. It's meant as a baseline and shared vocabulary for application security." },
+    { question: "Is the OWASP Top 10 a security checklist?", answer: "No. It's an awareness baseline — a floor to ensure you're not obviously exposed to the risks that affect everyone, and a starting point for threat modeling your specific system. Treating 'we covered the Top 10' as proof of security is the common misuse; it misses everything specific to your design. Use it as where a security program begins, not where it ends." },
+    { question: "Why is Broken Access Control now the #1 risk?", answer: "Because applications so often fail to enforce, server-side and per-object, what an authenticated user may do — trusting client-supplied IDs, tokens, or hidden UI instead. The signature form is IDOR/BOLA, where the app confirms you're logged in but not that the object is yours, so changing an ID in a URL returns someone else's data. The fix is server-side, object-level authorization with deny-by-default, covered in the Authorization topic." },
+    { question: "What changed in the 2021 Top 10?", answer: "Broken Access Control rose to #1, Cryptographic Failures (renamed from Sensitive Data Exposure to name the cause) took #2, and three categories were new or newly promoted: Insecure Design, Software and Data Integrity Failures, and SSRF. The shifts reflect that authorization flaws dominate, that supply-chain attacks matter, and that SSRF exploded alongside cloud metadata endpoints." },
+    { question: "What is injection and how do you prevent it?", answer: "Injection is when untrusted input is interpreted as code by an interpreter — SQL injection, cross-site scripting, command injection. The root cause is mixing code and data. Prevent it by keeping them separate: parameterized queries/prepared statements for databases (the query structure and values travel on different channels), context-aware output encoding for XSS, and safe APIs. Input validation helps as defense in depth but isn't a substitute for parameterization." },
+    { question: "What are Cryptographic Failures (A02)?", answer: "Everything that leaves sensitive data unprotected because cryptography was absent, weak, or misused: no encryption in transit or at rest, fast or unsalted password hashing, broken or outdated TLS, weak algorithms like MD5 or ECB, and hardcoded or mismanaged keys. The fixes map to three topics: Encryption & Key Management, Password Hashing, and TLS/HTTPS. Get those fundamentals right and A02 is largely handled." },
+    { question: "What is defense in depth and why does it matter?", answer: "Defense in depth means layering multiple independent controls so an attack must defeat all of them. Because the layers are independent, their effects multiply: if each blocks 90%, three layers let only 0.1% through — a 1,000× reduction versus none. It matters because no single control is perfect, so the reliable path to security is stacking imperfect defenses rather than seeking one silver bullet. The Top 10's fixes are meant to stack." },
+    { question: "How is Insecure Design different from a coding bug?", answer: "An insecure design is a missing or fundamentally flawed control in the architecture itself, not a control implemented incorrectly. You can implement a flawed design perfectly and still be insecure, and no amount of code review or patching creates a control that was never designed. It's addressed by threat modeling and secure design patterns during the design phase — shifting security left — rather than by fixing code after the fact." },
+    { question: "What is Security Misconfiguration?", answer: "It's the gap between installed and hardened: default or leftover credentials, verbose error messages that leak internals, publicly open storage buckets, unnecessary features or ports enabled, and missing security headers. The fix is secure defaults, systematic hardening, and least functionality — disable what you don't need and never ship development settings to production. It's one of the most common and most preventable risks." },
+    { question: "What are vulnerable and outdated components, and how do you manage them?", answer: "It's running third-party dependencies with known vulnerabilities — the Log4Shell class, where a flaw in a widely used library exposes everyone who hasn't patched. Since modern apps are mostly third-party code, manage it with software composition analysis (dependency scanning) to inventory and flag vulnerable packages, and a process to patch promptly. It's about known vulnerabilities in code you didn't write but do ship." },
+    { question: "What is SSRF and why is it dangerous in the cloud?", answer: "Server-Side Request Forgery tricks the server into making requests to attacker-chosen destinations. It's especially dangerous in the cloud because an attacker can point the server at the internal metadata endpoint, which returns instance credentials and secrets the attacker could never reach directly. Defend it by not fetching arbitrary user-supplied URLs: allowlist permitted destinations and block internal and link-local address ranges." },
+    { question: "Why is logging and monitoring on a list of vulnerabilities?", answer: "Because prevention is never perfect — even strong, layered controls leave a residual of attacks that get through — and you can't detect, respond to, or investigate what you never recorded. Inadequate logging lets breaches go unnoticed for months. Security Logging and Monitoring Failures (A09) is the detection layer for everything the preventive controls miss, which is why it earns a place alongside them on the Top 10." },
+  ]}
+/>
