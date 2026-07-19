@@ -528,6 +528,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "leaderboard": {
+    slug: "leaderboard",
+    title: "Design a Leaderboard",
+    description:
+      "An interview-grade walkthrough of a real-time leaderboard: why ranking looks like ORDER BY but needs both top-K and an arbitrary player's exact rank at scale, the sorted set (Redis ZSET / skip list) that gives O(log N) updates and rank queries, the read/write paths, sharding and approximate global rank, time-windowed boards, a durable source of truth behind the in-memory index, and the failure modes.",
+    difficulty: "Intermediate",
+    readingMinutes: 30,
+    concepts: ["Sorted sets", "Ranking", "Sharding", "Real-time updates"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "sorted-sets", label: "Sorted Sets: The Core Data Structure", depth: "advanced" },
+      { id: "score-updates", label: "Real-Time Score Updates", depth: "advanced" },
+      { id: "rank-queries", label: "Top-K & Rank Queries", depth: "advanced" },
+      { id: "sharding-scale", label: "Sharding & Approximate Rank", depth: "advanced" },
+      { id: "time-windows", label: "Time-Windowed Leaderboards", depth: "advanced" },
+      { id: "persistence-truth", label: "Persistence & the Source of Truth", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

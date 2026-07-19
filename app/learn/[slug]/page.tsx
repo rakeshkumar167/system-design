@@ -21,6 +21,7 @@ import WebCrawlerContent from "@/content/tutorials/web-crawler.mdx";
 import SearchAutocompleteContent from "@/content/tutorials/search-autocomplete.mdx";
 import NewsFeedContent from "@/content/tutorials/news-feed.mdx";
 import ChatSystemContent from "@/content/tutorials/chat-system.mdx";
+import LeaderboardContent from "@/content/tutorials/leaderboard.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -42,6 +43,7 @@ const content: Record<string, ComponentType> = {
   "search-autocomplete": SearchAutocompleteContent,
   "news-feed": NewsFeedContent,
   "chat-system": ChatSystemContent,
+  "leaderboard": LeaderboardContent,
 };
 
 export function generateStaticParams() {

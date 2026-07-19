@@ -322,7 +322,7 @@ export const problems: readonly Problem[] = [
       "Rank millions of players in real time with fast top-K queries and per-user rank lookups.",
     difficulty: "Intermediate",
     concepts: ["Sorted sets", "Ranking", "Sharding", "Real-time updates"],
-    status: "coming-soon",
+    status: "available",
     sequence: 32,
   },
   {
