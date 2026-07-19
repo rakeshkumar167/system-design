@@ -1,39 +1,206 @@
 <h2 id="overview">What a Secure SDLC Is</h2>
 
-Placeholder.
+Every other topic in this Security category is a *control* — a mechanism like [authorization](/topics/security/authorization), [encryption](/topics/security/encryption-key-management), or [session management](/topics/security/session-management). This one is about the **process** that makes sure those controls actually get designed, built, and maintained correctly. A **Secure Software Development Lifecycle (Secure SDLC)** integrates security into *every phase* of building software — requirements, design, implementation, testing, deployment, and operations — instead of treating it as a one-time check.
+
+The anti-pattern it replaces is **security as a gate at the end**: build the whole thing, then run a penetration test a week before launch. That fails for a simple reason — by then the flaws are baked into the architecture and the code, so fixing them is expensive, slow, and disruptive, and the schedule pressure means many get shipped anyway. A Secure SDLC instead follows the principle of **shifting left**: move every security activity as early in the timeline as possible, because that's where problems are cheapest to fix (the [capacity section](#capacity-estimates) quantifies exactly how much cheaper). The modern name for doing this with automation woven through the delivery pipeline is **DevSecOps** — security as a continuous, shared, automated responsibility rather than a separate team's final sign-off.
+
+<Callout variant="info" title="Build it in, don't test it in">
+Security is a **property you build in continuously**, not a test you run at the end. The later in the lifecycle a flaw is found, the more it costs to fix — a missing control is free to add on a design whiteboard and ruinous to fix after a breach. A Secure SDLC pushes threat modeling, code analysis, and dependency scanning as early as they'll go, and automates them so they run on every change.
+</Callout>
 
 <h2 id="requirements-design">Requirements & Design: Threat Modeling</h2>
 
-Placeholder.
+Security begins *before a line of code is written*. In the **requirements** phase, capture **security requirements** as first-class alongside functional ones — what data is sensitive, what authentication and authorization are needed, what compliance obligations apply — and write **abuse cases** (or misuse cases): for each feature, ask "how would an attacker misuse this?" A password-reset feature isn't done when it resets passwords; it's done when it resists account takeover.
+
+In the **design** phase, the central activity is **threat modeling**: systematically walking the design to enumerate what can go wrong and deciding on controls before building. You map the system's **data flows** and **trust boundaries** (where data crosses from less-trusted to more-trusted), then enumerate threats against each — frameworks like **STRIDE** (Spoofing, Tampering, Repudiation, Information disclosure, Denial of service, Elevation of privilege) give you a checklist so you don't miss a category. This is the direct answer to OWASP's [**Insecure Design**](/topics/security/owasp-top-10) risk: a missing control is a *design* flaw no amount of careful coding fixes, and the cheapest place to catch it is on a whiteboard. (Threat modeling has enough depth for its own topic.)
+
+<KnowledgeCheck
+  question="Why does a Secure SDLC start security work in the requirements and design phases, before coding?"
+  options={[
+    "Because security tools only run on design documents",
+    "Because the most expensive flaws are architectural — a missing or wrong control designed in from the start. Capturing security requirements and abuse cases and threat modeling the design catches those 'insecure design' problems on a whiteboard, where they're free to fix, rather than after they're built into the code and architecture. Careful coding can't retrofit a control that was never designed, so the earliest phases are where the highest-leverage security work happens",
+    "Because penetration testing is done first and coding comes later",
+    "Because compliance forbids writing code without a security review",
+  ]}
+  answer={1}
+  explanation="Design-level flaws — a control that's missing or fundamentally wrong — are the costliest and can't be patched away later, so the leverage is highest before coding. Security requirements, abuse cases, and threat modeling (e.g. STRIDE over data flows and trust boundaries) surface those issues when they're cheapest to address, directly countering OWASP's Insecure Design. It's about catching architectural problems early, not a tooling limitation or a compliance formality."
+/>
 
 <h2 id="secure-implementation">Implementation: Secure Coding & SAST</h2>
 
-Placeholder.
+As code is written, three practices keep flaws out. First, **secure coding standards** — the recurring defenses from across this category: validate input, encode output, use parameterized queries, apply least privilege, fail closed. These are the concrete habits that prevent injection, broken access control, and the rest of the [OWASP Top 10](/topics/security/owasp-top-10). Second, **peer code review** with security in mind, so a second set of eyes catches what the author missed — and specifically that **secrets never get committed to source** (they belong in a secrets manager, not the repo).
+
+Third, and the phase's signature automated control, **SAST — Static Application Security Testing**. SAST is **white-box** analysis: it reads the **source code** (without running it) looking for vulnerable patterns — a tainted input reaching a SQL string, a weak crypto call, a hardcoded credential. Its great virtue is that it runs **early and fast**, right in the developer's IDE and on every commit in CI, so a flaw is flagged **seconds after it's written** — the cheapest possible moment. Its limits: it can't see runtime or configuration behavior, and it produces **false positives** that need tuning. Used well, it's a fast feedback loop that stops whole classes of bug at the keyboard.
+
+<KnowledgeCheck
+  question="What is SAST and what is its main strength and limitation?"
+  options={[
+    "SAST attacks the running application from the outside to find runtime flaws",
+    "SAST (Static Application Security Testing) is white-box analysis of source code — without running it — that flags vulnerable patterns like tainted input reaching a query or hardcoded secrets. Its strength is running very early and fast (in the IDE and on every commit), catching flaws seconds after they're written, at the cheapest moment. Its limitation is that it can't see runtime or configuration behavior and tends to produce false positives that need tuning",
+    "SAST scans third-party dependencies for known CVEs",
+    "SAST is a manual penetration test performed before release",
+  ]}
+  answer={1}
+  explanation="SAST reads source statically to find insecure patterns, and because it runs in the IDE and CI it gives immediate, early feedback — the shift-left ideal. But since it never executes the app, it misses runtime and configuration issues and flags false positives. Attacking the running app is DAST; scanning dependencies is SCA; a manual pre-release test is a pentest. SAST is the source-code, white-box, early-feedback tool."
+/>
 
 <h2 id="security-testing">Testing: SAST, DAST, IAST & SCA</h2>
 
-Placeholder.
+The testing phase adds several complementary tools, and knowing when each applies is a common interview topic. No single one is sufficient — they see different things.
+
+<TradeoffTable
+  columns={["Tool", "How it works", "Finds", "Blind spot"]}
+  rows={[
+    ["SAST", "White-box: analyzes source code, not running", "Insecure code patterns, early", "Runtime/config issues; false positives"],
+    ["DAST", "Black-box: attacks the running app from outside", "Runtime, config, and integration flaws", "Later; no source view; shallow coverage"],
+    ["IAST", "Instruments the running app from inside", "Runtime flaws with code-level context", "Needs instrumentation; runtime only"],
+    ["SCA", "Scans dependencies against known-CVE databases", "Known-vulnerable third-party components", "Only known CVEs, not novel bugs"],
+  ]}
+  recommendedRow={3}
+/>
+
+**SAST** (from the last section) reads source early. **DAST — Dynamic Application Security Testing** is the opposite: **black-box**, it attacks the **running** application from the outside like a real attacker would — finding runtime and configuration flaws SAST can't see, with no source access needed — but it runs later and its coverage is shallower. **IAST** instruments the app from the inside to combine both views. And crucially, **SCA — Software Composition Analysis** scans your **dependencies** against databases of known vulnerabilities: since modern apps are mostly third-party code, this is how you catch the **[vulnerable-components](/topics/security/owasp-top-10)** risk (the Log4Shell class) before it ships. **Fuzzing** rounds it out, hurling malformed input at the app to find crashes and edge cases. The point is to layer them — each covers another's blind spot.
+
+<KnowledgeCheck
+  question="How do SAST, DAST, and SCA differ, and why run more than one?"
+  options={[
+    "They're three names for the same scan; running one is enough",
+    "SAST analyzes source code statically (early, white-box, finds insecure patterns), DAST attacks the running application from the outside (later, black-box, finds runtime and config flaws), and SCA scans third-party dependencies against known-CVE databases (catches vulnerable components like Log4Shell). Each sees what the others can't — SAST misses runtime behavior, DAST misses source-level issues and has shallow coverage, SCA only knows published CVEs — so layering them covers each tool's blind spot",
+    "SAST and DAST both scan dependencies; SCA tests the UI",
+    "They differ only in speed, not in what they can find",
+  ]}
+  answer={1}
+  explanation="The three operate at different vantage points: SAST on static source (early, pattern-based), DAST on the live app from outside (runtime/config), and SCA on the dependency tree against known-CVE feeds. Because each has real blind spots — SAST can't see runtime, DAST can't see source and covers shallowly, SCA only knows disclosed vulnerabilities — a serious pipeline runs several so their coverage overlaps. They're genuinely different techniques, not speed variants of one."
+/>
 
 <h2 id="supply-chain">CI/CD & Supply-Chain Security</h2>
 
-Placeholder.
+The **CI/CD pipeline** is where a Secure SDLC becomes real, because it's where the automated checks run as **enforcement gates**: SAST, SCA, secret-scanning, and DAST execute on every change and can **fail the build**, so security isn't optional or forgotten.
+
+<SecureSdlcPipelineSequence />
+
+But the pipeline is also a **high-value target**, which raises **supply-chain security**. A compromised build system or a single malicious dependency poisons **everything downstream** — every customer who installs the resulting software — which is exactly the **[Software and Data Integrity Failures](/topics/security/owasp-top-10)** risk, the class of the **SolarWinds** attack. The defenses are about **provenance and integrity**: **sign build artifacts** so consumers can verify they're genuine and untampered; generate an **SBOM (Software Bill of Materials)** so you know *exactly* what components you ship (and can answer "are we affected?" the day a new CVE lands); verify build **provenance** with frameworks like **SLSA**; pin and verify dependencies; and lock down the pipeline's own credentials. You're securing not just your code but the entire chain that produces and delivers it.
+
+<KnowledgeCheck
+  question="Why is supply-chain security critical, and what defenses address it?"
+  options={[
+    "It isn't — only your own source code matters",
+    "Because a compromised build pipeline or a malicious dependency poisons everything downstream — every user of the resulting software — as in the SolarWinds attack (OWASP's software and data integrity failures). Defenses focus on provenance and integrity: signing build artifacts so they can be verified as genuine, generating an SBOM to know exactly what you ship (and answer 'are we affected?' when a CVE drops), verifying build provenance (SLSA), pinning/verifying dependencies, and locking down pipeline credentials",
+    "It's handled entirely by running SAST on your own code",
+    "It only matters for open-source projects, not commercial software",
+  ]}
+  answer={1}
+  explanation="Modern software is assembled from many third-party components and produced by an automated pipeline, so compromising a dependency or the build system propagates to everyone downstream — the SolarWinds/integrity-failure class. Since the risk is trusting unverified code, the countermeasures establish provenance and integrity: artifact signing, an SBOM for visibility, provenance frameworks like SLSA, dependency pinning/verification, and hardened pipeline credentials. Scanning your own source (SAST) doesn't cover code you didn't write or the pipeline itself."
+/>
 
 <h2 id="capacity-estimates">Capacity: The Economics of Shifting Left</h2>
 
-Placeholder.
+Everything in this topic rests on one empirical fact: the cost to fix a flaw rises **steeply the later it's found**. A bug caught while threat modeling costs almost nothing — you erase a box and redraw it. The *same* bug found in production costs dramatically more: an emergency patch, an incident response, possibly a breach with regulatory and reputational fallout. The classic industry figure is roughly **100×** between the earliest and latest phases, and that multiplier is the entire business case for shifting left.
+
+<SecureSdlcCapacity
+  assumptions={{
+    vulnsPerRelease: 100,
+    costFixInDesign: 100,
+    prodCostMultiplier: 100,
+    shiftLeftCatchRate: 0.9,
+  }}
+/>
+
+Put numbers on it. Say a release introduces 100 flaws, each costing about **$100** to fix if caught early but **$10,000** (100×) if it escapes to production. If your only security check is a gate at the end and all 100 surface in production, that's **$1,000,000**. A Secure SDLC that catches **90%** early — threat modeling, SAST and SCA in the IDE and CI, code review — pays $100 for those 90 and $10,000 only for the 10 that slip through: a total of **$109,000**, saving **$891,000**, an **~89% reduction**. The lesson is blunt: shift-left isn't only safer, it's *far cheaper*, and the savings come precisely from moving detection into the earliest, most automated phases. Every dollar spent on early security tooling is leveraged against that 100× multiplier — which is why the investment is in prevention and early detection, not just late-stage testing.
 
 <h2 id="deploy-runtime">Deployment, Runtime & Operations</h2>
 
-Placeholder.
+Shipping isn't the finish line. At **deployment**, apply **secure configuration and hardening** — secure defaults, least functionality, no debug endpoints or default credentials (the OWASP **[misconfiguration](/topics/security/owasp-top-10)** risk) — and **inject secrets at deploy time** from a secrets manager rather than baking them into images. Run a final **DAST** pass against the deployed app in **staging**.
+
+Then comes **runtime**, where two operational disciplines matter. **Monitoring and logging** provide the detection layer for whatever slips through every earlier gate (the OWASP **logging & monitoring** risk — you can't respond to what you can't see). And **vulnerability management** handles a subtle but critical fact: **your code doesn't have to change to become vulnerable.** A dependency that was clean at ship time becomes exploitable the day a new CVE is disclosed against it — so you must **continuously rescan** dependencies and infrastructure against fresh vulnerability data and **patch promptly**. Security operations is a standing loop, not a launch checklist.
+
+<Callout variant="warning" title="Safe at ship time is not safe forever">
+A component with no known vulnerabilities when you deploy can become critically vulnerable overnight — not because your code changed, but because a **new CVE was disclosed** against it (Log4Shell hit millions of unchanged apps this way). This is why a Secure SDLC includes **continuous** vulnerability management — rescanning your dependency inventory (your SBOM) against fresh CVE feeds and patching on a clock — rather than a one-time pre-launch scan.
+</Callout>
+
+<KnowledgeCheck
+  question="Why must vulnerability management be continuous rather than a one-time pre-release scan?"
+  options={[
+    "Because code changes constantly, so you must rescan the new code",
+    "Because a dependency can become vulnerable without your code changing at all — a new CVE disclosed against a component you already shipped makes previously-clean software exploitable (as Log4Shell did to millions of unchanged apps). So you must continuously rescan your dependency inventory (SBOM) against fresh vulnerability data and patch promptly, treating security operations as a standing loop rather than a launch checklist",
+    "Because monitoring replaces the need for any scanning",
+    "Because compliance requires a scan every quarter regardless of risk",
+  ]}
+  answer={1}
+  explanation="The key insight is that vulnerability is not static: newly disclosed CVEs render already-deployed, unchanged components exploitable overnight, which is exactly how Log4Shell affected so many systems. That decouples risk from your own change cadence, so a one-time scan goes stale immediately. Continuous rescanning of the SBOM against current CVE feeds plus prompt patching is required — it's driven by the external threat landscape, not just your code changes or a compliance calendar."
+/>
 
 <h2 id="verification-response">Verification & Response</h2>
 
-Placeholder.
+Automation catches the known and the mechanical; **skilled humans** catch what it misses. Independent verification comes in escalating forms: **penetration testing** (experts actively try to break a specific application), **red teaming** (a simulated adversary attacks the whole organization — people, process, and technology — to test detection and response, not just find bugs), and **bug bounty** programs (paying a crowd of external researchers to report vulnerabilities continuously). Each surfaces creative, chained, and business-logic flaws that scanners can't reason about.
+
+When something *is* found — by a scanner, a pentester, or a bounty report — the work is to **close the loop**, which is where **incident response** and a **vulnerability-management process** come in.
+
+<VulnerabilityResponseSequence />
+
+Findings are **triaged** and assigned a **severity**, **prioritized** against everything else competing for engineering time, then **fixed, tested, deployed, and verified** as resolved. Doing this reliably — with severity-based **remediation SLAs** so a critical flaw is patched in days, not someday — is what separates a program that *finds* vulnerabilities from one that actually *reduces risk*. A finding that sits unremediated in a backlog protects no one.
+
+<KnowledgeCheck
+  question="What's the difference between a penetration test and a bug bounty program, and why have a vulnerability-management loop?"
+  options={[
+    "They're identical; the loop is unnecessary paperwork",
+    "A penetration test is a time-boxed engagement where experts actively try to break a specific application; a bug bounty is an ongoing program paying a crowd of external researchers to report vulnerabilities continuously. Both find creative flaws automation misses. The vulnerability-management loop matters because finding issues is worthless unless they're closed: it triages, assigns severity, prioritizes, fixes, and verifies — ideally with severity-based SLAs — so findings become remediated risk rather than a growing backlog",
+    "A pentest scans dependencies and a bug bounty runs SAST",
+    "A bug bounty is a one-time test and a pentest is continuous",
+  ]}
+  answer={1}
+  explanation="A pentest is a focused, time-boxed expert assessment; a bug bounty is a continuous, crowd-sourced incentive for external researchers — complementary ways to find what scanners can't. But discovery only reduces risk if paired with a management loop that triages by severity, prioritizes, remediates, and verifies, ideally under remediation SLAs. Without that loop, findings pile up unfixed. Neither is a dependency scan (SCA) or SAST, and the bounty is the continuous one, not the pentest."
+/>
 
 <h2 id="pitfalls-best-practices">Pitfalls & Best Practices</h2>
 
-Placeholder.
+The failure modes of a security program are as consistent as the technical ones.
+
+<Callout variant="warning" title="Secure SDLC footguns">
+- **Security as a last-minute gate.** A pentest the week before launch finds flaws when they're most expensive and least likely to be fixed. Shift left.
+- **No automation.** Manual security reviews don't scale and get skipped under deadline pressure. Bake SAST/SCA/secret-scanning into CI as gates.
+- **Ignoring dependencies.** Most of your code is third-party. Without SCA and an SBOM you're blind to the vulnerable-components risk.
+- **Secrets in code or images.** Keys committed to repos or baked into containers are a top leak. Inject them at runtime from a secrets manager.
+- **Unsigned artifacts, no SBOM.** Supply-chain blindness — you can't verify what you ship or answer "are we affected?" when a CVE drops.
+- **Scanning but never fixing.** Findings without remediation SLAs are theater. Prioritize and close them.
+- **Treating it as one-time.** New CVEs land against unchanged code. Vulnerability management is continuous.
+</Callout>
+
+<DecisionRecord
+  title="Adopting a Secure SDLC (DevSecOps)"
+  choice="Integrate security into every phase and automate it in the pipeline. Threat-model at design and capture security requirements/abuse cases; enforce secure coding standards, code review, and SAST during implementation; run SAST, DAST, IAST, and SCA plus secret-scanning as automated CI/CD gates that can fail the build; secure the supply chain by signing artifacts, generating an SBOM, and verifying provenance; harden configuration and inject secrets at deploy; monitor at runtime and run continuous vulnerability management with severity-based remediation SLAs; and verify independently with penetration tests and a bug-bounty program, closing every finding through a triage-to-remediation loop."
+  rationale="Flaws get exponentially more expensive by phase (~100× by production), so shifting detection left and automating it yields the largest risk reduction per dollar. Layering SAST/DAST/IAST/SCA covers each tool's blind spots; supply-chain controls address the integrity-failure class; continuous vulnerability management handles CVEs disclosed against unchanged code; and human testing plus a remediation loop catch and actually close what automation misses. Automation in the pipeline makes security consistent and unskippable rather than a person's final sign-off."
+  alternatives="A pre-release penetration test as the only control — finds flaws late and expensively, misses design issues. Manual security reviews without automation — don't scale, skipped under pressure. Scanning without remediation SLAs — findings pile up unfixed. No SBOM or artifact signing — supply-chain blindness. A one-time launch scan — goes stale the moment a new CVE is disclosed. A separate security team as a gatekeeper rather than shared DevSecOps responsibility — creates a bottleneck and an us-vs-them dynamic."
+  revisitWhen="A new class of component or architecture (mobile, ML, IaC) needs its own controls; an incident reveals a phase the pipeline doesn't cover; regulatory or customer requirements mandate specific evidence (SBOM, SLSA level, pentest cadence); or the toolchain's false-positive rate or gate latency starts causing developers to bypass it."
+/>
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="In the capacity model, fixing all 100 flaws in production costs $1,000,000 but a Secure SDLC that catches 90% early costs $109,000. What's the lesson?"
+  options={[
+    "That security is too expensive and should be minimized",
+    "That the cost to fix a flaw rises ~100× from design to production, so shifting detection into the earliest, most automated phases is dramatically cheaper, not just safer — here an ~89% saving. The steep cost curve is the business case for threat modeling and SAST/SCA in the IDE and CI: every dollar spent on early prevention and detection is leveraged against that 100× multiplier, which is why a Secure SDLC invests in the early phases and the pipeline rather than a late-stage test",
+    "That you should only test in production to save early effort",
+    "That the number of flaws per release is what matters most",
+  ]}
+  answer={1}
+  explanation="The model captures the exponential cost-by-phase curve (~100× design-to-production) and shows that catching most flaws early collapses total remediation cost (about 89% here). That economics — not just risk reduction — is why shift-left pays: early, automated detection is leveraged against the large late-stage multiplier. Testing only in production is the expensive worst case, and while flaw count matters, the decisive factor is where in the lifecycle each flaw is caught."
+/>
+
+<Faq
+  items={[
+    { question: "What is a Secure SDLC?", answer: "A Secure Software Development Lifecycle integrates security into every phase of building software — requirements, design, implementation, testing, deployment, and operations — rather than treating it as a one-time check at the end. It combines activities like threat modeling, secure coding, automated security testing, supply-chain controls, and continuous vulnerability management, so security is built in continuously instead of tested in at the end. The automated, pipeline-driven form is called DevSecOps." },
+    { question: "What does 'shift left' mean?", answer: "Shifting left means moving security activities as early in the development timeline as possible — threat modeling at design, SAST and code review during coding, dependency scanning in CI — rather than only testing near release. The rationale is cost: a flaw caught early (on a whiteboard or at the keyboard) is far cheaper to fix than one found in production, where it may mean an emergency patch, incident, or breach. Earlier detection is both safer and dramatically cheaper." },
+    { question: "Why is finding a bug early so much cheaper than finding it in production?", answer: "Because the later a flaw is found, the more it's baked into the architecture, code, and released systems, so fixing it touches more and risks more. A design flaw caught while threat modeling is a whiteboard edit; the same flaw in production can require an emergency patch, incident response, and breach remediation — roughly a 100× cost increase across the lifecycle. That multiplier is the core economic argument for a Secure SDLC." },
+    { question: "What is threat modeling and when do you do it?", answer: "Threat modeling is systematically analyzing a design to enumerate what can go wrong and deciding on controls before building — typically by mapping data flows and trust boundaries and applying a framework like STRIDE to check each threat category. You do it in the design phase (and revisit it when the design changes) because it catches insecure-design flaws — missing controls — when they're cheapest to fix, before they're built into code." },
+    { question: "What's the difference between SAST, DAST, IAST, and SCA?", answer: "SAST (static) analyzes source code without running it, finding insecure patterns early. DAST (dynamic) attacks the running application from the outside, finding runtime and configuration flaws. IAST instruments the running app from inside to combine both views. SCA (software composition analysis) scans third-party dependencies against known-CVE databases. Each has blind spots — SAST misses runtime, DAST misses source and covers shallowly, SCA only knows published CVEs — so mature pipelines run several." },
+    { question: "What is SCA and why does it matter so much?", answer: "Software Composition Analysis scans your dependencies against databases of known vulnerabilities to flag components with published CVEs. It matters because modern applications are mostly third-party code, so a known-vulnerable library (like Log4Shell) is one of the most common ways to get breached. SCA plus an SBOM lets you detect vulnerable components before shipping and quickly answer 'are we affected?' when a new CVE is disclosed." },
+    { question: "What is supply-chain security and what is an SBOM?", answer: "Supply-chain security protects the components and pipeline that produce your software, because a compromised dependency or build system poisons everything downstream (the SolarWinds class). An SBOM (Software Bill of Materials) is a complete inventory of the components in your software; it gives you the visibility to verify what you ship and to instantly check whether you're affected when a new vulnerability is disclosed. Signing artifacts and verifying provenance (SLSA) are complementary defenses." },
+    { question: "How does CI/CD fit into a Secure SDLC?", answer: "The CI/CD pipeline is where security automation becomes enforceable: SAST, SCA, secret-scanning, and DAST run on every change as gates that can fail the build, so security checks aren't optional or forgotten. It's also where supply-chain controls live — signing artifacts and generating an SBOM. Making these automated and unskippable is the essence of DevSecOps, turning security from a person's final sign-off into a property of the delivery process." },
+    { question: "Why must vulnerability management be continuous?", answer: "Because a component can become vulnerable without your code changing — a newly disclosed CVE makes already-deployed software exploitable overnight, as Log4Shell did to countless unchanged applications. A one-time pre-release scan goes stale immediately. Continuous vulnerability management rescans your dependency inventory against fresh CVE feeds and patches on a schedule, treating security as a standing operational loop rather than a launch checklist." },
+    { question: "What's the difference between penetration testing and a bug bounty?", answer: "A penetration test is a time-boxed engagement where experts actively try to break a specific application or system. A bug bounty is an ongoing program that pays a crowd of external researchers to report vulnerabilities continuously. Red teaming goes further, simulating a real adversary against the whole organization to test detection and response. All three find creative, chained, and business-logic flaws that automated scanners can't reason about, complementing the automated pipeline." },
+    { question: "What is DevSecOps?", answer: "DevSecOps extends DevOps by making security a shared, automated responsibility woven through the delivery pipeline rather than a separate team's gate at the end. In practice it means automating security testing (SAST, DAST, SCA, secret-scanning) as CI/CD gates, threat modeling early, securing the supply chain, and monitoring and managing vulnerabilities continuously — so security moves at the speed of development and everyone owns it, instead of being a bottleneck sign-off." },
+    { question: "Isn't a penetration test before launch enough?", answer: "No. A single pre-launch pentest finds flaws at the most expensive, hardest-to-fix moment, misses design-level problems entirely, and gives a false sense of security that decays as soon as code or dependencies change. It's a useful part of a program but not a substitute for building security in across every phase — threat modeling, automated testing in CI, supply-chain controls, and continuous vulnerability management — which catch far more, far earlier, and far more cheaply." },
+  ]}
+/>
