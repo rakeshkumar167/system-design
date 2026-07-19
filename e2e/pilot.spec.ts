@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(14);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(13);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -380,6 +380,19 @@ test("learner can open the leaderboard tutorial", async ({ page }) => {
   // Assert the embedded diagram first so layout settles before the viewport check.
   await expect(
     page.getByRole("img", { name: /leaderboard architecture/i }).first(),
+  ).toBeVisible();
+  await expect(page.locator("#high-level-architecture")).toBeInViewport();
+});
+
+test("learner can open the metrics and monitoring tutorial", async ({ page }) => {
+  await page.goto("/learn/metrics-monitoring");
+  await expect(
+    page.getByRole("heading", { name: /design a metrics and monitoring system/i }),
+  ).toBeVisible();
+  await page.goto("/learn/metrics-monitoring#high-level-architecture");
+  // Assert the embedded diagram first so layout settles before the viewport check.
+  await expect(
+    page.getByRole("img", { name: /metrics and monitoring architecture/i }).first(),
   ).toBeVisible();
   await expect(page.locator("#high-level-architecture")).toBeInViewport();
 });
