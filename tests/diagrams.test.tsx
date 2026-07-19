@@ -578,6 +578,10 @@ import {
   PasswordRegistrationSequence,
   PasswordVerificationSequence,
 } from "@/components/diagrams/password-hashing-flows";
+import {
+  EnvelopeEncryptSequence,
+  EnvelopeDecryptSequence,
+} from "@/components/diagrams/encryption-key-management-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -630,5 +634,23 @@ describe("Password hashing flow diagrams", () => {
       screen.getByRole("img", { name: /verifying a password at login/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/recomputed and compared in constant time/i)).toBeInTheDocument();
+  });
+});
+
+describe("Envelope encryption flow diagrams", () => {
+  it("exposes envelope encryption to non-visual readers", () => {
+    render(<EnvelopeEncryptSequence />);
+    expect(
+      screen.getByRole("img", { name: /encrypting data with envelope encryption/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/the master key never leaves the KMS/i)).toBeInTheDocument();
+  });
+
+  it("exposes envelope decryption to non-visual readers", () => {
+    render(<EnvelopeDecryptSequence />);
+    expect(
+      screen.getByRole("img", { name: /decrypting data with envelope encryption/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/consulted per data key, not per object/i)).toBeInTheDocument();
   });
 });
