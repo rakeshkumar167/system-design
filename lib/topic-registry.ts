@@ -70,6 +70,27 @@ export const topicMetas: Record<string, TopicMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "password-hashing": {
+    slug: "password-hashing",
+    categorySlug: "security",
+    title: "Password Hashing",
+    description:
+      "How a system stores credentials so a database breach yields no usable passwords — why passwords are hashed and never encrypted, salting against rainbow tables, deliberately slow adaptive hashing and the work factor, the memory-hard algorithms (Argon2, scrypt, bcrypt, PBKDF2), the cost of hashing at scale, peppering, and constant-time verification.",
+    readingMinutes: 22,
+    concepts: ["Salting", "Work factor", "Argon2/bcrypt", "Memory-hardness", "Peppering"],
+    sections: [
+      { id: "overview", label: "What Password Hashing Is", depth: "fundamentals" },
+      { id: "hashing-vs-encryption", label: "Hashing vs Encryption", depth: "fundamentals" },
+      { id: "salting", label: "Salting & Rainbow Tables", depth: "interview-ready" },
+      { id: "slow-hashing", label: "Slow Hashing & the Work Factor", depth: "interview-ready" },
+      { id: "algorithms", label: "The Algorithms: Argon2, scrypt, bcrypt, PBKDF2", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity: The Cost of Hashing", depth: "interview-ready" },
+      { id: "peppering-storage", label: "Peppering & Credential Storage", depth: "advanced" },
+      { id: "verification-in-practice", label: "Verification in Practice", depth: "interview-ready" },
+      { id: "pitfalls-best-practices", label: "Pitfalls & Best Practices", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTopic(slug: string): TopicMeta | undefined {

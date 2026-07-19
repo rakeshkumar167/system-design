@@ -7,12 +7,14 @@ import { TopicLayout } from "@/components/topic/topic-layout";
 import AuthenticationContent from "@/content/topics/authentication.mdx";
 import TlsContent from "@/content/topics/tls-https-certificates.mdx";
 import AuthorizationContent from "@/content/topics/authorization.mdx";
+import PasswordHashingContent from "@/content/topics/password-hashing.mdx";
 
 /** Maps each registered topic slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
   authentication: AuthenticationContent,
   "tls-https-certificates": TlsContent,
   authorization: AuthorizationContent,
+  "password-hashing": PasswordHashingContent,
 };
 
 export function generateStaticParams() {
