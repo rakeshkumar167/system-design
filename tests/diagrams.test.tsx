@@ -590,6 +590,10 @@ import {
   BolaAttackSequence,
   GatewayEnforcementSequence,
 } from "@/components/diagrams/api-security-flows";
+import {
+  SessionFixationSequence,
+  SecureLoginSessionSequence,
+} from "@/components/diagrams/session-management-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -696,5 +700,23 @@ describe("API security flow diagrams", () => {
       screen.getByRole("img", { name: /layered enforcement at the API gateway/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/Coarse checks at the edge, ownership checks in the service/i)).toBeInTheDocument();
+  });
+});
+
+describe("Session management flow diagrams", () => {
+  it("exposes the session fixation attack to non-visual readers", () => {
+    render(<SessionFixationSequence />);
+    expect(
+      screen.getByRole("img", { name: /a session fixation attack/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/regenerate the session id at login/i)).toBeInTheDocument();
+  });
+
+  it("exposes secure session establishment to non-visual readers", () => {
+    render(<SecureLoginSessionSequence />);
+    expect(
+      screen.getByRole("img", { name: /establishing and validating a secure session/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/it is simply a bearer credential validated server-side every time/i)).toBeInTheDocument();
   });
 });
