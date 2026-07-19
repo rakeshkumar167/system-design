@@ -33,6 +33,7 @@ import { AuthorizationCapacity } from "@/components/learning/authorization-capac
 import { PasswordHashingCapacity } from "@/components/learning/password-hashing-capacity";
 import { EncryptionCapacity } from "@/components/learning/encryption-key-management-capacity";
 import { OwaspRiskCapacity } from "@/components/learning/owasp-top-10-capacity";
+import { ApiSecurityCapacity } from "@/components/learning/api-security-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -208,6 +209,7 @@ const teachingComponents = {
   PasswordHashingCapacity,
   EncryptionCapacity,
   OwaspRiskCapacity,
+  ApiSecurityCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
