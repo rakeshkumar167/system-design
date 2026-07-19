@@ -157,6 +157,21 @@ test("learner can open the encryption and key management security topic", async 
   await expect(page.locator("#envelope-encryption")).toBeInViewport();
 });
 
+test("learner can open the OWASP Top 10 security topic", async ({ page }) => {
+  await page.goto("/topics");
+  await page.getByRole("link", { name: /owasp top 10/i }).first().click();
+  await expect(
+    page.getByRole("heading", { level: 1, name: /^owasp top 10$/i }),
+  ).toBeVisible();
+  // Navigate to a section via URL fragment (TOC is hidden on mobile viewports)
+  await page.goto("/topics/security/owasp-top-10#injection");
+  // Assert the embedded diagram first so layout settles before the viewport check.
+  await expect(
+    page.getByRole("img", { name: /a SQL injection attack/i }).first(),
+  ).toBeVisible();
+  await expect(page.locator("#injection")).toBeInViewport();
+});
+
 test("theme toggle switches between light and dark", async ({ page }) => {
   await page.goto("/");
   const html = page.locator("html");
