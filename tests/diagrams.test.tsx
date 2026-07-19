@@ -586,6 +586,10 @@ import {
   InjectionAttackSequence,
   SsrfAttackSequence,
 } from "@/components/diagrams/owasp-top-10-flows";
+import {
+  BolaAttackSequence,
+  GatewayEnforcementSequence,
+} from "@/components/diagrams/api-security-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -674,5 +678,23 @@ describe("OWASP attack flow diagrams", () => {
       screen.getByRole("img", { name: /a server-side request forgery attack/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/allow only an explicit list of permitted destinations/i)).toBeInTheDocument();
+  });
+});
+
+describe("API security flow diagrams", () => {
+  it("exposes the BOLA attack to non-visual readers", () => {
+    render(<BolaAttackSequence />);
+    expect(
+      screen.getByRole("img", { name: /a broken object-level authorization \(BOLA\) attack/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/a per-object ownership check on every request/i)).toBeInTheDocument();
+  });
+
+  it("exposes layered gateway enforcement to non-visual readers", () => {
+    render(<GatewayEnforcementSequence />);
+    expect(
+      screen.getByRole("img", { name: /layered enforcement at the API gateway/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Coarse checks at the edge, ownership checks in the service/i)).toBeInTheDocument();
   });
 });

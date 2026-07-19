@@ -167,6 +167,7 @@ import { AuthorizationDecisionSequence, RelationshipCheckSequence } from "@/comp
 import { PasswordRegistrationSequence, PasswordVerificationSequence } from "@/components/diagrams/password-hashing-flows";
 import { EnvelopeEncryptSequence, EnvelopeDecryptSequence } from "@/components/diagrams/encryption-key-management-flows";
 import { InjectionAttackSequence, SsrfAttackSequence } from "@/components/diagrams/owasp-top-10-flows";
+import { BolaAttackSequence, GatewayEnforcementSequence } from "@/components/diagrams/api-security-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -313,6 +314,8 @@ const teachingComponents = {
   EnvelopeDecryptSequence,
   InjectionAttackSequence,
   SsrfAttackSequence,
+  BolaAttackSequence,
+  GatewayEnforcementSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
