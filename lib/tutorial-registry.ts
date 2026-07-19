@@ -557,6 +557,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "metrics-monitoring": {
+    slug: "metrics-monitoring",
+    title: "Design a Metrics and Monitoring System",
+    description:
+      "An interview-grade walkthrough of a Prometheus/Datadog-class metrics platform: why monitoring is a write-firehose problem, the time-series data model and cardinality, push vs pull ingestion, a compressed time-partitioned TSDB (delta-of-delta + XOR), downsampling and tiered retention, range-aggregation queries, continuous alert-rule evaluation, and the failure modes.",
+    difficulty: "Advanced",
+    readingMinutes: 34,
+    concepts: ["Time-series storage", "Aggregation", "Downsampling", "Alerting"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "data-model-cardinality", label: "The Data Model & Cardinality", depth: "advanced" },
+      { id: "ingestion-pipeline", label: "Ingestion: Push vs Pull", depth: "advanced" },
+      { id: "tsdb-storage", label: "Time-Series Storage & Compression", depth: "advanced" },
+      { id: "downsampling-retention", label: "Downsampling & Retention", depth: "advanced" },
+      { id: "query-aggregation", label: "Querying & Aggregation", depth: "advanced" },
+      { id: "alerting", label: "Alerting", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

@@ -22,6 +22,7 @@ import SearchAutocompleteContent from "@/content/tutorials/search-autocomplete.m
 import NewsFeedContent from "@/content/tutorials/news-feed.mdx";
 import ChatSystemContent from "@/content/tutorials/chat-system.mdx";
 import LeaderboardContent from "@/content/tutorials/leaderboard.mdx";
+import MetricsMonitoringContent from "@/content/tutorials/metrics-monitoring.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -44,6 +45,7 @@ const content: Record<string, ComponentType> = {
   "news-feed": NewsFeedContent,
   "chat-system": ChatSystemContent,
   "leaderboard": LeaderboardContent,
+  "metrics-monitoring": MetricsMonitoringContent,
 };
 
 export function generateStaticParams() {

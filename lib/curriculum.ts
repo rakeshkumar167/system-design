@@ -192,7 +192,7 @@ export const problems: readonly Problem[] = [
       "Ingest, store, and query high-cardinality time-series data and drive alerting.",
     difficulty: "Advanced",
     concepts: ["Time-series storage", "Aggregation", "Downsampling", "Alerting"],
-    status: "coming-soon",
+    status: "available",
     sequence: 19,
   },
   {
