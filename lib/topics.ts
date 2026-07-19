@@ -19,7 +19,7 @@ export const topicCategories: readonly TopicCategory[] = [
       { slug: "password-hashing", title: "Password hashing", blurb: "Argon2/bcrypt", status: "available" },
       { slug: "encryption-key-management", title: "Encryption and key management", blurb: "AES, KMS, envelope encryption", status: "available" },
       { slug: "owasp-top-10", title: "OWASP Top 10", blurb: "Injection, access control, SSRF", status: "available" },
-      { slug: "api-security", title: "API security", blurb: "", status: "coming-soon" },
+      { slug: "api-security", title: "API security", blurb: "BOLA, tokens, gateways", status: "available" },
       { slug: "session-management", title: "Session management", blurb: "", status: "coming-soon" },
       { slug: "rate-limiting", title: "Rate limiting", blurb: "", status: "coming-soon" },
       { slug: "secrets-management", title: "Secrets management", blurb: "", status: "coming-soon" },

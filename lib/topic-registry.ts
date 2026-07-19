@@ -133,6 +133,27 @@ export const topicMetas: Record<string, TopicMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "api-security": {
+    slug: "api-security",
+    categorySlug: "security",
+    title: "API Security",
+    description:
+      "How to secure the APIs that are now the primary attack surface — authenticating machine clients (API keys, OAuth2 tokens, mTLS), object- and function-level authorization (BOLA/BFLA), preventing data over-exposure and mass assignment, rate limiting and resource consumption, the API gateway as the edge enforcement point, and transport and configuration hygiene.",
+    readingMinutes: 23,
+    concepts: ["API keys & tokens", "BOLA/BFLA", "Rate limiting", "API gateway", "Data exposure"],
+    sections: [
+      { id: "overview", label: "What API Security Is", depth: "fundamentals" },
+      { id: "authenticating-clients", label: "Authenticating API Clients", depth: "interview-ready" },
+      { id: "authorizing-requests", label: "Object- & Function-Level Authorization", depth: "interview-ready" },
+      { id: "data-exposure", label: "Data Exposure & Mass Assignment", depth: "interview-ready" },
+      { id: "resource-consumption", label: "Rate Limiting & Resource Consumption", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity: The Cost of Securing Every Request", depth: "interview-ready" },
+      { id: "api-gateway", label: "The API Gateway as Enforcement Point", depth: "advanced" },
+      { id: "transport-misconfig", label: "Transport Security & Misconfiguration", depth: "interview-ready" },
+      { id: "pitfalls-best-practices", label: "Pitfalls & Best Practices", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTopic(slug: string): TopicMeta | undefined {

@@ -24,7 +24,7 @@ describe("topic registry", () => {
     }
   });
   it("returns undefined for an unregistered topic", () => {
-    expect(getTopic("api-security")).toBeUndefined();
+    expect(getTopic("session-management")).toBeUndefined();
   });
   it("registers the TLS topic", () => {
     expect(Object.keys(topicMetas)).toContain("tls-https-certificates");
@@ -90,6 +90,20 @@ describe("topic registry", () => {
   });
   it("gives every OWASP section a unique id and a valid depth", () => {
     const sections = getTopic("owasp-top-10")!.sections;
+    const ids = sections.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const s of sections) {
+      expect(["fundamentals", "interview-ready", "advanced"]).toContain(s.depth);
+    }
+  });
+  it("registers the API Security topic", () => {
+    expect(Object.keys(topicMetas)).toContain("api-security");
+  });
+  it("describes the API Security topic's ten sections", () => {
+    expect(getTopic("api-security")?.sections).toHaveLength(10);
+  });
+  it("gives every API Security section a unique id and a valid depth", () => {
+    const sections = getTopic("api-security")!.sections;
     const ids = sections.map((s) => s.id);
     expect(new Set(ids).size).toBe(ids.length);
     for (const s of sections) {
