@@ -173,6 +173,13 @@ import { InjectionAttackSequence, SsrfAttackSequence } from "@/components/diagra
 import { BolaAttackSequence, GatewayEnforcementSequence } from "@/components/diagrams/api-security-flows";
 import { SessionFixationSequence, SecureLoginSessionSequence } from "@/components/diagrams/session-management-flows";
 import { SecureSdlcPipelineSequence, VulnerabilityResponseSequence } from "@/components/diagrams/secure-sdlc-flows";
+import { LeaderboardArchitecture } from "@/components/diagrams/leaderboard-architecture";
+import {
+  SubmitScoreSequence,
+  TopKQuerySequence,
+  PlayerRankSequence,
+  ShardedRankSequence,
+} from "@/components/diagrams/leaderboard-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -328,6 +335,11 @@ const teachingComponents = {
   SecureLoginSessionSequence,
   SecureSdlcPipelineSequence,
   VulnerabilityResponseSequence,
+  LeaderboardArchitecture,
+  SubmitScoreSequence,
+  TopKQuerySequence,
+  PlayerRankSequence,
+  ShardedRankSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

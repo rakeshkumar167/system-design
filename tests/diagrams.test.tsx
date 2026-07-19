@@ -598,6 +598,13 @@ import {
   SecureSdlcPipelineSequence,
   VulnerabilityResponseSequence,
 } from "@/components/diagrams/secure-sdlc-flows";
+import { LeaderboardArchitecture } from "@/components/diagrams/leaderboard-architecture";
+import {
+  SubmitScoreSequence,
+  TopKQuerySequence,
+  PlayerRankSequence,
+  ShardedRankSequence,
+} from "@/components/diagrams/leaderboard-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -740,5 +747,47 @@ describe("Secure SDLC flow diagrams", () => {
       screen.getByRole("img", { name: /the vulnerability-management loop/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/turns scattered findings into reliably closed risks/i)).toBeInTheDocument();
+  });
+});
+
+describe("Leaderboard diagrams", () => {
+  it("exposes the leaderboard architecture to non-visual readers", () => {
+    render(<LeaderboardArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /leaderboard architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/rebuilt from the database, so no scores are lost/i)).toBeInTheDocument();
+  });
+
+  it("exposes the score-submit flow to non-visual readers", () => {
+    render(<SubmitScoreSequence />);
+    expect(
+      screen.getByRole("img", { name: /submit a score update/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/keeps updates cheap at high volume/i)).toBeInTheDocument();
+  });
+
+  it("exposes the top-K read flow to non-visual readers", () => {
+    render(<TopKQuerySequence />);
+    expect(
+      screen.getByRole("img", { name: /read the top-K leaderboard/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Because everyone sees the same top-K/i)).toBeInTheDocument();
+  });
+
+  it("exposes the player-rank flow to non-visual readers", () => {
+    render(<PlayerRankSequence />);
+    expect(
+      screen.getByRole("img", { name: /look up a player's rank and neighbors/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/a plain ORDER BY cannot provide cheaply/i)).toBeInTheDocument();
+  });
+
+  it("exposes the cross-shard rank flow to non-visual readers", () => {
+    render(<ShardedRankSequence />);
+    expect(
+      screen.getByRole("img", { name: /compute a global rank across shards/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/approximate the rank from precomputed score-bucket histograms/i)).toBeInTheDocument();
   });
 });
