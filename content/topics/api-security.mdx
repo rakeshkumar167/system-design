@@ -1,39 +1,226 @@
 <h2 id="overview">What API Security Is</h2>
 
-Placeholder.
+Most modern systems are, from the outside, a collection of **APIs** — the HTTP (or gRPC/GraphQL) endpoints that mobile apps, single-page frontends, partners, and other services call. That makes APIs the **primary attack surface**, and securing them is different from securing a traditional server-rendered website in a few decisive ways. The client is **untrusted machine code**: there's no browser enforcing same-origin rules for you, no human to slow down with a CAPTCHA, and nothing stopping an attacker from scripting millions of requests and reading your published API docs to find every endpoint. Worse, APIs tend to **expose business logic and data directly** — an endpoint often maps straight onto a database object — so a single missing check leaks records at scale.
+
+The good news is that the principles are the ones you already know from the rest of this Security series: authenticate the caller, authorize every request, validate input, encrypt in transit, and limit consumption. API security is largely about applying those rigorously at the API layer, where the human-facing mitigations don't exist. The field's reference is the **OWASP API Security Top 10**, a list deliberately *separate* from the [general web-app Top 10](/topics/security/owasp-top-10) because APIs fail in their own characteristic ways — and its **#1 risk is authorization**, specifically failing to check that a caller may access the specific object they asked for.
+
+<Callout variant="info" title="Assume a hostile machine">
+An API endpoint is a promise to a **machine**, not a person. Assume every client is **hostile, scripted, and reading your documentation** — it will send fields you didn't expect, iterate every id, and replay requests a million times. There's no UI to hide behind and no human to reason with, so every control has to live on the **server**. The whole topic follows from taking that assumption seriously.
+</Callout>
 
 <h2 id="authenticating-clients">Authenticating API Clients</h2>
 
-Placeholder.
+The first question an API asks is *who is calling?* There are three common answers, and choosing well means knowing what each actually proves.
+
+- **API keys** — a long random secret string the client sends on each request. A key identifies an **application** (or a project/account), not an end user, and it's simple to issue. But it's a **bearer credential** with no built-in expiry and weak guarantees: anyone who obtains the key *is* the client, and keys leak notoriously (checked into repos, embedded in mobile apps and JavaScript). Keep them secret, scope them narrowly, and rotate them.
+- **OAuth2 bearer tokens / JWTs** — the standard for **delegated user access**. The client presents a token (often a JWT) that the API validates; the token encodes who the user is and what scopes were granted. This is the mainstream choice for user-facing APIs (the [Authentication](/topics/security/authentication) topic covers the flows and token internals).
+- **mTLS (mutual TLS)** — both client and server present certificates, so each cryptographically proves its identity. It's strong **service-to-service** authentication inside a trusted network or mesh (the [TLS](/topics/security/tls-https-certificates) topic covers certificates).
+
+<TradeoffTable
+  columns={["Mechanism", "Proves", "Best fit", "Watch out for"]}
+  rows={[
+    ["API key", "Which application is calling", "Simple server-to-server, public/partner APIs", "Bearer secret, no expiry — leaks easily; identity, not strong auth"],
+    ["OAuth2 / JWT", "Which user, and what they authorized", "User-facing APIs, delegated access", "Token validation, expiry, and revocation must be correct"],
+    ["mTLS", "Both endpoints' identities (mutual)", "Service-to-service inside a mesh", "Certificate issuance and rotation overhead"],
+  ]}
+  recommendedRow={1}
+/>
+
+The interview-level point: **an API key is identification, not strong authentication**. It tells you which application is calling, not that the call is trustworthy — and by itself it authorizes nothing. Whatever mechanism you choose, authentication only establishes *who*; the far more commonly botched step is deciding *what they may do*.
+
+<KnowledgeCheck
+  question="Why is an API key considered identification rather than strong authentication, and what follows from that?"
+  options={[
+    "An API key is encrypted, so it's actually the strongest option",
+    "An API key is a bearer secret that identifies an application, not an end user, and has no built-in expiry — anyone who obtains it becomes the client, and keys leak easily (committed to repos, embedded in mobile/JS). So it establishes which app is calling but not that the request is trustworthy, and it authorizes nothing on its own. It should be kept secret, scoped, and rotated, and paired with proper per-request authorization — for user access, OAuth2 tokens are the standard, and mTLS suits service-to-service",
+    "It authenticates the end user strongly and replaces the need for authorization",
+    "It only works over plaintext HTTP, so it's inherently insecure",
+  ]}
+  answer={1}
+  explanation="API keys are simple bearer credentials identifying an application; because they don't expire and leak readily, possession alone grants access, so they prove 'which app' rather than 'this request is trustworthy' and grant no permissions by themselves. That means they must be secret, scoped, rotated, and always backed by real authorization — with OAuth2/JWT for delegated user access and mTLS for service-to-service. Authentication of any kind only answers 'who'; authorization is the separate, critical step."
+/>
 
 <h2 id="authorizing-requests">Object- & Function-Level Authorization</h2>
 
-Placeholder.
+The two most damaging API risks are both **authorization** failures — the app authenticates the caller correctly but then fails to check what they're allowed to do.
+
+**BOLA (Broken Object-Level Authorization)** is the **#1** API risk. The endpoint verifies the caller is logged in, looks up the object by the id in the request, and returns it — **without checking that the object belongs to the caller**. So an attacker with a perfectly valid token changes `GET /accounts/1001` to `/accounts/1002` and reads someone else's data. Because APIs expose objects by id and attackers can iterate ids trivially, this one flaw leaks entire datasets.
+
+<BolaAttackSequence />
+
+**BFLA (Broken Function-Level Authorization)** is its sibling for *actions*: a normal user invokes an **administrative** function — `DELETE /users/5`, `POST /admin/config` — that was merely hidden from their UI but never protected on the server. The client isn't limited by what buttons it was shown; it can call any endpoint it discovers.
+
+Both fixes are the same discipline, and it's exactly the [Authorization](/topics/security/authorization) topic: enforce authorization **on the server, on every request**, checking both **object level** (does this caller own or have a relationship to *this specific* record?) and **function level** (is this caller's role permitted *this operation*?), and **deny by default**. Scopes from an OAuth token are coarse ("this app may read orders") and are *not* a substitute for the per-object check.
+
+<KnowledgeCheck
+  question="What is the difference between BOLA and BFLA, and why is authentication alone insufficient to prevent them?"
+  options={[
+    "BOLA is about encryption and BFLA is about rate limiting; authentication fixes both",
+    "BOLA (Broken Object-Level Authorization) is failing to check that the authenticated caller owns the specific object they requested, so changing an id in the URL returns another user's record. BFLA (Broken Function-Level Authorization) is failing to check that the caller's role may invoke a particular function, so a normal user calls an admin endpoint that was only hidden in the UI. Authentication only proves who is calling; without a server-side, per-object and per-function authorization check on every request, a valid token is enough to access data and actions that aren't theirs",
+    "They are the same thing described twice; authentication prevents both",
+    "BOLA only affects GraphQL APIs and BFLA only affects REST APIs",
+  ]}
+  answer={1}
+  explanation="BOLA is object-level (own this record?), BFLA is function-level (may call this operation?). Both occur when the app authenticates the caller but never authorizes the specific request, so a legitimate token lets an attacker iterate object ids or invoke hidden admin functions. The remedy is server-side authorization on every request at both the object and function level, deny-by-default — token scopes are too coarse to cover per-object ownership."
+/>
 
 <h2 id="data-exposure">Data Exposure & Mass Assignment</h2>
 
-Placeholder.
+Two mirror-image risks come from the API being careless about *which fields* cross the boundary — the read side and the write side.
+
+**Excessive data exposure** (the read side): the endpoint serializes the **whole object** and trusts the client to display only the relevant parts. But "the mobile app only shows the name" is irrelevant — the full JSON, including `ssn`, `passwordHash`, `internalNotes`, and `isAdmin`, went over the wire, and an attacker just reads it straight from the response. The fix is to **return only the fields the caller needs**, via an explicit response schema/DTO, never the raw database row.
+
+**Mass assignment** (the write side): the endpoint **binds client-supplied JSON directly onto an internal object**, so the client can set fields the developer never intended to expose. A registration request that includes `"role": "admin"` or `"isVerified": true` silently escalates the account if those properties are blindly assigned. The fix is to **allowlist exactly which properties a client may set** and ignore the rest.
+
+Both are really the same principle one level deeper than object authorization: **object property-level authorization** — controlling not just *which objects* a caller can touch but *which fields* of them they may **read** and **write**. Whitelist inputs, and shape outputs deliberately.
+
+<KnowledgeCheck
+  question="How are excessive data exposure and mass assignment related, and how do you prevent them?"
+  options={[
+    "They're unrelated; one is a network issue and one is a database issue",
+    "They're the read and write sides of the same problem — property-level authorization. Excessive data exposure returns whole objects and trusts the client to filter, so sensitive fields leak over the wire; mass assignment binds client-supplied JSON straight onto internal objects, so a client can set fields like role=admin it was never meant to. Prevent them by shaping outputs to an explicit response schema (return only needed fields) and allowlisting exactly which properties a client may set on input",
+    "They only occur when the API lacks TLS, and HTTPS prevents both",
+    "They are prevented by rate limiting the endpoints",
+  ]}
+  answer={1}
+  explanation="Both stem from not controlling which fields cross the API boundary. On reads, serializing entire objects leaks sensitive properties regardless of what the UI shows; on writes, binding raw client JSON onto internal models lets attackers set privileged fields. The unified fix is property-level control: explicit response DTOs that expose only necessary fields, and input allowlists that accept only intended properties. TLS and rate limiting address different risks."
+/>
 
 <h2 id="resource-consumption">Rate Limiting & Resource Consumption</h2>
 
-Placeholder.
+APIs also fail when they let a single client consume **unbounded resources** — the OWASP API risk of **unrestricted resource consumption**. Without limits, one caller (malicious or just buggy) can exhaust CPU, memory, bandwidth, database connections, or a metered third-party dependency you pay for per call. It's also the front line against **brute-force** and **denial-of-service**.
+
+The controls stack together:
+
+- **Rate limits** — cap requests per client per time window (the classic token-bucket / sliding-window algorithms, covered in the forthcoming rate-limiting topic).
+- **Quotas** — longer-horizon caps (daily/monthly), often per pricing tier.
+- **Payload-size limits** — reject oversized request bodies before you parse or hash them (recall the login-DoS from the [Password Hashing](/topics/security/password-hashing) topic).
+- **Pagination caps** — never return an unbounded list; enforce a maximum page size so `?limit=10000000` can't be used to exhaust memory.
+- **Timeouts** — bound how long any single request may run.
+- **Cost-based limiting** — weight expensive endpoints (a report, a GraphQL query that fans out) more heavily than cheap ones, so limits reflect actual work.
+
+The unifying idea is that **every dimension of consumption needs a ceiling**. Rate limiting is the most visible, but payload size, page size, and execution time are equally exploitable if left unbounded.
+
+<KnowledgeCheck
+  question="Beyond request-rate limits, what other consumption limits does an API need and why?"
+  options={[
+    "None — a requests-per-second limit fully protects an API",
+    "Every dimension of resource use needs a ceiling: payload-size limits (so a huge body can't exhaust memory or CPU before it's even processed), pagination caps (so a request can't ask for millions of rows), timeouts (so one request can't run forever), quotas (longer-horizon caps), and cost-based weighting (so expensive endpoints count for more). A request-rate limit alone leaves these other consumption vectors open to abuse and accidental overload",
+    "Only encryption limits, to bound how much data is encrypted",
+    "Only authentication retries, nothing else",
+  ]}
+  answer={1}
+  explanation="Unrestricted resource consumption isn't only about request frequency. A single request with a giant body, an unbounded page size, or a long-running query can exhaust resources regardless of rate. So APIs cap payload size, enforce maximum page sizes, set timeouts, apply longer-term quotas, and weight expensive endpoints via cost-based limiting. Rate limiting is necessary but not sufficient — every consumption dimension needs a bound."
+/>
 
 <h2 id="capacity-estimates">Capacity: The Cost of Securing Every Request</h2>
 
-Placeholder.
+Enforcing security on every request isn't free — verifying a token and checking a rate limit costs CPU — but that cost is small, and it *pays for itself* by rejecting abusive traffic before it reaches the expensive backend. A little arithmetic shows why doing security **early and at the edge** is also a capacity optimization.
+
+<ApiSecurityCapacity
+  assumptions={{
+    requestsPerSec: 200000,
+    abusiveFraction: 0.5,
+    gatewayCheckCpuMs: 0.25,
+    backendCpuMs: 5,
+    msPerCorePerSec: 1000,
+  }}
+/>
+
+At 200,000 requests/sec, the edge security checks — verify the token, check the rate limit — cost about **50 cores**. That's the security tax, and it looks like pure overhead until you account for what it prevents. Suppose **half** the incoming traffic is abusive or unauthenticated (scrapers, credential stuffing, junk). If the gateway waved everything through, the backend would have to *serve* all 200k req/s at 5 ms each — **1,000 cores**. Reject that abusive half at the edge and only the legitimate 100k req/s reach the backend, which now needs just **500 cores**. So the 50-core gateway investment removes 500 cores of backend load — a **net saving of ~450 cores**.
+
+Two lessons. First, **do cheap security checks early**: authentication and rate limiting at the gateway cost a fraction of serving a request, and every abusive request they drop is one the expensive backend never pays for — security is a capacity optimization, not just protection. Second, "early and cheap" applies only to the *coarse* checks; the **object-level authorization** that actually prevents BOLA can't be done at the gateway (it doesn't know who owns record 1002), so it stays deep in the service. Coarse and cheap at the edge, precise and correct in the service — the next section makes that split explicit.
 
 <h2 id="api-gateway">The API Gateway as Enforcement Point</h2>
 
-Placeholder.
+Rather than have every service reinvent authentication, rate limiting, and TLS, mature architectures put a hardened **API gateway** in front of everything and centralize the **coarse, cross-cutting** security there: **TLS termination**, **authentication** (validate the token/key), **coarse authorization** (does this token's scope cover this route?), **rate limiting and quotas**, request validation, a **Web Application Firewall**, and consistent **logging**. One well-audited front door beats dozens of inconsistent ones, and — as the capacity model showed — it's where you cheaply shed bad traffic.
+
+<GatewayEnforcementSequence />
+
+But the gateway is **necessary, not sufficient**. It sees the request in transit; it does **not** know your domain model, so it cannot answer "does *this* user own *this* order?" — the object-level check that stops BOLA. That must run **in the service**, where the data and ownership live. The correct design is **defense in depth**: coarse, cheap enforcement at the edge (authenticate, rate-limit, scope-check, reject early) and precise, correctness-critical **object- and function-level authorization** inside the service. Treating the gateway as the *only* line of defense is how "we have an API gateway" coexists with a wide-open BOLA vulnerability. (The [API Gateway](/learn/api-gateway) tutorial builds one end to end.)
+
+<KnowledgeCheck
+  question="Why is an API gateway necessary but not sufficient for API security?"
+  options={[
+    "Because gateways can't handle TLS, so services must do it themselves",
+    "The gateway centralizes the coarse, cross-cutting checks that apply to every request — TLS termination, authentication, rate limiting, scope-level authorization, WAF, logging — giving one hardened front door and cheaply rejecting bad traffic. But it doesn't know the domain model, so it can't verify that this specific caller owns this specific object (the BOLA check). That object- and function-level authorization must run in the service, where the data lives — coarse enforcement at the edge, precise enforcement in the service, defense in depth",
+    "Because a gateway is only for load balancing and does no security",
+    "Because gateways replace the need for authorization entirely",
+  ]}
+  answer={1}
+  explanation="A gateway is the right place for coarse, repeatable controls — terminating TLS, validating tokens, enforcing rate limits and scopes, running a WAF, logging — and it sheds abusive traffic cheaply. What it can't do is per-object authorization, because it has no knowledge of ownership or your data model. So the service must still enforce object- and function-level authorization. Relying on the gateway alone leaves BOLA/BFLA wide open; the two tiers together are defense in depth."
+/>
 
 <h2 id="transport-misconfig">Transport Security & Misconfiguration</h2>
 
-Placeholder.
+The remaining risks are hygiene — unglamorous, and responsible for a large share of real incidents.
+
+- **Always HTTPS, never plaintext.** Every endpoint over **TLS**, with **HSTS** to prevent downgrade, and no `http://` listener at all (the [TLS](/topics/security/tls-https-certificates) topic). An API token sent over plaintext is a token handed to anyone on the path.
+- **Correct CORS.** Cross-Origin Resource Sharing should be an **allowlist of trusted origins**, never `Access-Control-Allow-Origin: *` combined with credentials — that hands your authenticated API to any website.
+- **Security headers and safe errors.** Return **generic error messages**; a stack trace, a raw SQL error, or an internal hostname in a 500 response is free reconnaissance for an attacker. Log the detail server-side, return an opaque error to the client.
+- **API inventory management.** You can't secure what you don't know you run. **Shadow APIs** (undocumented endpoints someone shipped) and **zombie APIs** (old, unpatched `/v1` versions still live after `/v2` launched) are dangerous precisely because they're forgotten — unmonitored and unpatched. Maintain an inventory and **retire old versions**.
+
+<KnowledgeCheck
+  question="What are shadow and zombie APIs, and why are they a security problem?"
+  options={[
+    "They are caching layers that speed up API responses",
+    "Shadow APIs are undocumented endpoints that exist without the security team's knowledge; zombie APIs are old, deprecated versions (like a /v1 left running after /v2 shipped) that are still live but no longer maintained. They're dangerous because you can't secure, monitor, or patch what you don't know is running — a forgotten endpoint often lacks the newer authorization or validation fixes, giving attackers an unguarded way in. The defense is API inventory management: know every endpoint and retire old versions",
+    "They are APIs that only run at night to save resources",
+    "They are encrypted APIs that hide their traffic from monitoring",
+  ]}
+  answer={1}
+  explanation="Shadow APIs are endpoints running outside the security team's awareness; zombie APIs are outdated versions still exposed after a newer one replaced them. Both evade the controls, monitoring, and patches applied to the known, current surface, so they frequently retain vulnerabilities that were fixed elsewhere. Maintaining an accurate inventory and decommissioning deprecated versions closes those forgotten doors — it's the OWASP 'improper inventory management' risk."
+/>
 
 <h2 id="pitfalls-best-practices">Pitfalls & Best Practices</h2>
 
-Placeholder.
+The API-security failures are consistent and, once named, easy to guard against.
+
+<Callout variant="warning" title="API security footguns">
+- **Trusting the client.** Hidden fields, client-side filtering, "our app won't send that" — every request is attacker-controllable. Enforce on the **server**.
+- **API keys as authentication.** A key identifies an app, not a trustworthy request; leaked keys in mobile apps and front-end JavaScript are everywhere. Scope, rotate, and back them with real authorization.
+- **No object-level authorization (BOLA).** The #1 API risk: check ownership of the specific object on **every** request; never trust a client-supplied id.
+- **Returning whole objects / mass assignment.** Shape outputs to explicit schemas and allowlist writable fields — control which properties are read and written.
+- **No resource limits.** Unbounded rate, payload size, or page size invites DoS and runaway cost. Cap every dimension.
+- **Verbose errors and HTTP endpoints.** Generic errors only; TLS everywhere with HSTS.
+- **Forgotten versions.** Zombie `/v1` endpoints outlive their patches. Inventory and retire.
+</Callout>
+
+<DecisionRecord
+  title="The default API security posture"
+  choice="Terminate TLS and authenticate every request at an API gateway (OAuth2/JWT for user access, mTLS for service-to-service, scoped API keys only where a machine identity suffices), and enforce rate limits, quotas, and payload/pagination caps there too. Inside each service, enforce object- and function-level authorization on every request (deny-by-default) and validate input against a strict schema, allowlisting writable properties and shaping responses to explicit DTOs. Serve only over HTTPS with HSTS, lock down CORS to an allowlist, return generic errors, and maintain an API inventory that retires deprecated versions."
+  rationale="The gateway centralizes coarse, cross-cutting controls and cheaply rejects abusive traffic (a capacity win as well as a security one), while per-object authorization — which the gateway can't do — lives in the service to close BOLA/BFLA. Strict input/output schemas prevent excessive data exposure and mass assignment; consumption limits stop resource-exhaustion abuse; transport and configuration hygiene close the common misconfiguration holes; and inventory management removes the forgotten endpoints attackers love. Together they map onto the OWASP API Security Top 10."
+  alternatives="Relying on the gateway alone — coarse checks only, leaving object-level authorization (BOLA) unguarded. API keys as the sole auth — bearer secrets that leak and prove only which app is calling. Returning full database objects and binding raw client JSON — fast to build but leaks fields and enables privilege escalation. No rate/consumption limits — invites DoS and runaway third-party cost. Skipping an API inventory — leaves shadow and zombie endpoints unmonitored and unpatched."
+  revisitWhen="A new client type or partner integration widens the surface; traffic or abuse grows enough to retune rate limits and gateway capacity; a new API version ships (retire the old one); GraphQL/gRPC or event APIs are added (their own authz and cost models); or OWASP updates the API Security Top 10."
+/>
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="In the capacity model, edge security checks cost ~50 cores but drop the backend from 1,000 to 500 cores when half the traffic is abusive. What's the lesson?"
+  options={[
+    "That security checks are pure overhead and should be minimized",
+    "That doing cheap security checks early, at the gateway, is also a capacity optimization: verifying a token and checking a rate limit costs a fraction of serving a request, so every abusive request rejected at the edge is one the expensive backend never pays for. Here a 50-core edge investment removes 500 cores of backend load — a net ~450-core saving — while the correctness-critical object-level authorization still runs in the service, since the gateway can't know object ownership",
+    "That you should move all authorization to the gateway to save cores",
+    "That the backend should serve abusive traffic to keep the gateway small",
+  ]}
+  answer={1}
+  explanation="Coarse edge checks are far cheaper than serving requests, so rejecting abusive traffic at the gateway saves the backend from work it would otherwise do — security becomes a capacity win, not just protection (50 cores spent, ~450 net saved here). But 'cheap and early' applies only to coarse checks like authentication and rate limiting; object-level authorization can't be done at the gateway (it doesn't know ownership) and must stay in the service. That's the defense-in-depth split."
+/>
+
+<Faq
+  items={[
+    { question: "How is API security different from general web security?", answer: "APIs are machine-to-machine: the client is untrusted code with no browser enforcing rules and no human to slow down, so attackers script requests at scale, iterate object ids, and read your published docs. APIs also tend to expose business objects and logic directly, so one missing check leaks data in bulk. The principles (authenticate, authorize, validate, encrypt, limit) are the same, but human-facing mitigations don't exist, so every control must be server-side. OWASP maintains a separate API Security Top 10 for these reasons." },
+    { question: "What's the difference between API keys, OAuth tokens, and mTLS?", answer: "An API key is a bearer secret that identifies an application (not a user), is simple but has no expiry and leaks easily — good for basic server-to-server or partner APIs if scoped and rotated. OAuth2 bearer tokens (often JWTs) represent delegated user access, encoding who the user is and what they authorized — the standard for user-facing APIs. mTLS has both sides present certificates for mutual authentication, ideal for service-to-service inside a mesh. Keys identify, tokens delegate, mTLS mutually authenticates." },
+    { question: "What is BOLA and why is it the #1 API risk?", answer: "Broken Object-Level Authorization is when an endpoint authenticates the caller but doesn't check they own the specific object requested, so changing an id in the URL (GET /accounts/1001 to /accounts/1002) returns someone else's data. It's #1 because APIs expose objects by id and attackers can iterate ids trivially, so one missing ownership check leaks entire datasets. The fix is a per-object authorization check on every request, server-side, deny-by-default — never trust a client-supplied id." },
+    { question: "What is BFLA?", answer: "Broken Function-Level Authorization is the action counterpart to BOLA: a normal user invokes an administrative or privileged function (DELETE /users/5, POST /admin/config) that was only hidden from their UI but never protected on the server. Since an API client can call any endpoint it discovers, hiding a button is not a control. Enforce function-level authorization by role on the server for every operation, deny-by-default." },
+    { question: "What is excessive data exposure?", answer: "It's when an API returns whole objects and trusts the client to display only the relevant fields — so the response JSON includes sensitive properties (SSNs, password hashes, internal flags) that the UI never shows but an attacker reads directly off the wire. The fix is to shape outputs deliberately: return only the fields the caller needs, using explicit response schemas or DTOs rather than serializing raw database rows." },
+    { question: "What is mass assignment?", answer: "Mass assignment is binding client-supplied JSON directly onto internal objects, so a client can set properties the developer never intended to expose — a request that includes role=admin or isVerified=true silently escalates the account if those fields are blindly assigned. Prevent it by allowlisting exactly which properties a client may set on input and ignoring everything else. With excessive data exposure it forms object property-level authorization: control which fields can be read and written." },
+    { question: "How do you prevent API resource-exhaustion abuse?", answer: "Put a ceiling on every consumption dimension, not just request rate: rate limits (requests per client per window), quotas (daily/monthly caps), payload-size limits (reject oversized bodies before processing), pagination caps (no unbounded lists), timeouts (bound execution time), and cost-based limiting (weight expensive endpoints more). A rate limit alone leaves payload size, page size, and long-running queries exploitable, so all of them need bounds." },
+    { question: "Should authorization happen at the API gateway or in the service?", answer: "Both, at different granularities. The gateway does coarse, cross-cutting enforcement — TLS termination, authentication, rate limiting, scope checks, WAF, logging — and cheaply rejects bad traffic. But it doesn't know your domain model, so it can't verify that this caller owns this specific object. That object- and function-level authorization must run in the service where the data lives. Coarse checks at the edge, precise checks in the service — defense in depth." },
+    { question: "Why does CORS matter for API security?", answer: "Cross-Origin Resource Sharing controls which web origins may call your API from a browser. Misconfiguring it — especially Access-Control-Allow-Origin: * together with credentials — effectively hands your authenticated API to any website, enabling cross-site data theft. Set CORS to an explicit allowlist of trusted origins and be deliberate about whether credentials are allowed. It's a common misconfiguration with serious consequences." },
+    { question: "What are shadow and zombie APIs?", answer: "Shadow APIs are undocumented endpoints running without the security team's knowledge; zombie APIs are old, deprecated versions (a /v1 left live after /v2 shipped) that are still reachable but no longer maintained. Both are dangerous because you can't monitor, secure, or patch what you don't know is running, and forgotten endpoints often lack the newer authorization and validation fixes. Maintain an API inventory and retire old versions — OWASP calls this improper inventory management." },
+    { question: "Is the OWASP API Security Top 10 the same as the regular OWASP Top 10?", answer: "No — they're separate lists. The general OWASP Top 10 covers web-application risks broadly, while the API Security Top 10 focuses on how APIs specifically fail, which is dominated by authorization problems: BOLA (object level) is #1 and BFLA (function level) also ranks highly, alongside API-specific issues like unrestricted resource consumption, mass assignment/excessive data exposure, and improper inventory management. If you build APIs, use the API-specific list." },
+    { question: "Do I still need HTTPS if requests already carry a token?", answer: "Yes, absolutely. A bearer token or API key sent over plaintext HTTP is readable by anyone on the network path, who can then replay it as you — the token makes transport encryption more important, not less. Serve every endpoint over TLS, add HSTS to prevent downgrade to HTTP, and don't run a plaintext listener at all. Authentication and transport security are complementary, not substitutes." },
+  ]}
+/>
