@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(11);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(10);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -447,6 +447,20 @@ test("learner can open the photo sharing tutorial", async ({ page }) => {
   // Assert the embedded diagram first so layout settles before the viewport check.
   await expect(
     page.getByRole("img", { name: /photo sharing architecture/i }).first(),
+  ).toBeVisible();
+  await page.locator("#high-level-architecture").scrollIntoViewIfNeeded();
+  await expect(page.locator("#high-level-architecture")).toBeInViewport();
+});
+
+test("learner can open the ride hailing tutorial", async ({ page }) => {
+  await page.goto("/learn/ride-hailing");
+  await expect(
+    page.getByRole("heading", { name: /design a ride-hailing service/i }),
+  ).toBeVisible();
+  await page.goto("/learn/ride-hailing#high-level-architecture");
+  // Assert the embedded diagram first so layout settles before the viewport check.
+  await expect(
+    page.getByRole("img", { name: /ride-hailing architecture/i }).first(),
   ).toBeVisible();
   await page.locator("#high-level-architecture").scrollIntoViewIfNeeded();
   await expect(page.locator("#high-level-architecture")).toBeInViewport();
