@@ -189,6 +189,13 @@ import {
   AlertEvaluationSequence,
   DownsampleRetentionSequence,
 } from "@/components/diagrams/metrics-monitoring-flows";
+import { ObjectStorageArchitecture } from "@/components/diagrams/object-storage-architecture";
+import {
+  PutObjectSequence,
+  MultipartUploadSequence,
+  GetObjectSequence,
+  ScrubRepairSequence,
+} from "@/components/diagrams/object-storage-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -356,6 +363,11 @@ const teachingComponents = {
   RangeQuerySequence,
   AlertEvaluationSequence,
   DownsampleRetentionSequence,
+  ObjectStorageArchitecture,
+  PutObjectSequence,
+  MultipartUploadSequence,
+  GetObjectSequence,
+  ScrubRepairSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

@@ -612,6 +612,13 @@ import {
   AlertEvaluationSequence,
   DownsampleRetentionSequence,
 } from "@/components/diagrams/metrics-monitoring-flows";
+import { ObjectStorageArchitecture } from "@/components/diagrams/object-storage-architecture";
+import {
+  PutObjectSequence,
+  MultipartUploadSequence,
+  GetObjectSequence,
+  ScrubRepairSequence,
+} from "@/components/diagrams/object-storage-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -838,5 +845,47 @@ describe("Metrics and monitoring diagrams", () => {
       screen.getByRole("img", { name: /downsample and expire old data/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/bounds long-term storage without losing the shape of history/i)).toBeInTheDocument();
+  });
+});
+
+describe("Object storage diagrams", () => {
+  it("exposes the object storage architecture to non-visual readers", () => {
+    render(<ObjectStorageArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /object storage architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Durability comes from spreading erasure-coded fragments across independent failure domains/i)).toBeInTheDocument();
+  });
+
+  it("exposes the put-object flow to non-visual readers", () => {
+    render(<PutObjectSequence />);
+    expect(
+      screen.getByRole("img", { name: /write \(PUT\) an object/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/the metadata is committed last, so a half-written object is never visible/i)).toBeInTheDocument();
+  });
+
+  it("exposes the multipart-upload flow to non-visual readers", () => {
+    render(<MultipartUploadSequence />);
+    expect(
+      screen.getByRole("img", { name: /multipart upload of a large object/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Each part uploads and retries independently/i)).toBeInTheDocument();
+  });
+
+  it("exposes the get-object flow to non-visual readers", () => {
+    render(<GetObjectSequence />);
+    expect(
+      screen.getByRole("img", { name: /read \(GET\) an object/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Any k of the total fragments are enough to reconstruct the object/i)).toBeInTheDocument();
+  });
+
+  it("exposes the scrub/repair flow to non-visual readers", () => {
+    render(<ScrubRepairSequence />);
+    expect(
+      screen.getByRole("img", { name: /scrub and repair a corrupt fragment/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/continuous background repair is what sustains durability over years/i)).toBeInTheDocument();
   });
 });
