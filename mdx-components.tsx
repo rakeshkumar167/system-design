@@ -205,6 +205,13 @@ import {
   ServeImageSequence,
   FeedLoadSequence,
 } from "@/components/diagrams/photo-sharing-flows";
+import { RideHailingArchitecture } from "@/components/diagrams/ride-hailing-architecture";
+import {
+  LocationUpdateSequence,
+  MatchRideSequence,
+  TripStateSequence,
+  LiveTrackingSequence,
+} from "@/components/diagrams/ride-hailing-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -384,6 +391,11 @@ const teachingComponents = {
   ProcessImageSequence,
   ServeImageSequence,
   FeedLoadSequence,
+  RideHailingArchitecture,
+  LocationUpdateSequence,
+  MatchRideSequence,
+  TripStateSequence,
+  LiveTrackingSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

@@ -626,6 +626,13 @@ import {
   ServeImageSequence,
   FeedLoadSequence,
 } from "@/components/diagrams/photo-sharing-flows";
+import { RideHailingArchitecture } from "@/components/diagrams/ride-hailing-architecture";
+import {
+  LocationUpdateSequence,
+  MatchRideSequence,
+  TripStateSequence,
+  LiveTrackingSequence,
+} from "@/components/diagrams/ride-hailing-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -936,5 +943,47 @@ describe("Photo sharing diagrams", () => {
       screen.getByRole("img", { name: /load a photo feed/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/The feed is a list of post IDs hydrated with image URLs/i)).toBeInTheDocument();
+  });
+});
+
+describe("Ride-hailing diagrams", () => {
+  it("exposes the ride-hailing architecture to non-visual readers", () => {
+    render(<RideHailingArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /ride-hailing architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/absorbs a huge location-update firehose into a live geo-index/i)).toBeInTheDocument();
+  });
+
+  it("exposes the location-update flow to non-visual readers", () => {
+    render(<LocationUpdateSequence />);
+    expect(
+      screen.getByRole("img", { name: /a driver location update/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Only the latest position is kept, not a durable history of every ping/i)).toBeInTheDocument();
+  });
+
+  it("exposes the match flow to non-visual readers", () => {
+    render(<MatchRideSequence />);
+    expect(
+      screen.getByRole("img", { name: /match a rider to a driver/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/An atomic reservation ensures one driver is never matched to two riders/i)).toBeInTheDocument();
+  });
+
+  it("exposes the trip-lifecycle flow to non-visual readers", () => {
+    render(<TripStateSequence />);
+    expect(
+      screen.getByRole("img", { name: /the trip lifecycle/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/every trip is an explicit state machine that rejects invalid transitions/i)).toBeInTheDocument();
+  });
+
+  it("exposes the live-tracking flow to non-visual readers", () => {
+    render(<LiveTrackingSequence />);
+    expect(
+      screen.getByRole("img", { name: /track the driver in real time/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/the rider subscribes to the assigned driver's live location stream/i)).toBeInTheDocument();
   });
 });
