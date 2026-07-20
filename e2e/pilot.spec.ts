@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(12);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(11);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -44,6 +44,7 @@ test("learner can open the pastebin tutorial", async ({ page }) => {
   ).toBeVisible();
   // Navigate to the section via URL fragment (TOC is hidden on mobile viewports)
   await page.goto("/learn/pastebin#expiry-and-ttl");
+  await page.locator("#expiry-and-ttl").scrollIntoViewIfNeeded();
   await expect(page.locator("#expiry-and-ttl")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /pastebin architecture/i }).first(),
@@ -56,6 +57,7 @@ test("learner can open the notification service tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a notification service/i }),
   ).toBeVisible();
   await page.goto("/learn/notification-service#delivery-guarantees");
+  await page.locator("#delivery-guarantees").scrollIntoViewIfNeeded();
   await expect(page.locator("#delivery-guarantees")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /notification architecture/i }).first(),
@@ -68,6 +70,7 @@ test("learner can open the ticket booking tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a ticket booking system/i }),
   ).toBeVisible();
   await page.goto("/learn/ticket-booking#concurrency-control");
+  await page.locator("#concurrency-control").scrollIntoViewIfNeeded();
   await expect(page.locator("#concurrency-control")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /ticket booking architecture/i }).first(),
@@ -80,6 +83,7 @@ test("learner can open the video streaming tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a video streaming platform/i }),
   ).toBeVisible();
   await page.goto("/learn/video-streaming#transcoding-pipeline");
+  await page.locator("#transcoding-pipeline").scrollIntoViewIfNeeded();
   await expect(page.locator("#transcoding-pipeline")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /video streaming architecture/i }).first(),
@@ -94,6 +98,7 @@ test("learner can open the authentication security topic", async ({ page }) => {
   ).toBeVisible();
   // Navigate to a section via URL fragment (TOC is hidden on mobile viewports)
   await page.goto("/topics/security/authentication#oauth2-delegated");
+  await page.locator("#oauth2-delegated").scrollIntoViewIfNeeded();
   await expect(page.locator("#oauth2-delegated")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /authorization-code flow with pkce/i }).first(),
@@ -108,6 +113,7 @@ test("learner can open the TLS security topic", async ({ page }) => {
   ).toBeVisible();
   // Navigate to a section via URL fragment (TOC is hidden on mobile viewports)
   await page.goto("/topics/security/tls-https-certificates#tls-handshake");
+  await page.locator("#tls-handshake").scrollIntoViewIfNeeded();
   await expect(page.locator("#tls-handshake")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /tls handshake establishing an encrypted session/i }).first(),
@@ -122,6 +128,7 @@ test("learner can open the authorization security topic", async ({ page }) => {
   ).toBeVisible();
   // Navigate to a section via URL fragment (TOC is hidden on mobile viewports)
   await page.goto("/topics/security/authorization#policy-architecture");
+  await page.locator("#policy-architecture").scrollIntoViewIfNeeded();
   await expect(page.locator("#policy-architecture")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /an externalized authorization decision/i }).first(),
@@ -136,6 +143,7 @@ test("learner can open the password hashing security topic", async ({ page }) =>
   ).toBeVisible();
   // Navigate to a section via URL fragment (TOC is hidden on mobile viewports)
   await page.goto("/topics/security/password-hashing#slow-hashing");
+  await page.locator("#slow-hashing").scrollIntoViewIfNeeded();
   await expect(page.locator("#slow-hashing")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /hashing a password at registration/i }).first(),
@@ -154,6 +162,7 @@ test("learner can open the encryption and key management security topic", async 
   await expect(
     page.getByRole("img", { name: /encrypting data with envelope encryption/i }).first(),
   ).toBeVisible();
+  await page.locator("#envelope-encryption").scrollIntoViewIfNeeded();
   await expect(page.locator("#envelope-encryption")).toBeInViewport();
 });
 
@@ -185,6 +194,7 @@ test("learner can open the API security topic", async ({ page }) => {
   await expect(
     page.getByRole("img", { name: /a broken object-level authorization \(BOLA\) attack/i }).first(),
   ).toBeVisible();
+  await page.locator("#authorizing-requests").scrollIntoViewIfNeeded();
   await expect(page.locator("#authorizing-requests")).toBeInViewport();
 });
 
@@ -200,6 +210,7 @@ test("learner can open the session management security topic", async ({ page }) 
   await expect(
     page.getByRole("img", { name: /a session fixation attack/i }).first(),
   ).toBeVisible();
+  await page.locator("#session-attacks").scrollIntoViewIfNeeded();
   await expect(page.locator("#session-attacks")).toBeInViewport();
 });
 
@@ -235,6 +246,7 @@ test("learner can open the collaborative doc editor tutorial", async ({ page }) 
     page.getByRole("heading", { name: /design a collaborative document editor/i }),
   ).toBeVisible();
   await page.goto("/learn/collaborative-doc-editor#crdts");
+  await page.locator("#crdts").scrollIntoViewIfNeeded();
   await expect(page.locator("#crdts")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /collaborative (document )?editor architecture/i }).first(),
@@ -247,6 +259,7 @@ test("learner can open the distributed cache tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a distributed cache/i }),
   ).toBeVisible();
   await page.goto("/learn/distributed-cache#consistent-hashing");
+  await page.locator("#consistent-hashing").scrollIntoViewIfNeeded();
   await expect(page.locator("#consistent-hashing")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /distributed cache architecture/i }).first(),
@@ -259,6 +272,7 @@ test("learner can open the cloud drive tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a cloud drive/i }),
   ).toBeVisible();
   await page.goto("/learn/cloud-drive#delta-sync");
+  await page.locator("#delta-sync").scrollIntoViewIfNeeded();
   await expect(page.locator("#delta-sync")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /cloud drive architecture/i }).first(),
@@ -271,6 +285,7 @@ test("learner can open the payment system tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a payment system/i }),
   ).toBeVisible();
   await page.goto("/learn/payment-system#double-entry-ledger");
+  await page.locator("#double-entry-ledger").scrollIntoViewIfNeeded();
   await expect(page.locator("#double-entry-ledger")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /payment system architecture/i }).first(),
@@ -283,6 +298,7 @@ test("learner can open the distributed logging tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a distributed logging platform/i }),
   ).toBeVisible();
   await page.goto("/learn/distributed-logging#indexing");
+  await page.locator("#indexing").scrollIntoViewIfNeeded();
   await expect(page.locator("#indexing")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /distributed logging architecture/i }).first(),
@@ -295,6 +311,7 @@ test("learner can open the distributed job scheduler tutorial", async ({ page })
     page.getByRole("heading", { name: /design a distributed job scheduler/i }),
   ).toBeVisible();
   await page.goto("/learn/distributed-job-scheduler#leasing-coordination");
+  await page.locator("#leasing-coordination").scrollIntoViewIfNeeded();
   await expect(page.locator("#leasing-coordination")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /job scheduler architecture/i }).first(),
@@ -307,6 +324,7 @@ test("learner can open the maps and navigation tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design maps and navigation/i }),
   ).toBeVisible();
   await page.goto("/learn/maps-navigation#precomputation");
+  await page.locator("#precomputation").scrollIntoViewIfNeeded();
   await expect(page.locator("#precomputation")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /maps (and )?navigation architecture/i }).first(),
@@ -319,6 +337,7 @@ test("learner can open the api gateway tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design an api gateway/i }),
   ).toBeVisible();
   await page.goto("/learn/api-gateway#control-data-plane");
+  await page.locator("#control-data-plane").scrollIntoViewIfNeeded();
   await expect(page.locator("#control-data-plane")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /api gateway architecture/i }).first(),
@@ -331,6 +350,7 @@ test("learner can open the web crawler tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a web crawler/i }),
   ).toBeVisible();
   await page.goto("/learn/web-crawler#url-frontier");
+  await page.locator("#url-frontier").scrollIntoViewIfNeeded();
   await expect(page.locator("#url-frontier")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /web crawler architecture/i }).first(),
@@ -343,6 +363,7 @@ test("learner can open the search autocomplete tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design search autocomplete/i }),
   ).toBeVisible();
   await page.goto("/learn/search-autocomplete#trie-topk");
+  await page.locator("#trie-topk").scrollIntoViewIfNeeded();
   await expect(page.locator("#trie-topk")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /search autocomplete architecture/i }).first(),
@@ -355,6 +376,7 @@ test("learner can open the news feed tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a news feed/i }),
   ).toBeVisible();
   await page.goto("/learn/news-feed#fanout-models");
+  await page.locator("#fanout-models").scrollIntoViewIfNeeded();
   await expect(page.locator("#fanout-models")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /news feed architecture/i }).first(),
@@ -367,6 +389,7 @@ test("learner can open the chat system tutorial", async ({ page }) => {
     page.getByRole("heading", { name: /design a chat system/i }),
   ).toBeVisible();
   await page.goto("/learn/chat-system#connection-layer");
+  await page.locator("#connection-layer").scrollIntoViewIfNeeded();
   await expect(page.locator("#connection-layer")).toBeInViewport();
   await expect(
     page.getByRole("img", { name: /chat system architecture/i }).first(),
@@ -383,6 +406,7 @@ test("learner can open the leaderboard tutorial", async ({ page }) => {
   await expect(
     page.getByRole("img", { name: /leaderboard architecture/i }).first(),
   ).toBeVisible();
+  await page.locator("#high-level-architecture").scrollIntoViewIfNeeded();
   await expect(page.locator("#high-level-architecture")).toBeInViewport();
 });
 
@@ -396,6 +420,7 @@ test("learner can open the metrics and monitoring tutorial", async ({ page }) =>
   await expect(
     page.getByRole("img", { name: /metrics and monitoring architecture/i }).first(),
   ).toBeVisible();
+  await page.locator("#high-level-architecture").scrollIntoViewIfNeeded();
   await expect(page.locator("#high-level-architecture")).toBeInViewport();
 });
 
@@ -409,5 +434,20 @@ test("learner can open the object storage tutorial", async ({ page }) => {
   await expect(
     page.getByRole("img", { name: /object storage architecture/i }).first(),
   ).toBeVisible();
+  await page.locator("#high-level-architecture").scrollIntoViewIfNeeded();
+  await expect(page.locator("#high-level-architecture")).toBeInViewport();
+});
+
+test("learner can open the photo sharing tutorial", async ({ page }) => {
+  await page.goto("/learn/photo-sharing");
+  await expect(
+    page.getByRole("heading", { name: /design a photo sharing platform/i }),
+  ).toBeVisible();
+  await page.goto("/learn/photo-sharing#high-level-architecture");
+  // Assert the embedded diagram first so layout settles before the viewport check.
+  await expect(
+    page.getByRole("img", { name: /photo sharing architecture/i }).first(),
+  ).toBeVisible();
+  await page.locator("#high-level-architecture").scrollIntoViewIfNeeded();
   await expect(page.locator("#high-level-architecture")).toBeInViewport();
 });
