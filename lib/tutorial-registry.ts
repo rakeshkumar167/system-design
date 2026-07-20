@@ -586,6 +586,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "object-storage": {
+    slug: "object-storage",
+    title: "Design Object Storage",
+    description:
+      "An interview-grade walkthrough of an S3-class object store: why it's a durability engine for immutable blobs at exabyte scale, a metadata service indexing a flat namespace of trillions of keys, durability via erasure coding rather than replication, the write path and multipart upload, degraded reads and reconstruction, background scrubbing and repair against silent corruption, immutability and versioning, and the failure modes.",
+    difficulty: "Advanced",
+    readingMinutes: 36,
+    concepts: ["Erasure coding", "Durability", "Multipart upload", "Metadata indexing"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "metadata-service", label: "The Metadata Service & Flat Namespace", depth: "advanced" },
+      { id: "durability-erasure-coding", label: "Durability & Erasure Coding", depth: "advanced" },
+      { id: "write-path-multipart", label: "The Write Path & Multipart Upload", depth: "advanced" },
+      { id: "read-path-reconstruction", label: "The Read Path & Reconstruction", depth: "advanced" },
+      { id: "background-integrity", label: "Scrubbing, Repair & Rebalancing", depth: "advanced" },
+      { id: "consistency-versioning", label: "Consistency, Immutability & Versioning", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

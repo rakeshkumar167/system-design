@@ -122,7 +122,7 @@ export const problems: readonly Problem[] = [
       "Store and serve exabytes of immutable blobs durably with erasure coding and multipart uploads.",
     difficulty: "Advanced",
     concepts: ["Erasure coding", "Durability", "Multipart upload", "Metadata indexing"],
-    status: "coming-soon",
+    status: "available",
     sequence: 12,
   },
   {
