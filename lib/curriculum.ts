@@ -142,7 +142,7 @@ export const problems: readonly Problem[] = [
       "Match riders to nearby drivers in real time using geospatial indexing and dispatch.",
     difficulty: "Advanced",
     concepts: ["Geospatial indexing", "Matching", "Real-time updates", "State machines"],
-    status: "coming-soon",
+    status: "available",
     sequence: 14,
   },
   {

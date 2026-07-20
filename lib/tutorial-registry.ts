@@ -644,6 +644,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "ride-hailing": {
+    slug: "ride-hailing",
+    title: "Design a Ride-Hailing Service",
+    description:
+      "An interview-grade walkthrough of an Uber-class ride-hailing system: why it's real-time matching over a constantly-moving dataset — a cell-based geospatial index, the driver location-update firehose kept in memory, matching and dispatch without double-booking, the trip lifecycle state machine, real-time tracking, and supply/demand surge.",
+    difficulty: "Advanced",
+    readingMinutes: 34,
+    concepts: ["Geospatial indexing", "Matching", "Real-time updates", "State machines"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "geospatial-index", label: "Geospatial Indexing", depth: "advanced" },
+      { id: "location-updates", label: "The Location-Update Firehose", depth: "advanced" },
+      { id: "matching-dispatch", label: "Matching & Dispatch", depth: "advanced" },
+      { id: "trip-state-machine", label: "The Trip State Machine", depth: "advanced" },
+      { id: "real-time-tracking", label: "Real-Time Tracking & ETA", depth: "advanced" },
+      { id: "supply-demand-surge", label: "Supply, Demand & Surge", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {
