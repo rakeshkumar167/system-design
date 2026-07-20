@@ -24,6 +24,7 @@ import ChatSystemContent from "@/content/tutorials/chat-system.mdx";
 import LeaderboardContent from "@/content/tutorials/leaderboard.mdx";
 import MetricsMonitoringContent from "@/content/tutorials/metrics-monitoring.mdx";
 import ObjectStorageContent from "@/content/tutorials/object-storage.mdx";
+import PhotoSharingContent from "@/content/tutorials/photo-sharing.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -48,6 +49,7 @@ const content: Record<string, ComponentType> = {
   "leaderboard": LeaderboardContent,
   "metrics-monitoring": MetricsMonitoringContent,
   "object-storage": ObjectStorageContent,
+  "photo-sharing": PhotoSharingContent,
 };
 
 export function generateStaticParams() {

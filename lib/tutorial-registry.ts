@@ -615,6 +615,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "photo-sharing": {
+    slug: "photo-sharing",
+    title: "Design a Photo Sharing Platform",
+    description:
+      "An interview-grade walkthrough of an Instagram-class photo platform: why it's a write-amplified async image pipeline feeding a read-dominated CDN delivery path, direct-to-storage uploads with presigned URLs, generating derivative sizes and formats asynchronously, CDN and responsive delivery, feed generation (on top of fan-out), metadata and social interactions, and storage tiering for cost.",
+    difficulty: "Advanced",
+    readingMinutes: 34,
+    concepts: ["Object storage", "Image pipeline", "Feed generation", "CDN"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "upload-path", label: "Upload: Direct-to-Storage & Presigned URLs", depth: "advanced" },
+      { id: "image-pipeline", label: "The Image Processing Pipeline", depth: "advanced" },
+      { id: "serving-cdn", label: "Serving Images: CDN & Responsive Delivery", depth: "advanced" },
+      { id: "feed-generation", label: "Feed Generation", depth: "advanced" },
+      { id: "metadata-social", label: "Metadata, Albums & Social Interactions", depth: "advanced" },
+      { id: "storage-tiering", label: "Storage, Tiering & Cost", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

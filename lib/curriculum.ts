@@ -132,7 +132,7 @@ export const problems: readonly Problem[] = [
       "Upload, process, and serve images and feeds at social-network scale.",
     difficulty: "Advanced",
     concepts: ["Object storage", "Image pipeline", "Feed generation", "CDN"],
-    status: "coming-soon",
+    status: "available",
     sequence: 13,
   },
   {

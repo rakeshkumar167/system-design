@@ -3,7 +3,7 @@ import { getTutorial, tutorials } from "@/lib/tutorial-registry";
 
 describe("tutorial registry", () => {
   it("registers the URL Shortener, Rate Limiter, Pastebin, Notification Service, Distributed Cache, API Gateway, Chat System, Ticket Booking, Video Streaming, Collaborative Doc Editor, Cloud Drive, Payment System, Distributed Logging, Distributed Job Scheduler, Maps and Navigation, Web Crawler, Search Autocomplete, and News Feed tutorials", () => {
-    expect(Object.keys(tutorials).sort()).toEqual(["api-gateway", "chat-system", "cloud-drive", "collaborative-doc-editor", "distributed-cache", "distributed-job-scheduler", "distributed-logging", "leaderboard", "maps-navigation", "metrics-monitoring", "news-feed", "notification-service", "object-storage", "pastebin", "payment-system", "rate-limiter", "search-autocomplete", "ticket-booking", "url-shortener", "video-streaming", "web-crawler"]);
+    expect(Object.keys(tutorials).sort()).toEqual(["api-gateway", "chat-system", "cloud-drive", "collaborative-doc-editor", "distributed-cache", "distributed-job-scheduler", "distributed-logging", "leaderboard", "maps-navigation", "metrics-monitoring", "news-feed", "notification-service", "object-storage", "pastebin", "payment-system", "photo-sharing", "rate-limiter", "search-autocomplete", "ticket-booking", "url-shortener", "video-streaming", "web-crawler"]);
   });
 
   it("describes the URL Shortener's eighteen sections, the Rate Limiter's fifteen, the Pastebin's eighteen, the Notification Service's eighteen, the Distributed Cache's eighteen, the API Gateway's eighteen, the Chat System's eighteen, the Ticket Booking's eighteen, the Video Streaming's eighteen, the Collaborative Doc Editor's eighteen, the Cloud Drive's eighteen, the Payment System's eighteen, the Distributed Logging's eighteen, the Distributed Job Scheduler's eighteen, the Maps and Navigation's eighteen, the Web Crawler's eighteen, the Search Autocomplete's eighteen, and the News Feed's eighteen", () => {
@@ -28,6 +28,7 @@ describe("tutorial registry", () => {
     expect(getTutorial("leaderboard")?.sections).toHaveLength(18);
     expect(getTutorial("metrics-monitoring")?.sections).toHaveLength(18);
     expect(getTutorial("object-storage")?.sections).toHaveLength(18);
+    expect(getTutorial("photo-sharing")?.sections).toHaveLength(18);
   });
 
   it("gives every section a unique id and a valid depth", () => {
@@ -40,6 +41,6 @@ describe("tutorial registry", () => {
   });
 
   it("returns undefined for unregistered tutorials", () => {
-    expect(getTutorial("photo-sharing")).toBeUndefined();
+    expect(getTutorial("ride-hailing")).toBeUndefined();
   });
 });
