@@ -1,71 +1,381 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-Placeholder.
+Object storage is the system behind Amazon S3, Google Cloud Storage, and Azure Blob — a service that stores an essentially unlimited number of **immutable blobs** (files, images, videos, backups, data-lake objects) under string keys and serves them over HTTP. Half the internet's data sits in one. From the outside the API is trivially simple — `PUT` bytes under a key, `GET` them back — which is exactly why the naive framing ("it's a giant key-value store for files") misses the entire problem. Anyone can store a file; the reason object storage is a hard system is that it must keep **exabytes of data across millions of disks safe for years**, where disks are failing, corrupting, and being replaced *constantly*, and lose essentially nothing — the headline promise is **eleven nines of durability** (99.999999999%), meaning if you store ten million objects you'd expect to lose one every ten thousand years.
+
+The hard part, then, is **durability at scale, affordably** — plus the machinery that scale forces. Four things dominate, and the API is the easy one. First, **durability**: at exabyte scale, keeping three full copies of everything (simple replication) is financially brutal, so the system uses **erasure coding** (Reed-Solomon) to get *better* durability than 3× replication at roughly **1.5×** the storage, by splitting each object into data and parity fragments spread across independent failure domains. Second, **metadata at massive scale**: the namespace is **flat** (a key maps to an object; there are no real directories), but there are **trillions** of keys, so a separate **metadata service** must index them — small per entry, enormous in count. Third, **huge objects**: a single object can be terabytes, so uploads use **multipart** — parallel, independently-retryable parts — because you can't stream a terabyte over one flaky connection. Fourth, **silent corruption**: bits rot on disk undetectably, so a **background scrubber** continuously re-reads and checksums fragments and **repairs** them, which is what actually *sustains* durability over time — the initial write is not enough. The reframe to lead with: *the API is a key-value PUT/GET, but the system is a durability engine — erasure coding for affordable 11-nines durability across failure domains, a sharded metadata service over a flat namespace of trillions of keys, multipart upload for enormous objects, and continuous background scrubbing and repair against the relentless disk failures and bit rot that would otherwise erode the data. Storing a blob is easy; guaranteeing you'll still have it, uncorrupted, in ten years, at exabyte scale and affordable cost, is the design.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What are we storing — **immutable blobs** of arbitrary size, addressed by key? (Yes — object storage, not a filesystem with in-place edits or a block device.)
+- What's the **durability and availability** target? (11 nines durability is the headline; availability is typically ~4 nines — the two are different guarantees.)
+- What **object-size range** — kilobytes to terabytes? It drives multipart and how small objects are packed.
+- **Consistency** — is strong read-after-write for new objects required? (Modern object stores provide it.)
+- **Scale** — how many objects and how much data? This decides erasure-coding vs replication and how the metadata is sharded.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "simple API, but it's a durability engine" reframe · **5 min** requirements (durability target, scale, immutability, consistency) · **5 min** capacity (erasure coding vs replication: 1.5× vs 3×, and the trillion-key metadata) · **5 min** entity model (object, flat namespace) and the API (PUT/GET + multipart) · **8 min** durability via erasure coding — the centerpiece — and failure domains · **8 min** the metadata service, write/read paths, and background scrubbing/repair · **5 min** consistency/versioning, failure modes, wrap-up. Say your invariants out loud — the interviewer is grading whether you reach for erasure coding, separate metadata from data, and understand that background repair (not the write) is what sustains durability.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the flat-namespace metadata service, durability via erasure coding across failure domains, the write path and multipart upload, the read path with reconstruction, background scrubbing/repair/rebalancing, and immutability/versioning/consistency — plus scaling, failure modes, and trade-offs. **Out of scope:** the applications *built on top* of object storage — a file-sync product (**Cloud Drive**) or a video platform (**Video Streaming**) both *use* a blob store but add their own metadata, sharing, and delivery on top; here we build the blob store itself. Also out of scope: POSIX filesystem semantics (in-place edits, byte-range writes, hard links — object storage deliberately doesn't do these), block storage (virtual disks), and the CDN edge caching that fronts object storage for hot reads. This problem is the storage substrate the **Cloud Drive** and **Video Streaming** tutorials assume exists.
 
 <h2 id="requirements">Requirements</h2>
 
-Placeholder.
+Separate what the system must *do* from how *well* it must do it. The functional list is short — that's the point — and nearly all the difficulty lives in the non-functional durability, scale, and cost columns.
+
+<RequirementsTable
+  functional={[
+    "PUT an object (immutable) under a bucket + key",
+    "GET an object (whole or byte-range)",
+    "DELETE an object",
+    "LIST objects by key prefix",
+    "Multipart upload for large objects",
+    "Versioning: keep prior versions of a key",
+  ]}
+  nonFunctional={[
+    { goal: "Durability", target: "~11 nines — effectively never lose data" },
+    { goal: "Availability", target: "~4 nines — serve through node/rack/AZ loss" },
+    { goal: "Scale", target: "exabytes; trillions of objects" },
+    { goal: "Cost efficiency", target: "minimize storage overhead at scale" },
+    { goal: "Consistency", target: "strong read-after-write for new objects" },
+    { goal: "Throughput", target: "stream multi-GB/TB objects efficiently" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **durability is the whole product**: 11 nines means the design must survive constant disk failures, whole-rack and availability-zone losses, and silent bit rot without losing data — which forces **erasure coding across independent failure domains** plus **continuous scrubbing and repair**, because durability isn't a property of the write, it's a property you *maintain* against entropy forever. Second, **scale demands cost efficiency**: at exabytes, the difference between 3× replication and 1.5× erasure coding is *half your entire storage bill* — literally exabytes of hardware — so erasure coding isn't an optimization, it's the only affordable way to hit the durability target. Third, **immutability simplifies everything**: objects never change in place — a "modification" writes a **new version** — which makes caching trivial (an object at a key+version never changes), enables deduplication, and sidesteps the hardest distributed-systems problem (concurrent in-place mutation). Note what's **relaxed**: object storage is **not** a filesystem — no partial in-place writes, no rename-as-move, no strong cross-object transactions — and **availability is a weaker guarantee than durability** (a brief inability to *serve* an object is tolerable; *losing* it is not). The system trades filesystem flexibility and some availability for extreme, affordable durability at unlimited scale.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-Placeholder.
+Estimates here make one decision for you: at this scale, **durability comes from erasure coding, not replication**, because the storage-overhead difference is measured in exabytes of hardware.
+
+<ObjectStorageCapacity
+  assumptions={{
+    objectsStored: 1000000000000,
+    avgObjectBytes: 1000000,
+    dataShards: 8,
+    parityShards: 4,
+    replicationFactor: 3,
+  }}
+/>
+
+The takeaways. First — the signature decision — **erasure coding roughly halves the storage bill versus replication**. A trillion 1 MB objects is **1000 PB (1 EB)** of logical data. Store it with **8+4 Reed-Solomon** (split each object into 8 data + 4 parity fragments) and you use **1500 PB** — a **1.5× overhead** — while surviving **any 4** simultaneous fragment losses. Store it with **3× replication** for comparable durability and you need **3000 PB**. Erasure coding **saves ~1500 PB** — an entire exabyte and a half of hardware — which at scale is the difference between a viable business and an impossible one. That's why every large object store uses erasure coding for its main tier. Second, **durability is about tolerating failures, not copies**: 8+4 tolerates 4 fragment losses, and if you spread those 12 fragments across 12 **independent failure domains** (racks, AZs), no single rack or zone failure can take out more than one, so correlated failures stay well under the 4-loss budget — this is how you reach 11 nines. Third — the part the byte math hides — **metadata is small but numerous**: a trillion objects means a *trillion* metadata entries (key → size, checksum, version, fragment locations), maybe a few hundred bytes each, so the metadata service is a large distributed database in its own right, sharded across the keyspace and kept entirely separate from the multi-exabyte data plane. The capacity story: size the data plane for **erasure-coded durability across failure domains** (the affordable path to 11 nines), and size the metadata plane for **trillions of tiny entries**, not bytes.
 
 <h2 id="entity-model">Entity Model</h2>
 
-Placeholder.
+The central object is the **Object** itself — an immutable blob plus the metadata that lets the system find, verify, and serve it. The two ideas that matter most are that the namespace is **flat** (a key is just a string; there is no directory tree) and that the **metadata is separate from the data**: a small record points at where the object's fragments live.
+
+<EntityModel
+  name="Object"
+  description="An immutable blob stored under a bucket and key, plus the metadata needed to locate, verify, and serve it. The blob's bytes are erasure-coded into fragments spread across storage nodes; the metadata record — small — lives in a separate, sharded metadata service and points at those fragments. A new PUT to an existing key creates a new version rather than mutating the object."
+  fields={[
+    { name: "bucket", type: "string", notes: "the top-level container / namespace owner" },
+    { name: "key", type: "string", notes: "the object's full name within the bucket — a flat string, not a path" },
+    { name: "version_id", type: "string", notes: "identifies this immutable version; a new PUT makes a new one" },
+    { name: "size", type: "int64", notes: "object length in bytes" },
+    { name: "checksum", type: "string", notes: "content hash (e.g. MD5/SHA) for integrity + ETag" },
+    { name: "fragments", type: "list<location>", notes: "where the k+m erasure-coded fragments live" },
+    { name: "storage_class", type: "enum", notes: "hot/standard/cold — drives placement and cost" },
+  ]}
+  keys="An object is identified by (bucket, key, version_id). The namespace is FLAT: the key is an opaque string, so 'folder/sub/file.jpg' is one key, not a traversal — 'directories' are a UI illusion produced by listing keys with a common prefix. The metadata service maps (bucket, key) → the current version and its fragment locations, checksum, and size; it is a separate, sharded datastore from the data plane. The blob's bytes are never stored whole — they're erasure-coded into k data + m parity fragments distributed across independent failure domains, and the metadata records where each fragment is. Objects are IMMUTABLE: a PUT to an existing key writes a new version (or overwrites, if versioning is off) but never edits bytes in place, which is what makes caching, dedup, and consistency tractable. A DELETE writes a tombstone / delete-marker rather than immediately erasing data."
+/>
+
+Two ideas complete the picture. **Buckets** are the top-level containers — the unit of ownership, access policy, and often region/placement — under which keys live; the (bucket, key) pair is globally unique. And the crucial subtlety is that **the blob is never stored as one piece**: it's erasure-coded into **fragments**, and the metadata record holds the *list of fragment locations*, not the bytes. This split — a small, indexed, sharded **metadata plane** pointing into a vast, dumb **data plane** — is the architectural spine of the whole system. The discipline: an object is an **immutable** (bucket, key, version) mapping to a set of **erasure-coded fragments across failure domains**, the **namespace is flat** (prefixes only mimic folders), and **metadata is small, sharded, and separate** from the data it locates.
 
 <h2 id="api-design">API Design</h2>
 
-Placeholder.
+The surface is a small HTTP/REST API dominated by PUT and GET, plus a multipart flow for large objects. The simplicity is deliberate — the complexity lives entirely behind these calls, in durability and metadata.
+
+<ApiContract
+  method="PUT"
+  path="/{bucket}/{key}"
+  summary="Store an object (immutable) under a key."
+  request={`PUT /photos/2026/sunset.jpg
+Content-Length: 4194304
+Content-MD5: q1b2...
+<binary object bytes>`}
+  response={`HTTP/1.1 200 OK
+ETag: "q1b2..."
+x-version-id: v_8f31`}
+  statusCodes={[
+    { code: "200", meaning: "Object stored durably; ETag is the content checksum" },
+    { code: "400", meaning: "Bad request / checksum mismatch" },
+    { code: "412", meaning: "Precondition (If-None-Match) failed — object exists" },
+  ]}
+  notes="The whole object in one request (small/medium objects). The server checksums the bytes, erasure-codes them into fragments across failure domains, and commits metadata last so the object appears atomically. The ETag lets clients verify integrity; If-None-Match enables safe create-if-absent."
+/>
+
+<ApiContract
+  method="GET"
+  path="/{bucket}/{key}"
+  summary="Retrieve an object, whole or a byte range."
+  request={`GET /photos/2026/sunset.jpg
+Range: bytes=0-1048575`}
+  response={`HTTP/1.1 206 Partial Content
+Content-Range: bytes 0-1048575/4194304
+ETag: "q1b2..."
+<binary bytes>`}
+  statusCodes={[
+    { code: "200", meaning: "Full object returned" },
+    { code: "206", meaning: "Requested byte range returned" },
+    { code: "404", meaning: "No such object (or version)" },
+  ]}
+  notes="Resolves fragment locations from metadata, fetches any k of the k+m fragments (fastest responders), reconstructs if a data fragment is missing, and streams. Range requests enable partial reads (video seeking, resumable downloads) without fetching the whole object."
+/>
+
+<ApiContract
+  method="POST"
+  path="/{bucket}/{key}?uploads"
+  summary="Multipart upload: initiate, upload parts, then complete."
+  request={`POST /backups/db.tar?uploads         → { uploadId }
+PUT  /backups/db.tar?partNumber=1&uploadId=...   (part bytes)
+PUT  /backups/db.tar?partNumber=2&uploadId=...   (part bytes)
+POST /backups/db.tar?uploadId=...    { parts: [{n:1,etag},{n:2,etag}] }`}
+  response={`HTTP/1.1 200 OK
+ETag: "multipart-...-2"`}
+  statusCodes={[
+    { code: "200", meaning: "Parts assembled into one object on complete" },
+    { code: "400", meaning: "Missing/mismatched part or ETag" },
+    { code: "404", meaning: "Unknown uploadId (expired/aborted)" },
+  ]}
+  notes="For large objects: initiate returns an uploadId, parts (each ~5 MB–5 GB) upload in parallel and independently retry, and complete stitches them by part number into one object. Incomplete uploads are abortable and garbage-collected, so a failed multi-TB transfer costs nothing permanent."
+/>
+
+The whole surface is: PUT/GET/DELETE an object, LIST by prefix, and multipart for large objects. There's no in-place update, no append, no rename — an "edit" is a new PUT (a new version), and a "move" is a copy-then-delete. That immutability is not a limitation to apologize for; it's the simplification that makes the durability and consistency guarantees achievable.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-Placeholder.
+The architecture is a **thin metadata plane** pointing into a **vast data plane**, with an **erasure coder** between the API and storage and a **background scrubber** keeping the data honest.
+
+<ObjectStorageArchitecture />
+
+- **Client.** Any HTTP client issuing PUT/GET/DELETE against a bucket and key.
+- **Object API.** Stateless front end: authenticates, checksums, and orchestrates encode-on-write / fetch-and-reconstruct-on-read. Scales horizontally behind a load balancer.
+- **Metadata Service.** A sharded, replicated datastore mapping (bucket, key, version) → size, checksum, and **fragment locations**. Small records, trillions of them, entirely separate from the bytes.
+- **Erasure Coder.** Splits an object into **k data + m parity** fragments on write and reconstructs it from any **k** on read (often colocated in the API/storage tier, shown separately for clarity).
+- **Storage Nodes.** The dumb, vast data plane: disks holding erasure-coded **fragments**, deliberately spread across **independent failure domains** (disks, racks, AZs).
+- **Scrubber / Repair.** A continuous background service that re-reads fragments, verifies checksums, reconstructs corrupt or lost ones, and rebalances on node changes.
+
+The decisive boundary is the **separation of a small, indexed metadata plane from a huge, dumb data plane**, joined by erasure coding: metadata knows *where* every fragment is, the data plane just stores fragments durably, and the coder turns objects into fragments and back. Every section that follows elaborates one piece: the metadata service and flat namespace, durability via erasure coding, the write and read paths, background scrubbing/repair, and consistency/versioning.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-Placeholder.
+Four flows cover the system: writing an object, reading it, uploading a large object in parts, and the background repair that sustains durability. The first two are the hot request paths; multipart and scrubbing appear in their deep dives below.
+
+**Write (PUT) an object.** The API checksums the bytes, the erasure coder splits them into data and parity fragments, those fragments are distributed across failure domains, and — only once they're durably stored — the metadata is committed, making the object appear atomically.
+
+<PutObjectSequence />
+
+**Read (GET) an object.** The API resolves fragment locations from metadata, fetches fragments from the storage nodes, reconstructs from parity if any data fragment is missing or slow, and streams the object back — needing only any k of the fragments.
+
+<GetObjectSequence />
+
+The remaining two flows — **multipart upload** for large objects and background **scrub/repair** — are shown in the Write Path and Background Integrity deep dives below, where their details belong.
 
 <h2 id="metadata-service">The Metadata Service & Flat Namespace</h2>
 
-Placeholder.
+The first thing to get right is that object storage has a **flat namespace**, not a filesystem tree. A key like `photos/2026/sunset.jpg` looks hierarchical, but the slashes are just characters in an opaque string — there is no `photos` directory object, no `2026` folder, no tree to traverse. What looks like folders in a UI is produced by **listing keys with a common prefix** and a delimiter (`prefix=photos/2026/, delimiter=/`), which the system answers as a **prefix scan** over a sorted key index. This flatness is a deliberate simplification: no directory locks, no recursive rename, no tree rebalancing — a billion keys under one prefix is fine, because there's no actual directory to bottleneck.
+
+That flat namespace is indexed by the **metadata service**, which is a serious distributed database in its own right, separate from the data plane. Each entry is small — (bucket, key, version) → size, checksum, storage class, and the **fragment locations** — but there are **trillions** of them, so the metadata service is **sharded** across the keyspace (by hash of the key for even distribution, or by key range to keep prefix-listing efficient) and **replicated** for its own durability and availability. It's on the critical path of every request (a GET is a metadata lookup then a fragment fetch), so it must be fast and highly available, and its own scaling — sharding, replication, hot-shard handling — mirrors the **Distributed Key-Value Store** problem. The separation is the key architectural decision: keeping metadata apart from data means you can **scale, index, and strongly-consistency the small metadata independently** of the vast, dumb, eventually-consistent bytes. The principle: object storage is a **flat key→object map** where prefixes only *simulate* folders (LIST is a prefix scan), and the **metadata service is a sharded, replicated index** of trillions of small records — kept separate from the data plane so the two scale on their own terms.
+
+<KnowledgeCheck
+  question="Why is object storage's namespace 'flat', and why is metadata kept separate from the data?"
+  options={[
+    "The namespace is a real directory tree; metadata and data are stored together for speed",
+    "The key is an opaque string, so there's no directory tree — 'folder/file.jpg' is one key, and what looks like folders is just listing keys by common prefix (a prefix scan over a sorted index), which avoids directory locks, recursive renames, and tree bottlenecks. Metadata (key → size, checksum, fragment locations) is kept in a separate, sharded, replicated service from the vast data plane so the small, indexed, trillion-entry metadata can scale and be made strongly consistent independently of the dumb, eventually-consistent bytes",
+    "The namespace is flat to save disk space; metadata is stored on the client",
+    "Flatness means all objects are the same size; metadata is embedded in each object",
+  ]}
+  answer={1}
+  explanation="Keys are opaque strings, so the namespace is a flat map with no real hierarchy; 'directories' are an illusion created by prefix-listing, answered as a scan over a sorted key index — which sidesteps the locking, recursive operations, and rebalancing a true tree would need. Separating the small metadata records (which point at fragments) from the enormous data plane lets the metadata service be sharded, replicated, indexed, and strongly consistent on its own terms, while the data plane just stores fragments durably. It's a deliberate split of concerns, not about disk space or object size."
+/>
 
 <h2 id="durability-erasure-coding">Durability & Erasure Coding</h2>
 
-Placeholder.
+This is the centerpiece. To not lose data when disks constantly fail, you need **redundancy** — but *which* redundancy scheme decides whether the system is affordable. The simple option is **replication**: keep N full copies (typically 3) on different nodes, so you survive N−1 losses. It's simple and fast, but at exabyte scale **3× is ruinous** — you're buying three exabytes of hardware to store one exabyte of data.
+
+**Erasure coding** gets *more* durability for *far less* overhead. With **Reed-Solomon (k, m)**, you split an object into **k data fragments**, compute **m parity fragments** from them, and store all **k+m**. The mathematical guarantee: **any k of the k+m fragments** are enough to reconstruct the original object, so you can lose **any m** fragments and still recover perfectly. The overhead is just **(k+m)/k**. With **8+4** (our capacity model): split into 8 data + 4 parity = 12 fragments, tolerate **any 4** losses, at **1.5×** overhead — versus 3× replication tolerating only 2 losses. Erasure coding gives **better durability at half the storage cost**, which is why it's the main tier of every large object store.
+
+The subtlety that makes it actually durable is **failure domains**. Tolerating "any 4 fragment losses" only helps if losses are **independent** — so you place the 12 fragments across **12 different failure domains**: different disks, different nodes, different racks, ideally different availability zones. Then a whole rack dying takes out at most one fragment, a whole AZ failing takes out a bounded few, and correlated failures stay comfortably under the 4-loss budget — which is how you get to **11 nines**. The costs are real and worth naming: erasure coding spends **CPU** to encode on write and **decode/reconstruct** on degraded reads, and a **small-object penalty** (splitting a tiny object into 12 fragments has overhead), so very small objects are often replicated or packed together. The principle: use **erasure coding (Reed-Solomon k+m)** — any k of k+m fragments reconstruct, tolerating m losses at (k+m)/k overhead — instead of replication, and spread fragments across **independent failure domains** so correlated failures can't exceed the parity budget, buying **11-nines durability at ~1.5×** the storage cost of the data.
+
+<KnowledgeCheck
+  question="How does erasure coding (Reed-Solomon k+m) achieve better durability than replication at lower cost, and why do failure domains matter?"
+  options={[
+    "It compresses the data 3×, so less is stored; failure domains are irrelevant",
+    "It splits an object into k data + m parity fragments so any k of the k+m reconstruct it, tolerating any m losses at just (k+m)/k overhead — e.g. 8+4 tolerates 4 losses at 1.5× cost, versus 3× replication tolerating 2 losses at 3× cost, so it's more durable and cheaper. Failure domains matter because tolerating m losses only helps if losses are independent, so the fragments are spread across separate disks/racks/AZs, keeping correlated failures under the parity budget — which is how 11 nines is reached",
+    "It keeps 12 full copies of the object; failure domains just organize the copies",
+    "It replicates only the parity, not the data; failure domains reduce network cost",
+  ]}
+  answer={1}
+  explanation="Reed-Solomon encodes k data fragments into m additional parity fragments such that any k of the total k+m suffice to rebuild the object, so you survive any m losses while storing only (k+m)/k times the data — 8+4 gives 4-loss tolerance at 1.5×, beating 3× replication's 2-loss tolerance at 3× cost. But the m-loss budget assumes independent failures, so fragments are placed across distinct failure domains (disks, racks, AZs) so that a rack or zone outage removes at most a bounded number, keeping real correlated failures under m and delivering extreme durability affordably. It's coding, not compression or full copies."
+/>
 
 <h2 id="write-path-multipart">The Write Path & Multipart Upload</h2>
 
-Placeholder.
+The **write path** turns the durability design into a careful sequence. On a PUT, the API first **checksums** the incoming bytes (both to verify the client's upload and to store as the ETag), the erasure coder **splits** them into k+m fragments, and those fragments are **written across storage nodes in separate failure domains**. Critically, the **metadata is committed last**: only after the fragments are confirmed durably stored does the API write the (key → fragment locations) record. This ordering gives **atomic visibility** — until metadata is committed, the object simply doesn't exist to any reader, so a crash mid-write never exposes a half-written object; the orphaned fragments left behind are just **garbage-collected** by a background sweep. The write isn't acknowledged until enough fragments (a write quorum) are durable, so a returned 200 genuinely means "safe."
+
+For large objects, a single PUT is impractical — you can't reliably stream a terabyte over one HTTP connection that might drop at 90% — so object stores provide **multipart upload**.
+
+<MultipartUploadSequence />
+
+The client **initiates** the upload (getting an `uploadId`), splits the object into **parts** (each ~5 MB to 5 GB), uploads the parts **in parallel** and **independently** (each part is its own request with its own retry), and finally issues a **complete** call listing the parts and their ETags, which the system **assembles** into one logical object. The wins are large: parts upload **concurrently** for throughput, a **dropped part is re-sent alone** rather than restarting the whole transfer, and an abandoned upload is **abortable and garbage-collected** so a failed multi-TB transfer costs nothing permanent. It also enables resumable uploads and uploading an object whose total size you don't know upfront. The principle: on write, **erasure-code and distribute fragments across failure domains, then commit metadata last** so objects appear atomically and partial writes are invisible and GC'd; and for large objects use **multipart upload** — parallel, independently-retryable parts assembled on completion — so huge transfers are fast, resilient to flaky networks, and cheap to abort.
+
+<KnowledgeCheck
+  question="Why is metadata committed last on a write, and what problem does multipart upload solve?"
+  options={[
+    "Metadata is committed first so readers see the object immediately; multipart saves storage",
+    "Committing metadata last gives atomic visibility: until the (key → fragment locations) record is written, the object doesn't exist to readers, so a crash mid-write never exposes a half-written object — the orphaned fragments are just garbage-collected. Multipart upload solves large objects: the client uploads parts in parallel, each independently retryable, then a complete call assembles them — so a multi-GB/TB transfer is fast, survives a dropped part without restarting, and an abandoned upload is abortable and GC'd",
+    "Metadata is committed last to save a network round trip; multipart is only for small files",
+    "Both are about compression, reducing the number of fragments written",
+  ]}
+  answer={1}
+  explanation="Writing fragments first and the metadata record last means an object becomes visible only when it's fully durable — a partial write leaves fragments with no metadata pointing at them, invisible to readers and reclaimable by GC, so no half-written object is ever served. Multipart upload addresses the impossibility of reliably streaming huge objects in one request: parallel, independently-retryable parts assembled on completion give throughput, resilience to dropped connections, and cheap abort. Neither is about compression or saving round trips."
+/>
 
 <h2 id="read-path-reconstruction">The Read Path & Reconstruction</h2>
 
-Placeholder.
+The **read path** is where erasure coding quietly pays off in latency and availability, not just cost. On a GET, the API **looks up the object's fragment locations** in the metadata service, then **fetches fragments** from the storage nodes. Here's the elegant part: it needs **any k** of the k+m fragments. In the common case, all k **data** fragments are present, so the object is just their concatenation — a fast path with no math. But if a data fragment is **missing** (a dead node) or **slow** (a struggling disk, a hot node), the API doesn't wait — it fetches a **parity** fragment instead and **reconstructs** the missing data via the Reed-Solomon decode.
+
+This "any k" property is a double win. For **failure tolerance**, a read succeeds as long as any k of the k+m fragments are reachable, so several nodes can be down and reads still work — availability for free from the same coding that gives durability. For **tail latency**, the API can issue requests to more than k fragments and **use the first k to respond**, treating the slow ones as if they'd failed and reconstructing around them — so one slow disk out of twelve never slows the read (the same hedged-request idea that tames tail latency elsewhere). Reads also support **byte ranges** (fetch just the fragments covering the requested range) for partial reads like video seeking and resumable downloads, and hot objects are fronted by a **CDN/cache** so most reads never touch storage at all. The principle: a read needs only **any k of the k+m fragments**, so the API fetches from the **fastest responders and reconstructs from parity** around slow or dead nodes — turning erasure coding into failure tolerance and tail-latency insurance on top of its storage savings.
+
+<KnowledgeCheck
+  question="On a read, why does needing 'any k of k+m fragments' help with both failure tolerance and tail latency?"
+  options={[
+    "It doesn't; reads always need every fragment, so one slow disk slows every read",
+    "Because the object can be reconstructed from any k fragments, a read succeeds as long as any k of the k+m are reachable — so several nodes can be down and reads still work (availability from the same coding as durability). For tail latency, the API can request more than k fragments and use the first k to respond, reconstructing from parity around a slow or dead node rather than waiting — so one struggling disk out of twelve never slows the read",
+    "It helps failure tolerance only; tail latency is unaffected by erasure coding",
+    "It helps by compressing the response so less data is transferred",
+  ]}
+  answer={1}
+  explanation="The 'any k' guarantee means missing or slow fragments can be worked around: as long as any k of the total fragments respond, the object is recoverable, so reads tolerate multiple node failures without extra copies. And because the API can fetch beyond k and reconstruct from whichever k return first, a slow node is simply treated as failed and decoded around — hedging away tail latency. The same Reed-Solomon coding that provides cheap durability thus also delivers read availability and tail-latency insurance, not just storage savings."
+/>
 
 <h2 id="background-integrity">Scrubbing, Repair & Rebalancing</h2>
 
-Placeholder.
+Here's the truth that separates a real durability design from a naive one: **writing the data durably is not enough — durability decays, and must be actively maintained.** Disks suffer **silent corruption** (bit rot): a bit flips on a platter or SSD cell with no error reported, so a fragment that was written correctly is now subtly wrong, and you won't know until you read it — by which time other fragments may also have rotted, and you could be below the recovery threshold. And nodes fail permanently every day, each taking its fragments with it. If you did nothing, redundancy would erode fragment by fragment until objects crossed the m-loss threshold and were **lost forever**.
+
+<ScrubRepairSequence />
+
+The defense is a **background scrubber** that runs continuously: it systematically **re-reads every fragment** and **verifies its checksum**. When it finds a fragment that's **corrupt** (checksum mismatch) or **missing** (its node is gone), it **reconstructs** that fragment from the surviving fragments (the same Reed-Solomon decode as a degraded read) and **rewrites** it to a healthy node in a proper failure domain — **restoring full redundancy** before enough fragments are lost to threaten the object. This is what actually delivers 11 nines *over years*: durability is a **rate** — you must repair lost redundancy faster than it decays. Closely related is **rebalancing**: when nodes are **added** (spread data onto them), **removed**, or **fail** (their fragments must be re-replicated elsewhere), the system moves fragments to keep placement even and failure domains intact. The trade-off is background **I/O and CPU cost** — scrubbing constantly re-reads the entire dataset and repair consumes bandwidth — which is tuned against how fast you need to detect and heal corruption. The principle: durability is **maintained, not achieved once** — a continuous **scrubber** re-reads and checksums fragments and **repairs** silent corruption and lost fragments from parity, restoring redundancy faster than disks and nodes destroy it, with **rebalancing** keeping placement healthy as the fleet changes.
 
 <h2 id="consistency-versioning">Consistency, Immutability & Versioning</h2>
 
-Placeholder.
+Object storage leans hard on **immutability**, and it buys a lot. Objects are never modified in place — a PUT to an existing key doesn't edit bytes, it writes an entirely **new version** of the object, and the metadata service flips the key to point at it. This single choice dissolves the hardest problems in distributed storage: there's no concurrent in-place mutation to coordinate, an object at a given (key, version) **never changes** so it's **infinitely cacheable** (a CDN can hold it forever), and identical content can be **deduplicated** safely. "Editing" an object is re-uploading it; the old bytes remain their own immutable version.
+
+On **consistency**, modern object stores provide **strong read-after-write for new objects**: the moment a PUT returns success, a subsequent GET is guaranteed to see it — achieved by making the **metadata commit the single linearization point** (the object exists exactly when its metadata is committed, and the metadata service provides read-your-writes on that record). Historically some stores were only *eventually* consistent here (a just-written object could 404 briefly), but the metadata-commit-last design makes strong read-after-write natural. **Overwrites and deletes** are typically read-after-write consistent on the metadata too, while **LIST** operations may lag slightly (the index catches up). **Versioning** builds directly on immutability: with it enabled, every PUT keeps the prior versions (so you can recover an overwritten or deleted object), and a **DELETE** just writes a **tombstone / delete-marker** rather than erasing data — the bytes are reclaimed later by lifecycle policy. The principle: objects are **immutable** (a write is a new version), which makes them cacheable, dedup-able, and simple to reason about; **strong read-after-write** consistency for new objects falls out of committing **metadata as the linearization point**; and **versioning + tombstoned deletes** give recoverability on top of the same immutable-version model.
+
+<KnowledgeCheck
+  question="How does immutability simplify object storage, and how is strong read-after-write consistency achieved?"
+  options={[
+    "Immutability means objects can never be deleted; consistency requires locking every read",
+    "Because a write creates a new immutable version rather than editing in place, there's no concurrent in-place mutation to coordinate, an object at a (key, version) never changes so it's infinitely cacheable, and identical content can be deduplicated. Strong read-after-write for new objects comes from making the metadata commit the single linearization point — the object exists exactly when its metadata record is committed — so a GET after a successful PUT is guaranteed to see it. Versioning and tombstoned deletes add recoverability on the same model",
+    "Immutability means the data is compressed; consistency is achieved by replicating to every node synchronously",
+    "Immutability prevents versioning; consistency is eventual only, so reads may 404",
+  ]}
+  answer={1}
+  explanation="Never mutating bytes in place removes the coordination of concurrent writers, makes each (key, version) permanently cacheable, and enables safe dedup — a write simply produces a new version. Consistency then reduces to the metadata: since an object becomes visible exactly when its metadata record is committed (fragments were written first), committing metadata as the linearization point gives strong read-after-write for new objects. Versioning keeps prior versions and DELETE writes a tombstone, layering recoverability on the immutable-version model — not requiring per-read locks or precluding deletes."
+/>
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Placeholder.
+Don't build the exabyte-scale, erasure-coded, multi-region system on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Single-node blob store", "A modest amount of data, one machine", "Simple, but no durability beyond one disk and no scale — a toy"],
+    ["Replicated across nodes", "Need to survive disk/node loss", "3× storage overhead; survives a couple of losses but expensive at scale"],
+    ["Metadata-sharded + erasure-coded across failure domains", "Petabytes+; cost matters; 11-nines target", "Sharded metadata service; erasure coding (CPU); placement across racks/AZs; scrubbing/repair"],
+    ["Multi-region + storage tiering", "Geo-durability, locality, cost tiers", "Cross-region replication of objects/metadata; hot/cold tiers (standard/glacier); lifecycle policies"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the wall you're hitting. A **single-node blob store** is a toy — one disk, no durability. **Replication across nodes** is the first real durability step and is genuinely fine at small-to-medium scale, but its 3× overhead becomes untenable as you grow. The center of gravity for a real object store is a **sharded metadata service plus erasure coding across failure domains with background scrubbing** — this is where affordable 11-nines durability lives, and where most of this tutorial's design sits. Only at the largest scale do you add **multi-region and storage tiering**: replicate objects and metadata across regions for geo-durability and locality, and offer **storage classes** (hot "standard" on fast media, "cold/glacier" on cheap high-latency media) with **lifecycle policies** that transition objects to cheaper tiers as they age — trading retrieval latency for cost. Most systems are well-served by "erasure-coded across failure domains, metadata sharded, scrubbed continuously," adding regions and tiers as durability geography and cost pressure demand.
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-Placeholder.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. Object storage's guiding rule is stark: **durability is sacred and non-negotiable; availability can wobble, but data must never be lost** — so every failure mode is answered by redundancy, reconstruction, and background repair.
+
+<FailureMatrix
+  rows={[
+    { failure: "Disk / storage-node failure", impact: "Some fragments lost", detection: "Health checks / read errors", mitigation: "Erasure coding: any k of k+m still reconstruct; reads unaffected", recovery: "Scrubber reconstructs lost fragments to new nodes; rebalance" },
+    { failure: "Silent bit rot (corruption)", impact: "A fragment is wrong but 'present'", detection: "Checksum verification during scrub/read", mitigation: "Reject the bad fragment; reconstruct from parity", recovery: "Rewrite the repaired fragment; redundancy restored" },
+    { failure: "Whole rack / AZ failure", impact: "Multiple fragments offline at once", detection: "Zone health monitors", mitigation: "Fragments spread across domains so losses stay under m", recovery: "Reconstruct affected fragments elsewhere when zone returns/replaced" },
+    { failure: "Correlated loss exceeds m fragments", impact: "Object at risk of loss", detection: "Redundancy-below-threshold alerts", mitigation: "Prioritized repair of low-redundancy objects; wider spreading", recovery: "Rebuild from any surviving k before crossing the line" },
+    { failure: "Metadata shard loss", impact: "Keys on that shard unreadable", detection: "Metadata replica health", mitigation: "Metadata is replicated; fail over to a replica", recovery: "Restore/rebuild the shard from replicas" },
+    { failure: "Half-written / aborted upload", impact: "Orphan fragments, no object", detection: "Metadata never committed", mitigation: "Object invisible until metadata commit; nothing served", recovery: "Background GC reclaims orphan fragments" },
+    { failure: "Hot object / read storm", impact: "Storage nodes overloaded", detection: "Per-object QPS / latency", mitigation: "CDN/cache in front; immutable objects cache forever", recovery: "Cache absorbs; replicate hot object's fragments wider" },
+  ]}
+/>
+
+The theme: **redundancy tolerates, reconstruction heals, background repair sustains.** A dead disk or node is a non-event for reads because any k of k+m fragments reconstruct the object, and the scrubber rebuilds the lost fragments elsewhere. Silent corruption is caught by **checksums** (the only defense against bit rot — the disk won't tell you) and repaired from parity. Rack and AZ failures are survived because fragments are **spread across failure domains** so a whole-zone loss stays under the m-fragment budget, and the dangerous case — correlated loss *approaching* m — is met with **prioritized repair** of low-redundancy objects, racing to rebuild before crossing the line (durability as a rate again). Metadata shard loss is handled like any replicated datastore (fail over to a replica). Half-written uploads are harmless because **metadata-commit-last** means they're never visible, and GC reclaims the orphans. Hot objects are absorbed by a **CDN/cache** (trivial because objects are immutable). Because the data is erasure-coded across domains and continuously scrubbed, recovery is almost always "reconstruct from the survivors and rewrite" — and the one line never crossed is losing an object.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-Placeholder.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Store immutable objects under a flat (bucket, key, version) namespace, splitting each object with Reed-Solomon erasure coding (k+m, e.g. 8+4) into fragments spread across independent failure domains for ~11-nines durability at ~1.5× overhead; keep a small, sharded, replicated metadata service mapping keys to fragment locations, separate from the vast data plane; commit metadata last on write so objects appear atomically, use multipart upload for large objects, and reconstruct from any k fragments on read (bypassing slow/dead nodes); run a continuous background scrubber that checksums and repairs fragments to sustain durability, rebalancing as the fleet changes; and rely on immutability + metadata-as-linearization-point for cacheability and strong read-after-write, with versioning and tombstoned deletes for recoverability."
+  rationale="Durability at exabyte scale must be affordable, and erasure coding across failure domains delivers better-than-3×-replication durability at ~1.5× cost — the decisive economic choice. Separating small, indexed metadata from dumb, vast data lets each scale independently and makes strong consistency a metadata property. Immutability removes in-place-mutation coordination and makes objects cacheable and dedup-able. And because disks fail and rot continuously, background scrubbing/repair — not the write — is what actually maintains 11 nines over years. Multipart and any-k reads add resilience for huge objects and tail latency."
+  alternatives="3× replication instead of erasure coding — simpler and lower-CPU but double the storage cost at scale, untenable for exabytes (though still used for very small objects, where EC's per-fragment overhead hurts). Storing objects whole rather than as fragments — no reconstruction complexity but no cheap durability or any-k read resilience. Combining metadata and data — simpler but couples their very different scaling and consistency needs. A filesystem/POSIX interface — flexible in-place edits but reintroduces the coordination immutability removes. No background scrubber — durable at write time but decays to data loss as bit rot and node failures accumulate. Eventual consistency for new objects — simpler but surprises clients with missing-then-present reads."
+  revisitWhen="Object-size distribution skews tiny (replicate or pack small objects to avoid per-fragment overhead); durability geography requires surviving a whole region (add cross-region replication); cost pressure warrants tiering (add cold storage classes + lifecycle policies); read patterns concentrate on hot objects (widen fragment placement / lean on CDN); or the metadata service becomes the bottleneck (reshard, add caching, or adopt a stronger distributed KV store underneath)."
+/>
+
+Four axes capture the real tension:
+
+- **Erasure coding vs replication.** Erasure coding gives better durability at ~half the storage cost but spends CPU on encode/decode and hurts on tiny objects; replication is simple and low-latency but 3× the storage. Erasure code the main tier; replicate tiny objects.
+- **Metadata/data separation vs unified.** Separating them lets each scale and be consistent on its own terms (the winning choice); unifying is simpler but couples very different needs.
+- **Immutable vs mutable objects.** Immutability removes mutation coordination and enables caching/dedup at the cost of no in-place edits; object storage embraces it fully.
+- **Strong vs eventual read-after-write.** Strong (via metadata-commit-last) is what clients expect and modern stores provide; eventual is simpler but surprises callers with briefly-missing new objects.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-Placeholder.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"Object storage looks like a key-value PUT/GET for files, but the real system is a durability engine: it has to keep exabytes safe for years at eleven nines, while disks fail and silently corrupt data constantly. So the core decision is erasure coding instead of replication — I split each object with Reed-Solomon into, say, eight data plus four parity fragments, where any eight of the twelve reconstruct the object, so I tolerate any four losses at only one-and-a-half times the storage, versus three times for replication that's actually less durable. I spread those twelve fragments across independent failure domains — different disks, racks, and availability zones — so a whole rack or zone dying stays well under the four-loss budget, which is how eleven nines is reached. The namespace is flat: a key is just a string, folders are an illusion from prefix listing, and a separate sharded metadata service maps keys to fragment locations — small records but trillions of them, kept apart from the vast data plane so each scales on its own. On write, I checksum, erasure-code, distribute fragments, and commit metadata last so an object appears atomically and half-writes are invisible and garbage-collected; big objects use multipart upload with parallel, independently-retryable parts. On read, I only need any k fragments, so I fetch the fastest responders and reconstruct around slow or dead nodes — durability that doubles as availability and tail-latency insurance. And the thing that actually sustains durability isn't the write, it's a background scrubber that continuously re-reads and checksums every fragment and repairs corruption or loss from parity, restoring redundancy faster than entropy destroys it. Objects are immutable — a write is a new version — which makes them cacheable, dedup-able, and gives strong read-after-write since the metadata commit is the linearization point. The one line I never cross: availability can wobble, but I never lose an object."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why erasure coding over replication, and what do failure domains buy you? Why separate metadata from data? Why commit metadata last? How does multipart upload help? Why does a read only need k fragments? What actually sustains durability over years? How do you get strong read-after-write?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="What does the capacity model reveal about how object storage achieves durability affordably?"
+  options={[
+    "It stores three full copies because replication is cheapest at scale",
+    "That at exabyte scale, erasure coding beats replication decisively: storing 1 EB with 8+4 Reed-Solomon uses ~1.5 EB (1.5× overhead) and survives any 4 fragment losses, versus 3× replication needing ~3 EB for comparable durability — saving ~1500 PB, an exabyte and a half of hardware. Spreading fragments across independent failure domains keeps correlated failures under the parity budget, delivering 11 nines. Metadata is tiny by bytes but enormous by count (a trillion keys), so it's sharded and separate",
+    "That storage is dominated by metadata, not object bytes",
+    "That durability requires keeping every object in memory",
+  ]}
+  answer={1}
+  explanation="The numbers show erasure coding roughly halves the storage cost of durability versus replication (1.5× vs 3×) while tolerating more losses, which at exabyte scale is a decisive, business-critical saving. Placing the k+m fragments across independent failure domains ensures no single rack/zone failure exceeds the parity budget, yielding 11 nines. Separately, a trillion objects means a trillion small metadata records, so the metadata plane is a large sharded database in its own right, kept apart from the multi-exabyte data plane. Durability is engineered through coding and placement, not full copies or memory."
+/>
+
+<KnowledgeCheck
+  question="Why is a background scrubber essential, not optional, for an object store's durability?"
+  options={[
+    "It isn't — durability is guaranteed the moment data is written",
+    "Because durability decays: disks suffer silent corruption (bit rot the disk doesn't report) and nodes fail permanently over time, so redundancy erodes fragment by fragment until an object crosses the m-loss threshold and is lost forever. A background scrubber continuously re-reads and checksums every fragment, and reconstructs corrupt or lost fragments from parity, restoring redundancy faster than entropy destroys it. Durability is a rate you must maintain, not a one-time property of the write",
+    "It only improves read latency, not durability",
+    "It compresses old fragments to save space",
+  ]}
+  answer={1}
+  explanation="Writing k+m fragments makes an object durable at that instant, but disks silently corrupt data and nodes die continuously, so without active maintenance redundancy would decay until objects fall below the recoverable threshold and are permanently lost. The scrubber detects corruption via checksums (the only defense against silent rot) and missing fragments via node health, then rebuilds them from surviving fragments — keeping redundancy ahead of decay. That continuous repair, not the initial write, is what actually delivers eleven nines over years."
+/>
+
+<Faq
+  items={[
+    { question: "What is object storage?", answer: "It's a service that stores an unlimited number of immutable blobs (files, images, videos, backups) under string keys and serves them over HTTP — Amazon S3, Google Cloud Storage, Azure Blob. The API is a simple PUT/GET, but the system is a durability engine: it keeps exabytes safe for years at eleven nines despite constant disk failures and corruption. It's not a filesystem (no in-place edits) and not block storage (no virtual disks)." },
+    { question: "How is object storage different from a filesystem?", answer: "Object storage has a flat namespace (keys are opaque strings; 'folders' are just prefix listings), stores immutable objects (a write is a new version, no in-place byte edits, no append, no rename), and is accessed over HTTP by key. A filesystem has a real directory tree, mutable files with partial writes and seeks, and POSIX semantics. Object storage trades that flexibility for massive scale and extreme durability." },
+    { question: "What is erasure coding and why use it over replication?", answer: "Erasure coding (Reed-Solomon k+m) splits an object into k data and m parity fragments so any k of the k+m reconstruct it, tolerating any m losses at just (k+m)/k overhead. With 8+4 you tolerate 4 losses at 1.5× storage — more durable than 3× replication (2 losses at 3× storage) and roughly half the cost. At exabyte scale that saving is enormous, which is why erasure coding is the main tier of every large object store; replication is reserved for tiny objects where per-fragment overhead hurts." },
+    { question: "How does object storage reach eleven nines of durability?", answer: "By combining erasure coding with placement across independent failure domains and continuous repair. Fragments (k+m) are spread across different disks, racks, and availability zones so no single failure removes more than a bounded few, keeping correlated losses under the m-fragment budget. A background scrubber then continuously checksums and rebuilds fragments, restoring redundancy faster than disks fail and rot — durability is a rate you maintain, and that ongoing repair is what sustains eleven nines over years." },
+    { question: "What are failure domains and why do they matter?", answer: "A failure domain is a boundary within which components tend to fail together — a disk, a node, a rack, an availability zone. Erasure coding tolerates m fragment losses only if those losses are independent, so the k+m fragments are placed in separate failure domains. Then a whole rack or AZ going down takes out at most a bounded number of fragments, staying under the parity budget. Without domain-aware placement, one rack failure could destroy many fragments of the same object at once." },
+    { question: "Why is metadata kept separate from the data?", answer: "Because the two have completely different scaling and consistency needs. Metadata records (key → size, checksum, fragment locations) are small but number in the trillions and need to be indexed, sharded, replicated, and strongly consistent; the data plane is a vast, dumb store of fragments. Separating them lets the metadata service be a fast, strongly-consistent distributed database while the data plane just stores bytes durably — and it makes the metadata commit the natural linearization point for consistency." },
+    { question: "What is multipart upload and why is it needed?", answer: "It's a way to upload a large object in parts: the client initiates the upload, sends parts (each ~5 MB–5 GB) in parallel, and issues a complete call that assembles them into one object. It's needed because you can't reliably stream a terabyte over a single HTTP connection — parts upload concurrently for throughput, a dropped part is re-sent without restarting the whole transfer, uploads are resumable, and an abandoned upload is abortable and garbage-collected, so a failed multi-TB transfer costs nothing permanent." },
+    { question: "Why does committing metadata last matter on a write?", answer: "It gives atomic visibility. Fragments are written to the data plane first, and only after they're durably stored is the metadata record (key → fragment locations) committed. Until that commit, the object simply doesn't exist to any reader, so a crash mid-write never exposes a half-written or corrupt object — the orphaned fragments are just reclaimed by background garbage collection. The metadata commit is the single point at which the object atomically appears." },
+    { question: "Why does a read only need k of the k+m fragments?", answer: "Because Reed-Solomon guarantees the original object can be reconstructed from any k of the k+m fragments. So a read fetches fragments and, as long as any k respond, rebuilds the object — bypassing missing (dead-node) or slow fragments by reconstructing from parity. This gives failure tolerance (reads survive multiple node losses) and tail-latency insurance (fetch more than k, use the first k to respond, decode around the slow ones) on top of the storage savings." },
+    { question: "What is silent corruption and how is it handled?", answer: "Silent corruption (bit rot) is when data on a disk changes — a flipped bit — with no error reported, so a fragment that was written correctly is now wrong and you won't know until you read it. It's handled with checksums: every fragment has a stored checksum, and the background scrubber (and every read) verifies it. A mismatch means the fragment is corrupt, so it's rejected and reconstructed from parity and rewritten — checksums are the only defense, since the disk itself won't tell you." },
+    { question: "Are objects mutable, and how does versioning work?", answer: "No — objects are immutable. A PUT to an existing key writes a new version rather than editing bytes in place, which makes objects infinitely cacheable, safely dedup-able, and free of in-place-mutation coordination. With versioning enabled, prior versions are retained so you can recover an overwritten or deleted object, and a DELETE writes a tombstone (delete-marker) rather than erasing data immediately; the bytes are reclaimed later by lifecycle policy. 'Editing' is just re-uploading." },
+    { question: "Does object storage give strong or eventual consistency?", answer: "Modern object stores provide strong read-after-write consistency for new objects: once a PUT returns success, a subsequent GET is guaranteed to see it. This falls out of committing metadata as the single linearization point — the object exists exactly when its metadata record is committed, and the metadata service provides read-your-writes on it. Overwrites and deletes are typically read-after-write consistent too, while LIST operations may lag slightly as the index catches up." },
+    { question: "How is this different from Cloud Drive or a video platform?", answer: "Those are applications built on top of object storage. Cloud Drive adds file-sync, sharing, and its own metadata; a video platform adds transcoding and adaptive streaming — both store their actual bytes in a blob store like the one this tutorial designs. Here we build the blob store itself: the durability engine (erasure coding, failure domains, scrubbing), the flat-namespace metadata service, and the multipart write path that those higher-level products simply assume exists." },
+  ]}
+/>
