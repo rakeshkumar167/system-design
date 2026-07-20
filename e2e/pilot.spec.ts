@@ -28,7 +28,7 @@ test("knowledge checks reveal an explanation after a choice", async ({ page }) =
 
 test("curriculum separates available and upcoming content", async ({ page }) => {
   await page.goto("/curriculum");
-  await expect(page.getByText(/^coming soon$/i)).toHaveCount(13);
+  await expect(page.getByText(/^coming soon$/i)).toHaveCount(12);
 
   await page.getByLabel(/search problems/i).fill("payment");
   await expect(
@@ -169,6 +169,7 @@ test("learner can open the OWASP Top 10 security topic", async ({ page }) => {
   await expect(
     page.getByRole("img", { name: /a SQL injection attack/i }).first(),
   ).toBeVisible();
+  await page.locator("#injection").scrollIntoViewIfNeeded();
   await expect(page.locator("#injection")).toBeInViewport();
 });
 
@@ -214,6 +215,7 @@ test("learner can open the secure SDLC security topic", async ({ page }) => {
   await expect(
     page.getByRole("img", { name: /security gates in the CI\/CD pipeline/i }).first(),
   ).toBeVisible();
+  await page.locator("#supply-chain").scrollIntoViewIfNeeded();
   await expect(page.locator("#supply-chain")).toBeInViewport();
 });
 
@@ -393,6 +395,19 @@ test("learner can open the metrics and monitoring tutorial", async ({ page }) =>
   // Assert the embedded diagram first so layout settles before the viewport check.
   await expect(
     page.getByRole("img", { name: /metrics and monitoring architecture/i }).first(),
+  ).toBeVisible();
+  await expect(page.locator("#high-level-architecture")).toBeInViewport();
+});
+
+test("learner can open the object storage tutorial", async ({ page }) => {
+  await page.goto("/learn/object-storage");
+  await expect(
+    page.getByRole("heading", { name: /design object storage/i }),
+  ).toBeVisible();
+  await page.goto("/learn/object-storage#high-level-architecture");
+  // Assert the embedded diagram first so layout settles before the viewport check.
+  await expect(
+    page.getByRole("img", { name: /object storage architecture/i }).first(),
   ).toBeVisible();
   await expect(page.locator("#high-level-architecture")).toBeInViewport();
 });
