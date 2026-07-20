@@ -1,71 +1,360 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-Placeholder.
+A ride-hailing service — Uber, Lyft, Grab, Didi — connects a rider who wants a trip with a nearby driver who can provide it, tracks the ride in real time, and handles payment. Type in a destination, tap a button, and a car shows up. The apparent simplicity ("find a driver near me and send them over") hides a distinctive combination of hard problems, none of which is the connect step. The defining challenge is that **the data is in constant motion**: millions of drivers are physically moving and reporting their location every few seconds, so "which drivers are near this rider?" is a query over a **live, churning geospatial dataset**, not a static table — and you have to answer it fast, thousands of times a second, then commit a **match** without ever handing the same driver to two riders, and then drive the whole ride through a **lifecycle** where the driver or rider can cancel at any step.
+
+Four forces dominate. First, **geospatial indexing**: you cannot scan millions of drivers computing distances on every request, so drivers are indexed by **spatial cells** (geohash, quadtree, S2, or Uber's H3 hex grid) so "nearby" is a cheap cell lookup. Second, a **location-update firehose**: every active driver pings GPS every few seconds, an enormous **write** stream that the system absorbs into **in-memory, ephemeral** state (you keep only each driver's *latest* position, overwriting — persisting every ping durably would be pointless). Third, **matching under contention**: a request queries nearby drivers, ranks them by real arrival time, and must **atomically reserve** the chosen one so concurrent requests can't double-book a driver — the same distributed-contention problem as [Ticket Booking](/learn/ticket-booking). Fourth, a **trip state machine**: each ride is an explicit sequence of states (requested → matched → en route → arrived → in progress → completed, plus cancellations) with only valid transitions allowed. The reframe to lead with: *connecting a rider and driver is trivial; the design is real-time matching over a constantly-moving dataset — a cell-based geospatial index kept current by a massive location-update firehose (in-memory and ephemeral), a matching step that ranks nearby drivers and reserves one without double-booking, and a trip state machine that drives each ride safely through its lifecycle with live tracking on top.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What's the **core loop** — drivers share location, riders request, we match, then track a stateful trip? (Yes — that's the spine.)
+- How **fresh** must driver locations and matches be? (Locations every few seconds; matching in a second or two — it's real-time.)
+- What's the **scale** — how many active drivers pinging, and how many ride requests? This reveals the firehose vs. matching asymmetry.
+- **Matching objective** — nearest by road ETA, highest rating, pooling? It shapes ranking.
+- Do we handle **surge pricing** and **pooling**, or just 1:1 matching? Scopes the demand side.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "real-time matching over a moving dataset" reframe · **5 min** requirements (low-latency matching, absorb location writes, no double-booking, live tracking) · **5 min** capacity (the location firehose is ~2160× the ride rate ⇒ ephemeral in-memory location) · **5 min** entity model (Trip state machine, Driver location) and the API · **8 min** geospatial indexing + the location-update firehose · **8 min** matching/dispatch (atomic reservation) and the trip state machine · **5 min** real-time tracking, surge, failure modes, wrap-up. Say your invariants out loud — the interviewer wants a cell-based geo-index, ephemeral in-memory locations, atomic reservation against double-booking, and an explicit trip state machine.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the geospatial index, the location-update ingestion, matching and dispatch (with reservation), the trip lifecycle state machine, real-time tracking and ETA, and supply/demand surge — plus scaling, failure modes, and trade-offs. **Out of scope (reuse, don't rebuild):** the road-graph routing and ETA computation is the [Maps & Navigation](/learn/maps-navigation) tutorial (we consume ETAs, not derive them); the durable, push-based real-time connection layer for tracking is the [Chat System](/learn/chat-system) delivery model; payment on trip completion is the [Payment System](/learn/payment-system); and pure "find nearby things" is generalized in the future Proximity Service. Also out of scope: the driver/rider mobile apps, fraud detection, and the marketplace economics beyond surge as a balancing signal. This tutorial composes a geo-index, a real-time firehose, a matching engine, and a state machine into a live marketplace.
 
 <h2 id="requirements">Requirements</h2>
 
-Placeholder.
+Separate what the system must *do* from how *well* it must do it. The functional list is a marketplace loop; the difficulty is in the real-time, contention, and scale non-functionals.
+
+<RequirementsTable
+  functional={[
+    "Drivers continuously share their location",
+    "Riders request a ride to a destination",
+    "Match a rider to the best nearby available driver",
+    "Track the assigned driver's location in real time",
+    "Drive the trip through its lifecycle (accept → complete)",
+    "Handle cancellations, no-shows, and fare/payment",
+  ]}
+  nonFunctional={[
+    { goal: "Matching latency", target: "match within a second or two" },
+    { goal: "Location ingest", target: "absorb millions of GPS pings/sec" },
+    { goal: "No double-booking", target: "a driver is matched to at most one rider" },
+    { goal: "Real-time tracking", target: "live driver position + ETA" },
+    { goal: "Availability", target: "the marketplace stays up regionally" },
+    { goal: "Consistency", target: "trip state is authoritative; locations are best-effort" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **it's real-time over a moving dataset**: driver positions change every few seconds and matches must be found in ~a second, so "nearby drivers" is answered from a **live, in-memory geospatial index** kept current by the location stream — not a database query with a spatial scan. Second, **there are two very different consistency needs**: **driver locations are best-effort and ephemeral** (a slightly stale position is fine, and you deliberately don't durably persist every ping), while a **trip is an authoritative, consistent state machine** (you must never lose a trip or allow an illegal transition, and you must never match one driver to two riders). Recognizing that split — cheap, lossy, in-memory location vs. durable, strongly-consistent trips — is the crux of the design. Third, **matching must avoid double-booking under contention**: many requests race for the same nearby drivers, so committing a match requires an **atomic reservation**, the [Ticket Booking](/learn/ticket-booking) contention pattern. Note what's **relaxed**: locations are approximate and lossy (drop a ping, no problem), and matching is best-effort optimal (a *good* nearby driver, not provably *the* best). The system trades exact, durable location history and perfect matches for real-time responsiveness and consistent, double-booking-free trips.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-Placeholder.
+Estimates here expose a striking asymmetry: the system is overwhelmingly about **absorbing location writes**, and matching — the part that feels like the product — is comparatively tiny.
+
+<RideHailingCapacity
+  assumptions={{
+    activeDrivers: 5000000,
+    pingIntervalSec: 4,
+    locationBytes: 100,
+    ridesPerDay: 50000000,
+    candidatesPerMatch: 10,
+  }}
+/>
+
+The takeaways. First — the defining number — **it's a location-update firehose**: 5 million active drivers each pinging every 4 seconds is **1.25 million location writes per second** (~**125 MB/s**), a continuous, relentless stream. Second, that firehose is **~2160× the ride-request rate** (~579 rides/sec): location writes utterly dwarf the actual matching work. This asymmetry dictates the architecture — you **cannot** durably persist 1.25M writes/sec of ephemeral GPS data (it would be a pointless firehose to disk), so driver location lives in an **in-memory geospatial index** holding only each driver's **latest** position, overwritten on every ping. Third, **matching is cheap by comparison**: each of ~579 requests/sec runs a geo query plus ranks ~10 candidates, about **5,800 candidate evaluations/sec** — trivial CPU against the live index. The capacity story flips the intuition: the hard, high-volume part is **ingesting and indexing a huge stream of moving-driver positions in memory**, and the matching that the product is "about" is a light query layer on top. Size the location tier for the firehose (in-memory, sharded, ephemeral) and the matching tier modestly.
 
 <h2 id="entity-model">Entity Model</h2>
 
-Placeholder.
+The model has a sharp split that mirrors the capacity finding: the **Trip** is a durable, authoritative state machine, while a **Driver**'s location is ephemeral live state. Getting that division right is the heart of the design.
+
+<EntityModel
+  name="Trip"
+  description="One ride's authoritative record and lifecycle. It ties a rider to a matched driver, tracks the current state through the ride, and holds the pickup/dropoff and fare. Unlike driver location (ephemeral, in-memory), a Trip is durable and strongly consistent — it must never be lost or enter an illegal state, and a driver may hold at most one active trip."
+  fields={[
+    { name: "trip_id", type: "string", notes: "unique id" },
+    { name: "rider_id", type: "string", notes: "who requested" },
+    { name: "driver_id", type: "string", notes: "matched driver (null until matched)" },
+    { name: "state", type: "enum", notes: "requested → matched → en_route → arrived → in_progress → completed (or cancelled/no_show)" },
+    { name: "pickup / dropoff", type: "geo", notes: "coordinates + addresses" },
+    { name: "fare", type: "money", notes: "computed on completion (with surge multiplier)" },
+    { name: "timestamps", type: "map", notes: "per-state transition times (requested_at, matched_at, …)" },
+  ]}
+  keys="A Trip is keyed by trip_id and is the durable source of truth for a ride; its state field is a finite state machine with only legal transitions allowed. A Driver has two very different kinds of state: durable profile/status (available | on_trip | offline) in a datastore, and EPHEMERAL location (lat, lng, updated_at) held in the in-memory geospatial index, overwritten on every ping and never durably persisted per update. The geo-index maps a spatial cell → the set of available drivers currently in it, so matching queries the rider's cell and neighbors. The invariant that prevents double-booking is that a driver can have at most one active (non-terminal) Trip at a time, enforced by an atomic reservation when a match is committed — the driver's status flips available → on_trip as part of creating the Trip. A Rider likewise has at most one active requested/ongoing Trip."
+/>
+
+Two ideas complete the picture. **Driver status** (available / on-trip / offline) is durable and is what matching filters on, while the driver's **live position** is the ephemeral in-memory data — same entity, two storage regimes. And the **geo-index** itself is best thought of as a derived structure: `cell → {available driver ids here}`, continuously updated by the firehose, that the matcher reads. The discipline: **Trips are durable, authoritative state machines** (never lost, only legal transitions, one active trip per driver); **driver location is ephemeral in-memory state** overwritten per ping; and the **double-booking invariant** — at most one active trip per driver — is enforced by an **atomic reservation** at match time.
 
 <h2 id="api-design">API Design</h2>
 
-Placeholder.
+The surface is three endpoints spanning the two data planes: the high-volume driver location update, the rider's ride request, and trip status (with live tracking).
+
+<ApiContract
+  method="POST"
+  path="/drivers/location"
+  summary="A driver reports its current GPS position (the firehose)."
+  request={`POST /drivers/location
+{ "driver_id": "d_5581", "lat": 37.7749, "lng": -122.4194, "ts": 1721480000 }`}
+  response={`HTTP/1.1 204 No Content`}
+  statusCodes={[
+    { code: "204", meaning: "Position upserted into the in-memory geo-index (overwrites previous)" },
+    { code: "409", meaning: "Driver offline / not accepting — ignored" },
+  ]}
+  notes="Called by every active driver every few seconds — ~1.25M/sec. It only updates the latest position in the in-memory geospatial index; it is not durably persisted per ping. Lightweight and lossy by design: a dropped update just means a slightly staler position."
+/>
+
+<ApiContract
+  method="POST"
+  path="/rides"
+  summary="A rider requests a ride; the system matches a nearby driver."
+  request={`POST /rides
+{ "rider_id": "r_92", "pickup": {"lat":37.77,"lng":-122.41}, "dropoff": {"lat":37.80,"lng":-122.40} }`}
+  response={`HTTP/1.1 201 Created
+{ "trip_id": "t_8f31", "state": "matched",
+  "driver": { "id": "d_5581", "eta_sec": 240, "rating": 4.9 } }`}
+  statusCodes={[
+    { code: "201", meaning: "Matched: a driver reserved and a trip created" },
+    { code: "202", meaning: "Searching — no driver yet, will notify (retry/expand radius)" },
+    { code: "409", meaning: "Rider already has an active trip" },
+  ]}
+  notes="Queries the geo-index for nearby available drivers, ranks by ETA/rating, atomically reserves the best (flipping it to on_trip), and creates the trip. If no driver is available, it keeps searching with an expanding radius rather than failing outright."
+/>
+
+<ApiContract
+  method="GET"
+  path="/rides/{trip_id}"
+  summary="Get a trip's current state and the driver's live location."
+  request={`GET /rides/t_8f31   (or a WebSocket subscription for live updates)`}
+  response={`HTTP/1.1 200 OK
+{ "trip_id": "t_8f31", "state": "en_route",
+  "driver_location": {"lat":37.775,"lng":-122.418}, "eta_sec": 180 }`}
+  statusCodes={[
+    { code: "200", meaning: "Current trip state + driver's latest position + ETA" },
+    { code: "404", meaning: "No such trip" },
+  ]}
+  notes="For live tracking, the client holds a pushed connection (WebSocket) and receives driver position + ETA updates as they arrive — the Chat System delivery model, scoped to the one matched driver. The polling GET is the fallback."
+/>
+
+The whole surface is: drivers stream location (the firehose), riders request rides (matching), and clients read/subscribe to trip state (tracking). The location endpoint is the high-QPS write, the ride request is the contention-sensitive match, and trip status is the real-time read — three endpoints, three very different scaling profiles.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-Placeholder.
+The architecture is two data planes meeting at an **in-memory geo-index**: a **driver plane** that ingests the location firehose, and a **rider plane** that matches requests against it and runs stateful trips.
+
+<RideHailingArchitecture />
+
+- **Rider / Driver.** The two sides of the marketplace — riders request rides, drivers stream GPS and accept trips.
+- **API.** Stateless front end routing the three call types (location update, ride request, trip status/subscribe).
+- **Location Ingest.** Absorbs the ~1.25M/sec ping firehose and upserts each driver's latest position into the geo-index — never durably persisting per ping.
+- **Geo Index.** The in-memory, region-sharded spatial index (`cell → available drivers here`), the live structure both planes hinge on.
+- **Matching Service.** Queries the geo-index for nearby drivers, ranks by ETA, and atomically reserves one.
+- **Trip Service.** The durable state machine that owns each ride's lifecycle, dispatch, and completion/payment.
+
+The decisive boundary is that **driver location is ephemeral, in-memory, and lossy while trips are durable, consistent state machines** — the firehose feeds a live geo-index cheaply, and matching plus trips are the authoritative, correctness-critical layer on top. Every section that follows elaborates one piece: geospatial indexing, the location firehose, matching/dispatch, the trip state machine, real-time tracking, and surge.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-Placeholder.
+Four flows cover the system: a driver location update (the firehose), matching a rider to a driver, the trip lifecycle, and live tracking. The first is the high-volume write; the rest are the marketplace loop.
+
+**A driver location update.** A GPS ping maps to a grid cell and overwrites the driver's latest position in the in-memory geo-index — ephemeral, latest-only, never durably persisted.
+
+<LocationUpdateSequence />
+
+**Match a rider to a driver.** A request queries the geo-index for nearby available drivers, ranks them by arrival ETA, atomically reserves the best, and creates a trip — the reservation being what prevents double-booking.
+
+<MatchRideSequence />
+
+The remaining two flows — the **trip state machine** and **live tracking** — appear in their deep dives below, where their details belong.
 
 <h2 id="geospatial-index">Geospatial Indexing</h2>
 
-Placeholder.
+The foundational question is: given a rider's location, how do you find nearby drivers among **millions of moving points** without scanning them all? A naive `SELECT * FROM drivers WHERE distance(driver_loc, rider_loc) < radius` computes distance to *every* driver on *every* request — O(all drivers) per query, hopeless at this scale (and worse, the data is changing constantly). The answer is a **spatial index** built on **space-filling cells**: partition the world into a grid of cells and index drivers by which cell they're in, so "nearby" becomes "look in this cell and its neighbors."
+
+Several schemes implement this. **Geohash** encodes a lat/lng into a short string where a shared prefix means spatial proximity, so nearby points share prefixes and you query by prefix. **Quadtree** recursively subdivides space into four quadrants, denser where there are more points. **Google S2** projects the sphere onto a cube and uses a hierarchy of cells with good distance properties. **Uber's H3** uses a **hexagonal** grid, which has the nice property that all neighbors are equidistant (hexagons tile with uniform adjacency, unlike squares whose diagonal neighbors are farther) — a natural fit for ride-hailing, which is why Uber built it. Whatever the scheme, the core operation is the same: map the rider to a cell, then **read the drivers in that cell and the ring of neighboring cells** (expanding the ring if too few are found) — an **O(cells checked)** lookup instead of O(all drivers). The trade-off is **granularity**: small cells mean precise proximity but more cells to check for a given radius; large cells mean fewer lookups but coarser results (and you still filter by exact distance afterward). The principle: index drivers by **spatial cells** (geohash / quadtree / S2 / H3) so a proximity query reads the rider's cell plus neighbors rather than scanning every driver — turning an O(all drivers) distance computation into a cheap O(nearby cells) lookup over a live, constantly-updated grid.
+
+<KnowledgeCheck
+  question="Why index drivers with a cell-based geospatial scheme instead of computing distance to every driver?"
+  options={[
+    "Because computing distance is mathematically impossible at scale",
+    "Because scanning millions of moving drivers to compute distance on every request is O(all drivers) — far too slow, especially since positions change constantly. A cell-based index (geohash, quadtree, S2, or H3) maps each driver to a spatial cell, so a proximity query reads the rider's cell and its neighboring cells — an O(nearby cells) lookup — then filters by exact distance. H3's hexagonal grid is popular because all neighbors are equidistant, unlike a square grid's farther diagonal neighbors",
+    "Because cells store the drivers durably on disk, unlike distance queries",
+    "Because it removes the need to know driver locations at all",
+  ]}
+  answer={1}
+  explanation="A per-request full scan computing distance to every driver doesn't scale to millions of continuously-moving points. Space-filling cell schemes index drivers by location so 'nearby' becomes reading a small set of cells (the rider's plus adjacent ones), reducing the query from O(all drivers) to O(nearby cells), with a final exact-distance filter. Hex grids like H3 give uniform neighbor distances, which is why ride-hailing favors them. It's about query complexity over a live grid, not durability or avoiding locations."
+/>
 
 <h2 id="location-updates">The Location-Update Firehose</h2>
 
-Placeholder.
+The capacity section's headline was that driver location is a **firehose** — on the order of a million-plus writes per second — and how you handle that write stream is a defining decision. The critical realization is that this data is **ephemeral and low-value per item**: you only ever need each driver's *current* position for matching and tracking; last minute's positions are worthless once a new ping arrives. So the design keeps only the **latest position per driver**, held **in memory** in the geospatial index, and each new ping **overwrites** the previous one. You do **not** durably persist every ping — writing 1.25M ephemeral GPS points per second to a database would be an enormous, pointless cost, and if a node holding the index is lost, drivers simply re-report within seconds and the index rebuilds itself.
+
+This makes the location tier a specialized, high-throughput, in-memory store — commonly **Redis with geospatial commands** or a purpose-built in-memory H3 index — **sharded** by region so no single node takes the whole firehose (a driver's updates go to the shard owning its area). Two refinements manage the load. **Client-side batching/throttling**: drivers ping at a sensible interval (every few seconds, not continuously) and can adapt — a stationary driver pings less often than one speeding down a highway. And the tier must **never backpressure** the fleet: like the [Metrics](/learn/metrics-monitoring) and [Distributed Logging](/learn/distributed-logging) firehoses, it absorbs bursts and drops or samples under extreme load rather than slowing drivers' apps — a missed location update is harmless. The principle: treat driver location as **ephemeral, latest-only, in-memory** state (overwrite per ping, never durably persist the firehose), **shard** the index by region to spread the write load, and keep ingestion **lossy and non-blocking** — because the value is entirely in the current position, and losing an old one costs nothing.
+
+<KnowledgeCheck
+  question="Why is driver location kept in memory and overwritten per ping rather than durably persisted?"
+  options={[
+    "Because databases can't store latitude and longitude",
+    "Because location is a ~1.25M/sec firehose of ephemeral data whose value is entirely the driver's current position — old positions are worthless once a new ping arrives. So the system keeps only the latest position per driver in an in-memory, region-sharded geospatial index, overwriting on each ping and never durably persisting the firehose (which would be enormous and pointless). If the index is lost, drivers re-report within seconds and it rebuilds. Ingestion is lossy and non-blocking — a dropped ping is harmless",
+    "Because in-memory storage is more durable than disk",
+    "Because each ping must be kept forever for billing",
+  ]}
+  answer={1}
+  explanation="Only the current position matters for matching and tracking, and the update rate is enormous (~1.25M/sec), so persisting every ephemeral ping to disk would be huge, costly, and useless. The design holds latest-position-only in an in-memory, region-sharded index (e.g. Redis GEO or an in-memory H3 store), overwriting per ping; a lost node self-heals as drivers re-report. Ingestion tolerates loss and never backpressures drivers, since a stale-by-a-few-seconds position is fine. It's the opposite of durable per-event storage."
+/>
 
 <h2 id="matching-dispatch">Matching & Dispatch</h2>
 
-Placeholder.
+Matching is where the two planes meet and where correctness gets subtle. On a ride request, the matcher **queries the geo-index** for available drivers in the rider's cell and neighboring cells, then **ranks** the candidates (the match flow is shown in Detailed Flows above).
+
+Ranking is more than straight-line distance: the best driver is the one who can **arrive soonest**, which means **road-network ETA** (a driver 200 m away across a river with no bridge is worse than one 800 m away on the same street) — the [Maps & Navigation](/learn/maps-navigation) routing the system consumes — blended with **rating**, **driver acceptance likelihood**, and sometimes direction of travel. Then comes **dispatch**: the match is **offered** to the top driver, who may **accept**, **decline**, or **time out**, in which case the system moves to the next candidate. The correctness crux is **avoiding double-booking**: many riders in a busy area race for the same few nearby drivers, so when a match is committed the driver must be **atomically reserved** — flipped from `available` to `on_trip` in a single atomic operation (a lock, a compare-and-set, or a conditional DB update) that fails if someone else grabbed them first. This is exactly the **contention/oversell** problem from [Ticket Booking](/learn/ticket-booking): the resource (a driver) is scarce and contended, and only an atomic reservation prevents assigning it twice. Getting this wrong means two riders both think they got the same car. The trade-off in matching is **greedy-nearest vs. globally-optimal**: matching each request to its nearest driver immediately is simple and fast but can be globally suboptimal (batching requests and solving an assignment over a short window can reduce total wait time, at the cost of latency and complexity). The principle: **query the geo-index, rank by real arrival ETA** (not straight-line distance), **offer with accept/decline/timeout**, and **atomically reserve** the chosen driver so concurrent requests can never double-book — the same contention control as selling a seat.
+
+<KnowledgeCheck
+  question="Why must matching atomically reserve a driver, and why rank by ETA rather than straight-line distance?"
+  options={[
+    "Reservation is optional; straight-line distance is always the best ranking",
+    "Because many riders race for the same few nearby drivers, so committing a match must atomically flip the driver from available to on_trip (a lock or compare-and-set that fails if someone else grabbed them) — otherwise two riders get the same car, the double-booking/oversell problem from ticket booking. Ranking uses road-network ETA, not straight-line distance, because the driver who can actually arrive soonest may be farther in a straight line but closer by road (a river with no nearby bridge makes a 200 m driver worse than an 800 m one)",
+    "Reservation prevents drivers from moving; ETA and distance are identical",
+    "Because straight-line distance is impossible to compute",
+  ]}
+  answer={1}
+  explanation="Nearby drivers are a scarce, contended resource under concurrent requests, so a match must atomically reserve the driver (compare-and-set / lock / conditional update) to prevent assigning the same driver to two riders — the classic contention control from Ticket Booking. And 'nearest' should mean soonest-to-arrive by the road network, since straight-line proximity can be misleading (barriers, one-way streets, no bridge), so ranking uses ETA from routing plus signals like rating and acceptance. Reservation isn't optional, and ETA and straight-line distance are not the same."
+/>
 
 <h2 id="trip-state-machine">The Trip State Machine</h2>
 
-Placeholder.
+Once matched, a ride is a **stateful, long-lived process** with many steps and many ways to go wrong, so it's modeled as an explicit **finite state machine**. A trip moves `requested → matched → driver_en_route → arrived → in_progress → completed`, with terminal branches for `cancelled` (by rider or driver) and `no_show`.
+
+<TripStateSequence />
+
+Modeling it as a state machine buys correctness: each state has a defined set of **legal transitions**, and events that don't fit are **rejected**. A driver can't "start the ride" on a trip that was never accepted; you can't complete a trip that's still en route; a cancellation is only legal from certain states. This prevents the ride from ever entering an inconsistent or impossible state, no matter what order events arrive in (and in a distributed system, events *do* arrive out of order and get retried). Each transition is triggered by an **event** — the driver accepts, arrives (often geofence-detected), starts the ride, ends it — and each is **recorded durably with a timestamp**, so the trip is auditable and recoverable. The tricky states are the **failure branches**: a driver cancels after accepting (re-match the rider), a rider cancels (maybe a fee), a **no-show** (timeout at pickup), a driver goes offline mid-trip (the ride must still resolve). On the terminal `completed` transition, the **fare is computed** (distance, time, surge) and **payment captured** via the [Payment System](/learn/payment-system) (with its idempotency and exactly-once guarantees). The principle: model each ride as an **explicit trip state machine** with only **legal transitions**, driven by durable, timestamped **events**, so that out-of-order or retried events can never corrupt a trip's state and every failure path (cancel, no-show, driver-offline) is a defined transition — with payment captured on completion.
+
+<KnowledgeCheck
+  question="Why model a ride as an explicit state machine with only legal transitions?"
+  options={[
+    "To make the code longer; any transition should be allowed for flexibility",
+    "Because a ride is a long-lived process with many steps and failure paths, and in a distributed system events arrive out of order and get retried. An explicit state machine defines the legal transitions from each state and rejects the rest, so an event like 'start ride' on an unaccepted trip, or completing an en-route trip, can never corrupt the trip's state. Each transition is a durable, timestamped event, making trips auditable and recoverable, and every failure (cancel, no-show, driver-offline) is a defined transition — with payment captured on the completed transition",
+    "Because state machines make the driver's GPS more accurate",
+    "Because it lets the trip skip states to finish faster",
+  ]}
+  answer={1}
+  explanation="Rides span many steps with numerous failure modes, and distributed events are reordered and retried, so without constraints a trip could enter impossible or inconsistent states. A finite state machine enumerates each state's legal transitions and refuses illegal ones, guaranteeing consistency regardless of event ordering; durable, timestamped transitions make trips recoverable and auditable, and cancellations/no-shows/driver-offline are modeled as defined terminal or recovery transitions. Payment is captured on completion. It's about correctness under concurrency, not verbosity, GPS accuracy, or skipping steps."
+/>
 
 <h2 id="real-time-tracking">Real-Time Tracking & ETA</h2>
 
-Placeholder.
+From the moment a driver is assigned, the rider watches the car approach on a map — and this **live tracking** is a real-time push problem, not a polling one. The driver's location updates (the same pings feeding the geo-index) need to reach the **specific rider** matched to that driver, continuously, with low latency. Polling (`GET /rides/{id}` every second) works as a fallback but is wasteful; the real answer is a **pushed connection**: the rider's app holds a **WebSocket** (or long-lived stream) subscribed to *its* driver, and each new driver position is pushed to it as it arrives.
+
+<LiveTrackingSequence />
+
+This is exactly the [Chat System](/learn/chat-system)'s delivery model — a stateful connection layer that routes a message (here, a location update) to the right connected client — but **scoped**: a rider subscribes only to the one driver they're matched with, so the fan-out is 1:1, not a broadcast. Alongside position, the app shows an **ETA**, recomputed as the driver moves by routing over the road network ([Maps & Navigation](/learn/maps-navigation)); the ETA updates as traffic and the driver's progress change. The trade-off is **update frequency vs. cost**: pushing every single ping to the rider is smooth but chatty, so updates are often **throttled/interpolated** (send every couple of seconds, animate between them client-side) to balance smoothness against connection and battery cost. The principle: deliver live tracking by **pushing the assigned driver's location to the matched rider over a long-lived connection** (the chat-delivery pattern, scoped 1:1), overlaying an **ETA recomputed from road routing** — throttling and interpolating updates to keep the map smooth without flooding the connection.
 
 <h2 id="supply-demand-surge">Supply, Demand & Surge</h2>
 
-Placeholder.
+A ride-hailing service is a **two-sided marketplace**, and matching quality depends on the **balance of supply (available drivers) and demand (ride requests)** in each area — a balance that shifts constantly by time and place. When demand spikes in a zone (a concert lets out, a rainstorm hits, rush hour) and nearby supply is thin, riders wait longer, matches get worse (the "nearest" driver is now far), and some requests can't be filled at all. The system's balancing mechanism is **surge (dynamic) pricing**: when demand outstrips supply in an area, the price multiplier rises, which does two things — it **dampens demand** (some riders wait or choose another option) and **attracts supply** (drivers move toward the higher-earning zone) — pushing the market back toward balance. Surge is computed per **geographic cell** (the same grid as the geo-index) over a short time window from the local supply/demand ratio.
+
+<Callout variant="info" title="Surge pricing is a load-balancing control">
+Surge isn't primarily a revenue lever — it's a **real-time control loop that rebalances a two-sided marketplace**. High demand and low supply in a cell raise the multiplier, which simultaneously sheds demand and draws in drivers, restoring the supply/demand ratio so wait times and match quality recover. It's computed per geo-cell over a short window, exactly the kind of localized, real-time signal the cell grid already provides.
+</Callout>
+
+Related demand-side optimizations include **pooling** (matching multiple riders heading the same way into one vehicle, increasing effective supply), **dispatch batching** (briefly accumulating requests to solve a better global assignment, as noted in matching), and **driver positioning** (nudging idle drivers toward predicted demand). The principle: treat the service as a **two-sided marketplace whose health is the local supply/demand balance**, and use **surge pricing per geo-cell** as a real-time control loop that sheds demand and attracts supply to keep matches fast and fillable — with pooling and predictive positioning as further levers on the balance.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Placeholder.
+Don't build the globally-sharded, surge-optimized system on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["DB with a spatial query", "A few drivers, one city", "A spatial scan per request; fine tiny, dies as drivers and QPS grow"],
+    ["In-memory geo-index + matching service", "Real location firehose; fast matches", "Run an in-memory spatial index (Redis GEO / H3); ephemeral location; a matching tier"],
+    ["Geo-sharded by region", "Millions of drivers; one node can't hold the firehose", "Shard the index and matching by geography; route updates/queries to the owning shard"],
+    ["Global, per-city isolation + surge", "Worldwide; independent markets", "City/region-isolated deployments; per-cell surge; cross-region only at boundaries"],
+  ]}
+  recommendedRow={1}
+/>
+
+The progression tracks the wall you're hitting. A **database with a spatial query** (PostGIS, a geo-index extension) is fine for a single small city but does a spatial scan per request and can't absorb the location firehose as you grow. The pivotal move is an **in-memory geospatial index with a matching service** — ephemeral latest-only locations in memory, cheap cell queries, atomic-reservation matching — which is where real-time matching at scale lives and where most of this design sits. As drivers grow past what one node can hold, you **shard the geo-index by region** so each node owns a geographic area's firehose and queries (a natural sharding, since proximity is inherently local — a query rarely crosses regions). At global scale, ride-hailing is beautifully **partitionable by city/region**: markets are largely independent (a rider in Tokyo never matches a driver in Paris), so you run **per-city isolated deployments** with per-cell surge, handling cross-region only at metro boundaries. Most of the system's difficulty is handled by "in-memory geo-index + matching, sharded by region."
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-Placeholder.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. The ride-hailing rule reflects the two-plane split: **location is best-effort and self-healing; trips are sacred and must never be lost or double-booked.**
+
+<FailureMatrix
+  rows={[
+    { failure: "Geo-index node loss", impact: "That region's driver positions gone", detection: "Node health", mitigation: "Locations are ephemeral; drivers re-report within seconds", recovery: "Index rebuilds itself from incoming pings; replica takes over" },
+    { failure: "Location-ingest overload", impact: "Update backlog / lag", detection: "Ingest rate / lag metrics", mitigation: "Shard by region; sample/drop under extreme load; never backpressure drivers", recovery: "Load subsides; positions refresh on next pings" },
+    { failure: "Double-match race", impact: "Two riders get one driver", detection: "Reservation conflict", mitigation: "Atomic reservation (CAS/lock) — the loser re-matches to another driver", recovery: "Second request transparently matched elsewhere" },
+    { failure: "No drivers available", impact: "Request can't be filled", detection: "Empty candidate set", mitigation: "Expand search radius; queue and retry; surge to attract supply", recovery: "A driver frees up / arrives; match completes" },
+    { failure: "Driver goes offline mid-trip", impact: "Live trip stalls", detection: "Missing pings / heartbeat", mitigation: "Trip state persists; hold state, notify rider, attempt reconnect", recovery: "Driver reconnects and resumes, or trip is cancelled/reassigned" },
+    { failure: "Trip-service crash", impact: "Trips can't transition", detection: "Health / transition errors", mitigation: "Trip state is durable + replicated; fail over to a replica", recovery: "Replica resumes from the last committed state" },
+    { failure: "Stale driver location", impact: "Match to a driver who moved", detection: "updated_at age", mitigation: "Ignore locations older than a threshold; re-query", recovery: "Fresh pings restore accuracy" },
+  ]}
+/>
+
+The theme: **let location fail freely, protect trips absolutely.** A geo-index node loss is nearly a non-event — locations are ephemeral, so drivers just re-report and the index self-heals, or a replica takes over. Ingest overload is met by **sharding, sampling, and never backpressuring** the driver fleet (a dropped ping is harmless). The double-match race — the scariest correctness bug — is prevented by the **atomic reservation**: the losing request simply re-matches to another driver. "No drivers" isn't a hard failure but a marketplace state, handled by **expanding radius, queuing, and surge**. The trip-side failures are where durability matters: a driver going offline mid-trip or a trip-service crash are survived because **trip state is durable and replicated**, so the ride resolves (resume, reassign, or cancel) from the last committed state — a trip is never silently lost. Stale locations are filtered by freshness. Because location is disposable and trips are durable, recovery is "let the firehose refill the index" for the volatile side and "fail over to the replica and resume the state machine" for the authoritative side.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-Placeholder.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Index moving drivers in an in-memory, region-sharded geospatial index built on space-filling cells (H3/S2/geohash), kept current by an ephemeral, latest-only location firehose that overwrites per ping and is never durably persisted; match a ride by querying the rider's cell and neighbors, ranking candidates by road-network ETA (plus rating/acceptance), and atomically reserving the chosen driver to prevent double-booking; model each ride as a durable trip state machine with only legal transitions driven by timestamped events; push the matched driver's location to the rider over a long-lived connection for live tracking with routing-based ETA; balance the two-sided marketplace with per-cell surge pricing; and partition the whole system by city/region since markets are independent."
+  rationale="The dominant load is a location firehose ~2160× the ride rate, so location must be cheap, ephemeral, in-memory, and lossy, while trips — which must never be lost or double-booked — are durable, consistent state machines; that split drives everything. Cell-based indexing turns proximity into an O(nearby-cells) query over a live grid. Atomic reservation closes the double-booking race (the ticket-booking pattern). A state machine keeps long-lived rides consistent under out-of-order, retried events. Pushed tracking reuses the chat delivery model scoped 1:1, and city partitioning exploits the natural locality of the marketplace."
+  alternatives="A spatial database query per request — simple but scans and can't absorb the firehose. Durably persisting every location ping — enormous, pointless cost for ephemeral data; keep latest-only in memory. Ranking by straight-line distance — cheap but wrong when roads/barriers matter; use ETA. Optimistic matching without reservation — fast but double-books drivers under contention. Polling for tracking — wasteful; push over a long-lived connection. A single global index — a node can't hold millions of drivers and there's no benefit, since matching is inherently regional; shard by geography. Solving a global optimal assignment per request — better matches but adds latency; greedy-nearest (optionally lightly batched) is usually enough."
+  revisitWhen="Pooling/shared rides become core (a harder multi-rider assignment and routing problem). Match quality needs global optimization (batched assignment windows). Surge/pricing grows into a full ML pricing system. You expand to many countries (per-region compliance, currencies, and data residency). Or you add adjacent products (food delivery reuses much of this — dispatch, tracking, state machines — which is the next tutorial)."
+/>
+
+Four axes capture the real tension:
+
+- **Ephemeral in-memory vs. durable locations.** In-memory latest-only absorbs the firehose cheaply and self-heals; durable per-ping is exact-history but enormously expensive and needless. Ephemeral wins.
+- **ETA vs. straight-line ranking.** ETA reflects real arrival time (roads, traffic) but needs routing; straight-line is cheap but wrong near barriers. ETA wins for match quality.
+- **Atomic reservation vs. optimistic matching.** Reservation prevents double-booking under contention at a small coordination cost; optimistic is faster but incorrect. Reservation wins.
+- **Greedy-nearest vs. batched-optimal matching.** Greedy is simple and low-latency; batching a short window can improve global wait times at the cost of latency/complexity. Greedy (optionally lightly batched) is the default.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-Placeholder.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A ride-hailing service looks like 'find a nearby driver,' but the real design is real-time matching over a constantly-moving dataset. The dominant load isn't matching — it's the location firehose: millions of drivers ping GPS every few seconds, over a million writes a second, which is thousands of times the actual ride rate. So driver location is ephemeral, in-memory, latest-position-only: I keep each driver's current spot in an in-memory geospatial index — cells from something like H3's hex grid — overwriting on every ping and never durably persisting it, because a stale-by-seconds or dropped location is harmless and the index self-heals as drivers re-report. That cell index turns 'who's nearby' into reading the rider's cell plus neighbors instead of scanning everyone. When a rider requests, the matcher queries nearby available drivers, ranks them by road-network ETA rather than straight-line distance, and — the correctness crux — atomically reserves the chosen driver so two riders can never get the same car, exactly the double-booking problem from ticket booking. The ride itself is a durable state machine: requested, matched, en route, arrived, in progress, completed, plus cancel and no-show, with only legal transitions allowed so out-of-order, retried events can't corrupt it, and payment captured on completion. Live tracking pushes the matched driver's location to the rider over a long-lived connection — the chat delivery model scoped one-to-one — with an ETA recomputed from routing. I balance the marketplace with per-cell surge pricing that sheds demand and attracts supply, and I shard everything by city because markets are independent. The key split: location is disposable and self-healing, trips are sacred and never double-booked."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why a cell index over a distance scan? Why keep locations in memory and not persist them? Why rank by ETA? How do you prevent double-booking? Why a state machine for trips? How does live tracking work? What does surge actually do?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="What does the capacity model reveal as the defining characteristic of a ride-hailing system?"
+  options={[
+    "Matching is the dominant load and must be heavily optimized",
+    "That it's dominated by a location-update firehose: 5M drivers pinging every 4s is ~1.25M writes/sec (~125 MB/s), about 2160× the ride-request rate (~579/s). That asymmetry means driver location must be ephemeral, in-memory, latest-only (overwrite per ping, never durably persisted), held in a region-sharded geo-index, while matching — a geo query plus ranking ~10 candidates (~5.8k evals/sec) — is comparatively cheap. The hard part is ingesting and indexing moving positions, not matching",
+    "That storage of trips dominates and needs a huge database",
+    "That the system is read-heavy like a photo feed",
+  ]}
+  answer={1}
+  explanation="The model shows location writes (~1.25M/sec) vastly exceed ride requests (~579/sec) — roughly 2160× — so the architecture is shaped by absorbing that firehose. Because the data is ephemeral (only the current position matters), it lives in an in-memory, region-sharded geospatial index that's overwritten per ping and never durably persisted. Matching, which feels like the product, is a light query-and-rank layer (~5.8k candidate evals/sec). The dominant engineering challenge is real-time location ingestion and indexing, not matching, trip storage, or feed reads."
+/>
+
+<KnowledgeCheck
+  question="How does the design keep driver location cheap while keeping trips correct?"
+  options={[
+    "Both location and trips are stored durably and identically",
+    "By splitting the two: driver location is ephemeral, in-memory, latest-only state overwritten per ping and never durably persisted (lossy and self-healing, since only the current position matters), while a Trip is a durable, replicated state machine with only legal transitions and an atomic reservation ensuring at most one active trip per driver. Location can fail freely and rebuild from incoming pings; trips must never be lost or double-booked, so they're the authoritative, consistent side",
+    "By persisting every location ping and never recording trip state",
+    "By keeping trips in memory and locations on disk",
+  ]}
+  answer={1}
+  explanation="The system deliberately treats the two data planes oppositely. Location is a huge ephemeral firehose whose value is only the latest position, so it's held in memory, overwritten per ping, sharded by region, and allowed to drop updates — a lost index self-heals as drivers re-report. Trips are the authoritative record that must never be lost or enter an illegal state, so they're durable, replicated finite state machines with atomic driver reservation to prevent double-booking. Matching correctness and trip durability live on the consistent side; volatile location lives on the cheap side."
+/>
+
+<Faq
+  items={[
+    { question: "What is a ride-hailing service, as a system?", answer: "It's a two-sided marketplace that connects riders wanting trips with nearby drivers, matches them in real time, tracks the ride live, and handles the trip lifecycle and payment. The hard engineering isn't the connection — it's real-time matching over a constantly-moving dataset: a geospatial index of drivers kept current by a massive location firehose, matching without double-booking, and a durable trip state machine." },
+    { question: "How do you find nearby drivers efficiently?", answer: "With a cell-based geospatial index rather than computing distance to every driver. Schemes like geohash, quadtree, Google S2, or Uber's H3 (a hexagonal grid) map each driver to a spatial cell, so a proximity query reads the rider's cell and its neighbors — an O(nearby cells) lookup — then filters by exact distance. H3's hexagons are popular because all neighbors are equidistant, unlike a square grid whose diagonal neighbors are farther." },
+    { question: "Why is driver location kept in memory and not in a database?", answer: "Because it's a firehose of ephemeral data — millions of pings per second whose value is only the driver's current position. Persisting every ping durably would be enormous and pointless. So the system keeps latest-position-only in an in-memory, region-sharded geospatial index, overwriting on each ping. If a node is lost, drivers re-report within seconds and it rebuilds. Ingestion is intentionally lossy and never backpressures drivers." },
+    { question: "Why is the location firehose so much bigger than the ride volume?", answer: "Because every active driver reports location continuously (every few seconds), whether or not they're on a trip, while ride requests happen only when someone wants a ride. In the capacity model that's ~1.25M location writes/sec versus ~579 rides/sec — about 2160×. This asymmetry is why the architecture centers on cheaply absorbing and indexing location updates in memory, with matching as a comparatively light layer on top." },
+    { question: "How does matching pick the best driver?", answer: "It queries the geo-index for available drivers in the rider's cell and neighbors, then ranks them — primarily by road-network ETA (who can actually arrive soonest, not straight-line distance), blended with rating, acceptance likelihood, and sometimes direction of travel. It offers the ride to the top candidate, who can accept, decline, or time out (moving to the next), and atomically reserves the chosen driver so they can't be matched to someone else." },
+    { question: "How do you prevent two riders from getting the same driver?", answer: "With an atomic reservation. When a match is committed, the driver is flipped from available to on_trip in a single atomic operation — a lock, compare-and-set, or conditional update — that fails if another request already claimed them, in which case the loser re-matches to a different driver. It's the same contention/oversell control as selling a scarce seat in the Ticket Booking design; nearby drivers are the scarce, contended resource." },
+    { question: "Why rank by ETA instead of straight-line distance?", answer: "Because the goal is the driver who arrives soonest, and straight-line proximity can be misleading: a driver 200 m away across a river with no nearby bridge, or on a one-way street heading the wrong way, is worse than one 800 m away on the same road. So ranking uses road-network ETA from routing (the Maps & Navigation system), which reflects actual travel time including barriers and traffic, giving better matches than raw distance." },
+    { question: "Why model a ride as a state machine?", answer: "Because a ride is a long-lived process with many steps (matched, en route, arrived, in progress, completed) and failure branches (cancel, no-show, driver-offline), and in a distributed system events arrive out of order and get retried. A finite state machine allows only legal transitions from each state and rejects the rest, so no event ordering can corrupt the trip. Each transition is a durable, timestamped event, making trips consistent, auditable, and recoverable." },
+    { question: "How does real-time tracking work?", answer: "The rider's app holds a long-lived pushed connection (a WebSocket) subscribed to the one driver it's matched with, and each new driver location is pushed to it as it arrives — the Chat System delivery model, scoped one-to-one rather than broadcast. Alongside the position it shows an ETA recomputed from road routing as the driver moves. Updates are often throttled and interpolated (animated client-side) to keep the map smooth without flooding the connection." },
+    { question: "What is surge pricing actually for?", answer: "It's a real-time control loop that rebalances the two-sided marketplace, not primarily a revenue lever. When demand outstrips supply in a geographic cell (a concert, rain, rush hour), the price multiplier rises, which simultaneously dampens demand (some riders wait or opt out) and attracts supply (drivers move toward the higher-earning area), restoring the supply/demand ratio so wait times and match quality recover. It's computed per geo-cell over a short window." },
+    { question: "How does ride-hailing scale globally?", answer: "It partitions beautifully by geography, because markets are independent — a rider in Tokyo never matches a driver in Paris. So the geo-index and matching are sharded by region (each node owns an area's firehose and queries), and at global scale you run per-city or per-region isolated deployments with local surge, handling cross-region only at metro boundaries. Proximity is inherently local, so this sharding is natural and highly effective." },
+    { question: "What happens if a driver goes offline mid-trip or the geo-index fails?", answer: "They're handled oppositely because of the two-plane split. A geo-index node loss is nearly a non-event: locations are ephemeral, so drivers re-report and the index self-heals (or a replica takes over). But a trip is durable and replicated, so a driver going offline mid-ride or a trip-service crash is survived by holding the persisted trip state and resuming from the last committed transition — resume, reassign, or cancel. A trip is never silently lost; a location always refreshes." },
+    { question: "How is this related to a food-delivery system?", answer: "They share most of the machinery: a geospatial index of couriers/drivers, real-time location tracking, dispatch/matching, and an order/trip state machine. Food delivery adds a three-sided coordination (customer, restaurant, courier) and preparation timing, but the dispatch, tracking, and lifecycle-state-machine patterns carry over directly — which is why it's a natural next problem after ride-hailing." },
+  ]}
+/>
