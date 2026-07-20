@@ -39,6 +39,7 @@ import { SecureSdlcCapacity } from "@/components/learning/secure-sdlc-capacity";
 import { LeaderboardCapacity } from "@/components/learning/leaderboard-capacity";
 import { MetricsCapacity } from "@/components/learning/metrics-monitoring-capacity";
 import { ObjectStorageCapacity } from "@/components/learning/object-storage-capacity";
+import { PhotoSharingCapacity } from "@/components/learning/photo-sharing-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -244,6 +245,7 @@ const teachingComponents = {
   LeaderboardCapacity,
   MetricsCapacity,
   ObjectStorageCapacity,
+  PhotoSharingCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
