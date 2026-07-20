@@ -619,6 +619,13 @@ import {
   GetObjectSequence,
   ScrubRepairSequence,
 } from "@/components/diagrams/object-storage-flows";
+import { PhotoSharingArchitecture } from "@/components/diagrams/photo-sharing-architecture";
+import {
+  UploadPhotoSequence,
+  ProcessImageSequence,
+  ServeImageSequence,
+  FeedLoadSequence,
+} from "@/components/diagrams/photo-sharing-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -887,5 +894,47 @@ describe("Object storage diagrams", () => {
       screen.getByRole("img", { name: /scrub and repair a corrupt fragment/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/continuous background repair is what sustains durability over years/i)).toBeInTheDocument();
+  });
+});
+
+describe("Photo sharing diagrams", () => {
+  it("exposes the photo sharing architecture to non-visual readers", () => {
+    render(<PhotoSharingArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /photo sharing architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/a write-amplified async media pipeline feeding a read-dominated, CDN-served delivery path/i)).toBeInTheDocument();
+  });
+
+  it("exposes the upload flow to non-visual readers", () => {
+    render(<UploadPhotoSequence />);
+    expect(
+      screen.getByRole("img", { name: /upload a photo/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/uploading directly to the object store bypasses the application servers/i)).toBeInTheDocument();
+  });
+
+  it("exposes the image-processing flow to non-visual readers", () => {
+    render(<ProcessImageSequence />);
+    expect(
+      screen.getByRole("img", { name: /process an uploaded image/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/The original is never modified, so derivatives can be regenerated/i)).toBeInTheDocument();
+  });
+
+  it("exposes the serve-image flow to non-visual readers", () => {
+    render(<ServeImageSequence />);
+    expect(
+      screen.getByRole("img", { name: /serve an image/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/the CDN absorbs the overwhelming majority of read traffic/i)).toBeInTheDocument();
+  });
+
+  it("exposes the feed-load flow to non-visual readers", () => {
+    render(<FeedLoadSequence />);
+    expect(
+      screen.getByRole("img", { name: /load a photo feed/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/The feed is a list of post IDs hydrated with image URLs/i)).toBeInTheDocument();
   });
 });

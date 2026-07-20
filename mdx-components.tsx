@@ -197,6 +197,13 @@ import {
   GetObjectSequence,
   ScrubRepairSequence,
 } from "@/components/diagrams/object-storage-flows";
+import { PhotoSharingArchitecture } from "@/components/diagrams/photo-sharing-architecture";
+import {
+  UploadPhotoSequence,
+  ProcessImageSequence,
+  ServeImageSequence,
+  FeedLoadSequence,
+} from "@/components/diagrams/photo-sharing-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -370,6 +377,11 @@ const teachingComponents = {
   MultipartUploadSequence,
   GetObjectSequence,
   ScrubRepairSequence,
+  PhotoSharingArchitecture,
+  UploadPhotoSequence,
+  ProcessImageSequence,
+  ServeImageSequence,
+  FeedLoadSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {
