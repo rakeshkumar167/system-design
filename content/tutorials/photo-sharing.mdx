@@ -1,71 +1,363 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-Placeholder.
+A photo-sharing platform — Instagram, Flickr, Google Photos — lets people upload images, processes each into the sizes and formats every device and screen needs, and serves them back in feeds and profiles to a global audience. From the outside it's "upload a picture, show it in a grid," which hides where the real engineering is. Two forces dominate, and neither is the upload button. First, **every upload fans out into many stored artifacts**: you don't serve a phone camera's 4 MB original to a thumbnail grid — you generate a spread of **derivatives** (multiple resolutions, modern formats like WebP/AVIF, cropped variants), so one upload becomes half a dozen stored objects, and at hundreds of millions of uploads a day that's a firehose of new storage. Second, **reads crush writes**: a photo is uploaded once and viewed hundreds of times across feeds, profiles, and re-shares, so the system is overwhelmingly a **read-heavy global delivery** problem, which lives or dies on a **CDN**.
+
+Crucially, this system is built **on top of two you may have already designed**. The bytes live in an [object store](/learn/object-storage) (that tutorial builds the durable blob store this one assumes), and the timeline is a [news feed](/learn/news-feed) fan-out problem (covered in depth there). So the distinctive parts — the parts an interviewer wants *here* — are the **asynchronous image-processing pipeline** and the **CDN-served delivery path**, not re-deriving erasure coding or fan-out. The reframe to lead with: *uploading and feeds are known problems; the design here is a write-amplified, asynchronous image pipeline — one upload becomes an original plus many derivatives, generated off the request path so upload feels instant — feeding a read-dominated delivery path where a CDN serves the overwhelming majority of traffic and the app tier barely touches image bytes. It rests on an object store for durability and a fan-out feed for the timeline; the media pipeline and CDN delivery are the heart of it.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What are we storing and serving — **photos** (immutable image blobs) with feeds and profiles? (Yes — reuse object storage + fan-out feed as substrates.)
+- How many **derivatives** per upload, and generated **eagerly** (all on upload) or **on-demand** (lazily, first request)? This shapes the pipeline and storage.
+- What's the **read:write ratio** and the **latency** target for viewing? It sizes the CDN and confirms this is a delivery problem.
+- **Global** audience? Then a CDN and regional storage matter for latency and cost.
+- **Retention** — kept forever? Most photos are viewed heavily for days then rarely, which drives storage tiering.
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "write-amplified async pipeline + read-dominated CDN delivery, on object storage + fan-out feed" reframe · **5 min** requirements (read-heavy, async processing, global delivery, durable originals) · **5 min** capacity (the write amplification into ~600 TB/day and the ~50× CDN offload) · **5 min** entity model (Photo + derivatives) and the API (upload + responsive URLs) · **8 min** the image pipeline — the centerpiece — async derivative generation · **8 min** CDN/responsive serving, and how feed + object storage plug in (reference those tutorials) · **5 min** storage tiering/cost, failure modes, wrap-up. Say your invariants out loud — the interviewer wants direct-to-storage upload, async idempotent derivative generation, immutable CDN-served URLs, and that you *reuse* object storage and fan-out rather than rebuild them.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the upload path (direct-to-storage, presigned URLs), the asynchronous image-processing pipeline (derivative sizes/formats), CDN and responsive delivery, how feed generation and object storage plug in, metadata and social interactions, and storage tiering for cost — plus scaling, failure modes, and trade-offs. **Out of scope (reuse, don't rebuild):** the durable blob store itself — erasure coding, scrubbing, the metadata service — is the [Object Storage](/learn/object-storage) tutorial; the timeline **fan-out** (push vs pull vs hybrid for celebrities) is the [News Feed](/learn/news-feed) tutorial; and the CDN edge-caching mechanics echo the [Video Streaming](/learn/video-streaming) tutorial's delivery tier. Also out of scope: ML features (auto-tagging, face recognition, ranking beyond a mention), and video (a related but distinct transcoding pipeline). This is the tutorial that *composes* object storage, an image pipeline, a CDN, and a feed into a product.
 
 <h2 id="requirements">Requirements</h2>
 
-Placeholder.
+Separate what the system must *do* from how *well* it must do it. The functional list is ordinary; the difficulty is in the non-functional read-scale, async-processing, and cost columns.
+
+<RequirementsTable
+  functional={[
+    "Upload a photo (original bytes)",
+    "Process each photo into multiple sizes and formats",
+    "View a photo at the right size for the device",
+    "Browse a feed / profile grid of photos",
+    "Organize photos into albums",
+    "Like, comment on, and share photos",
+  ]}
+  nonFunctional={[
+    { goal: "Read scale", target: "very read-heavy — views ≫ uploads" },
+    { goal: "Delivery latency", target: "fast global image loads (CDN)" },
+    { goal: "Upload UX", target: "feels instant — processing is async" },
+    { goal: "Durability", target: "never lose an original (object storage)" },
+    { goal: "Availability", target: "serving stays up; degrade gracefully" },
+    { goal: "Storage cost", target: "bounded via tiering + dedup" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **it's a read-heavy delivery problem**: a photo is written once and read hundreds of times, so the design optimizes serving above all — images are **immutable**, so their URLs are **cacheable forever**, and a **CDN** carries the overwhelming majority of reads while the origin object store handles only misses. Second, **processing must be asynchronous**: generating half a dozen derivatives (resize, transcode, strip EXIF) takes real CPU time, and you can't make the user wait, so the upload path just **stores the original and returns**, while a background **pipeline** produces the derivatives — the photo shows a placeholder or the original until they're ready. Third, **storage cost dominates and must be bounded**: each upload amplifies into an original plus many derivatives (the capacity section puts it at ~600 TB/day), most of which is viewed heavily for a few days and then rarely, so the design leans on **tiering** (hot → cold storage), **regenerating** rarely-used derivatives on demand rather than storing them forever, and **deduplication**. Note what's **relaxed**: processing is **eventually** complete (a derivative appearing a second late is fine), and social counters (likes, views) can be **approximate** at scale. The system trades instant-everywhere processing and exact counts for instant uploads, cheap global reads, and bounded storage.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-Placeholder.
+Estimates here reveal the two defining forces: **write amplification into storage** and **read amplification absorbed by a CDN**.
+
+<PhotoSharingCapacity
+  assumptions={{
+    uploadsPerDay: 100000000,
+    derivativesPerPhoto: 5,
+    originalBytes: 4000000,
+    derivativeBytes: 400000,
+    viewsPerUpload: 100,
+    cdnHitRate: 0.98,
+  }}
+/>
+
+The takeaways. First — the storage lesson — **each upload amplifies**: 100 million uploads a day, each producing an original plus ~5 derivatives (~6 MB total), is ~**600 TB/day** of *new* storage, forever. That's why a durable, cheap **object store** ([Object Storage](/learn/object-storage)) is the foundation and why an **async pipeline** must generate those derivatives — you can't store the flood without an engine producing it, and you can't afford to keep all of it hot forever (hence tiering). Second — the serving lesson — **reads dominate and the CDN absorbs them**: at ~100 views per upload, image serving runs at ~**116,000 requests/sec**, but a **98%-hit CDN** offloads **~50×**, so the origin object store sees only ~**2,300/sec**. The consequence is architectural: **the application tier barely touches image bytes** — it orchestrates uploads and the pipeline and hands clients **CDN URLs**; the heavy lifting of moving pixels to eyeballs happens entirely at the edge. Third, the **upload rate itself is modest** (~1,157/sec) — writes are not the scaling challenge; the *amplification* of each write into storage, and the *volume* of reads, are. The capacity story: size the **storage and pipeline** for write amplification (object store + async derivative generation + tiering) and the **delivery** for read amplification (a CDN doing ~50× offload) — the request-serving app tier is comparatively light.
 
 <h2 id="entity-model">Entity Model</h2>
 
-Placeholder.
+The central object is the **Photo** — but note that a "photo" isn't one file, it's an **original plus a family of derivatives**, tracked by a metadata record. The two ideas that matter are that the bytes live in the object store (the metadata just points at them) and that a photo has a **processing status** because its derivatives are produced asynchronously.
+
+<EntityModel
+  name="Photo"
+  description="An uploaded image and the family of derivative renditions generated from it, plus the metadata to locate, display, and organize it. The bytes (original + each derivative) live in the object store; this record holds their keys, dimensions, ownership, caption, and processing status. A photo is immutable content — edits produce a new photo/version — with derivatives regenerable from the original at any time."
+  fields={[
+    { name: "photo_id", type: "string", notes: "unique id; also the object-key prefix for its renditions" },
+    { name: "owner_id", type: "string", notes: "the uploading user" },
+    { name: "original_key", type: "string", notes: "object-store key of the untouched original" },
+    { name: "derivatives", type: "map<size,key>", notes: "thumbnail/small/medium/large → object-store keys (and formats)" },
+    { name: "status", type: "enum", notes: "uploading → processing → ready (derivatives available)" },
+    { name: "width/height", type: "int", notes: "original dimensions (for layout / responsive selection)" },
+    { name: "caption", type: "string", notes: "user text; EXIF is stripped from the image itself" },
+    { name: "created_at", type: "datetime", notes: "upload time — feed ordering" },
+  ]}
+  keys="A Photo is keyed by photo_id, which also namespaces its object-store keys (photo_id/original, photo_id/thumb, photo_id/large, …). The record lives in the metadata DB; the bytes live in the object store, so the record just holds keys — a photo is a small metadata row pointing at a set of immutable blobs. status matters because derivatives are generated asynchronously: a freshly uploaded photo is 'processing' until the pipeline finishes, so readers get a placeholder or the original meanwhile. Derivatives are DERIVED, regenerable state — you can drop a rarely-used size and re-create it on demand from the original, which is why the original is kept durably and the derivatives are treated as a cache. Albums are collections referencing photo_ids (join rows), and social interactions (likes, comments) are separate high-write entities aggregated into per-photo counters rather than counted live."
+/>
+
+Two supporting ideas complete the picture. **Albums** are just collections of `photo_id`s (join rows or a list), not copies of the images — organization is metadata. And **social interactions** — likes, comments, shares — are their own high-write entities that, at scale, are **aggregated into approximate per-photo counters** rather than counted with a live `COUNT(*)` (the same approximate-counter pattern as the [Leaderboard](/learn/leaderboard) and [News Feed](/learn/news-feed)). The discipline: a Photo is a **small metadata record pointing at immutable blobs in the object store**, its **derivatives are regenerable cached state** (keep the original durable, treat derivatives as reproducible), and its **status** reflects that processing is asynchronous.
 
 <h2 id="api-design">API Design</h2>
 
-Placeholder.
+The surface is an upload flow, a read that returns responsive image URLs, and a feed. The key design choice shows up immediately: the upload doesn't stream bytes *through* the API.
+
+<ApiContract
+  method="POST"
+  path="/photos"
+  summary="Initiate an upload: get a presigned URL to upload the original directly to storage."
+  request={`POST /photos
+{ "content_type": "image/jpeg", "size": 4194304, "caption": "sunset" }`}
+  response={`HTTP/1.1 201 Created
+{ "photo_id": "ph_8f31",
+  "upload_url": "https://objstore/.../ph_8f31/original?signature=...",
+  "status": "uploading" }`}
+  statusCodes={[
+    { code: "201", meaning: "Photo record created; upload the bytes to upload_url (PUT), then processing begins" },
+    { code: "400", meaning: "Unsupported type / oversized" },
+  ]}
+  notes="The client PUTs the original bytes directly to the presigned object-store URL — the API never proxies the multi-MB body. On upload completion (a storage event or a confirm call) the photo goes to 'processing' and a pipeline job is enqueued. This keeps the app tier light and uploads fast."
+/>
+
+<ApiContract
+  method="GET"
+  path="/photos/{photo_id}"
+  summary="Fetch a photo's metadata and responsive image URLs (CDN)."
+  request={`GET /photos/ph_8f31`}
+  response={`HTTP/1.1 200 OK
+{ "photo_id": "ph_8f31", "status": "ready", "caption": "sunset",
+  "renditions": {
+    "thumb":  "https://cdn/.../ph_8f31/thumb.webp",
+    "medium": "https://cdn/.../ph_8f31/medium.webp",
+    "large":  "https://cdn/.../ph_8f31/large.webp" } }`}
+  statusCodes={[
+    { code: "200", meaning: "Metadata + CDN URLs for each rendition" },
+    { code: "202", meaning: "Still processing — original/placeholder available, derivatives pending" },
+    { code: "404", meaning: "No such photo" },
+  ]}
+  notes="Returns immutable CDN URLs per size, so the client picks the rendition that fits its screen (responsive delivery) and the bytes come from the edge, never the app. While status is 'processing', clients show the original or a blurhash placeholder."
+/>
+
+<ApiContract
+  method="GET"
+  path="/feed"
+  summary="Return a page of the user's photo feed (post IDs + metadata + image URLs)."
+  request={`GET /feed?cursor=...&limit=20`}
+  response={`HTTP/1.1 200 OK
+{ "items": [
+  { "photo_id": "ph_77", "owner": "u_2", "renditions": { "medium": "https://cdn/..." }, "likes": 1240 } ],
+  "next_cursor": "..." }`}
+  statusCodes={[
+    { code: "200", meaning: "A page of feed items with CDN image URLs" },
+    { code: "204", meaning: "No more items" },
+  ]}
+  notes="The feed is a fan-out problem (see the News Feed tutorial): it returns a list of photo IDs hydrated with metadata and CDN image URLs. The images themselves load from the CDN, so the feed service serves only lightweight JSON."
+/>
+
+The whole surface is: initiate an upload (get a presigned URL), read a photo's metadata + CDN URLs, and page a feed. The defining choices are that **image bytes never flow through the API** — uploads go directly to storage and reads go directly from the CDN — and that reads return **immutable per-size URLs**, pushing all the heavy byte-moving to the object store and the edge.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-Placeholder.
+The architecture is an **async write pipeline** feeding an **object store**, fronted by a **CDN** for reads, with a **metadata DB** and a **feed service** on the side.
+
+<PhotoSharingArchitecture />
+
+- **Client.** Uploads originals (directly to storage) and loads images (directly from the CDN).
+- **App / API.** Stateless orchestration: issues presigned upload URLs, writes metadata, enqueues processing jobs, and returns CDN URLs. It moves JSON, not pixels.
+- **Object Store.** Durable home of every original and derivative ([Object Storage](/learn/object-storage) is this component). Amplified write volume lands here.
+- **Metadata DB.** Photo records, albums, ownership, and social data — small rows pointing at object-store keys; sharded for scale.
+- **Image Pipeline.** A queue plus a fleet of workers that read originals and generate derivative sizes/formats asynchronously.
+- **CDN.** The delivery tier: caches immutable image URLs at the edge and serves the overwhelming majority of reads, filling from the object store on a miss.
+
+The decisive boundary is that **writes flow into an object store through an async pipeline while reads flow out of a CDN — the app tier orchestrates but never carries image bytes**. Every section that follows elaborates one piece: the direct-to-storage upload, the image pipeline, CDN/responsive serving, how the feed plugs in, metadata/social, and storage tiering.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-Placeholder.
+Four flows cover the system: uploading a photo, processing it into derivatives, serving an image, and loading a feed. The first and third are the hot request paths; processing is the async engine; the feed reuses the fan-out design.
+
+**Upload a photo.** The client gets a presigned URL and uploads the original **directly to the object store**, the app records metadata (status `processing`) and enqueues a job, and the upload returns immediately — the heavy processing happens off the request path.
+
+<UploadPhotoSequence />
+
+**Serve an image.** The client requests the size its screen needs; the CDN returns it from the edge on a hit, and on a miss fetches that derivative from the object store, caches it, and returns — so the origin sees only the small fraction of misses.
+
+<ServeImageSequence />
+
+The remaining two flows — **image processing** and **feed loading** — appear in the Image Pipeline and Feed Generation deep dives below, where their details belong.
 
 <h2 id="upload-path">Upload: Direct-to-Storage & Presigned URLs</h2>
 
-Placeholder.
+The first non-obvious decision is how the bytes get in. The naive design streams the upload **through** the application servers: client → API → object store. At photo scale that's a mistake — a 4 MB body times thousands of uploads a second means your app tier is spending all its CPU and network **proxying pixels**, a job it adds no value to, and you'd have to scale the app fleet for byte-pushing rather than logic. The fix is **direct-to-storage upload via a presigned URL**: the client asks the API to *initiate* an upload, the API creates the photo record and returns a **short-lived, signed URL** that grants permission to `PUT` the original straight to the object store, and the client uploads the bytes **directly**, bypassing the app entirely. The API only ever handles small JSON; the object store handles the big bytes it's built for.
+
+The second decision is that **processing is asynchronous**, which is what makes the upload feel instant. When the upload to storage completes (signaled by a storage event or a small confirm call), the photo transitions to `processing` and a job is enqueued for the pipeline — and the user's upload is **already done**, showing the original or a placeholder while derivatives generate in the background. This decoupling is the same async-queue pattern as the [Notification Service](/learn/notification-service) and [News Feed](/learn/news-feed) fan-out: accept fast, do the slow work behind a queue. (Large originals can additionally use **multipart upload** from the [Object Storage](/learn/object-storage) tutorial.) The principle: **upload originals directly to the object store via presigned URLs** so the app tier never proxies image bytes, and **process asynchronously** so the upload returns instantly while derivative generation happens off the request path.
+
+<KnowledgeCheck
+  question="Why do clients upload directly to the object store via a presigned URL instead of through the app servers?"
+  options={[
+    "Because the app servers can't reach the object store",
+    "Because streaming multi-megabyte uploads through the app tier would waste its CPU and network proxying bytes it adds no value to, forcing you to scale the app fleet for byte-pushing. A presigned URL lets the API create the photo record and hand back a short-lived signed URL, so the client PUTs the original straight to the object store — the app only handles small JSON. Combined with asynchronous processing, the upload returns instantly while derivatives generate in the background",
+    "Because presigned URLs encrypt the image, which the app can't do",
+    "Because it's the only way to support multiple image formats",
+  ]}
+  answer={1}
+  explanation="Proxying large bodies through the application tier turns your logic servers into byte pumps, consuming CPU and bandwidth for a job the object store does natively and forcing wasteful scaling. A presigned URL delegates the heavy transfer directly to the object store while the API only creates metadata and returns the signed URL, keeping the app tier light. Processing is then done asynchronously off the request path so the upload feels instant. It's about offloading byte movement and decoupling slow work, not reachability, encryption, or format support."
+/>
 
 <h2 id="image-pipeline">The Image Processing Pipeline</h2>
 
-Placeholder.
+This is the centerpiece. Once an original is stored, an **asynchronous, event-driven pipeline** turns it into everything the product actually serves. A queue holds processing jobs, and a fleet of **workers** consumes them; each worker reads the original and **generates the derivatives**.
+
+<ProcessImageSequence />
+
+What a worker produces per photo is a small matrix: multiple **resolutions** (a tiny thumbnail for grids, small/medium for feeds, large for detail views — you never serve a 4 MB original to a 150-pixel thumbnail), modern **formats** (WebP and AVIF, which are far smaller than JPEG for the same quality, with a JPEG fallback for old clients), maybe **crops** (a square for the grid), and often a **blurhash / low-quality placeholder** for instant perceived loading. It also **strips EXIF metadata** from the image — both for privacy (originals embed GPS location, device info) and to shrink the file. Two properties make the pipeline robust. It's **idempotent**: a job that's retried after a worker crash (at-least-once delivery from the queue) re-derives exactly the same outputs to the same keys, so duplicates are harmless — the same discipline as the [Distributed Job Scheduler](/learn/distributed-job-scheduler). And the **original is never modified**: derivatives are pure functions of it, so they're **regenerable** — if you later add a new size or a new format (AVIF didn't exist when you built the product), you backfill by re-running the pipeline over originals, and if you drop a rarely-used derivative to save storage you can recreate it on demand. The trade-off is **eager vs lazy** generation: eagerly producing all derivatives on upload makes every read a cache hit but stores renditions that may never be viewed; lazily generating on first request saves storage but adds latency to the first view (often the best answer is eager for common sizes, lazy for rare ones). The principle: an **asynchronous, idempotent worker pipeline** generates the derivative resolutions and formats (and strips EXIF) from an **immutable original**, so derivatives are **regenerable cached artifacts** — decoupling slow processing from the upload and letting formats and sizes evolve without touching originals.
+
+<KnowledgeCheck
+  question="Why is the image pipeline asynchronous and idempotent, and why is the original never modified?"
+  options={[
+    "So the user waits for all derivatives before the upload completes",
+    "Asynchronous: generating multiple resolutions and formats takes real CPU time, so it runs behind a queue off the upload path, letting the upload return instantly while derivatives appear in the background. Idempotent: the queue is at-least-once, so a retried job after a crash re-derives identical outputs to the same keys, making duplicates harmless. The original is never modified because derivatives are pure functions of it — regenerable — so you can add a new size/format later by backfilling, or drop a rarely-used derivative and recreate it on demand",
+    "Because modifying the original saves storage; async just means slower",
+    "Because idempotency encrypts the derivatives and async load-balances the CDN",
+  ]}
+  answer={1}
+  explanation="Derivative generation is expensive, so it's decoupled from the request via a queue — the upload acknowledges immediately and processing happens asynchronously. Because the queue delivers at-least-once, jobs must be idempotent so a retry re-produces the same outputs without harm. Keeping the original immutable makes every derivative a reproducible function of it: new formats/sizes can be backfilled and rarely-used renditions dropped and regenerated on demand, treating derivatives as a cache over durable originals. It's about decoupling, safe retries, and regenerability — not making users wait or encryption."
+/>
 
 <h2 id="serving-cdn">Serving Images: CDN & Responsive Delivery</h2>
 
-Placeholder.
+Serving is where the read amplification is tamed, and the answer is a **CDN**. Because images are **immutable** — a derivative at a given URL never changes — they are perfectly cacheable, so a CDN can hold them at edge locations **close to users worldwide** and serve them without ever touching the origin. As the capacity model showed, a ~98% edge hit rate means the object store sees only ~2% of reads (a **~50× offload**), which is what makes globally serving hundreds of thousands of image requests per second **affordable and fast** — the bytes travel from a nearby edge, not a distant origin. The origin (the object store) is consulted only on a **cache miss** (a cold or newly-generated image), after which the edge caches it for everyone nearby. This is the same delivery tier as the [Video Streaming](/learn/video-streaming) platform, applied to images.
+
+The second lever is **responsive delivery**: serve the **smallest derivative that fits the context**. A phone showing a grid of thumbnails should get 150-pixel WebP thumbnails, not full-resolution originals — sending the right size saves enormous bandwidth (and time and battery) across billions of views. The client picks the rendition from the per-size URLs the API returned, or an image CDN selects it from the request (device, viewport, `Accept` header for format negotiation — WebP/AVIF to capable browsers, JPEG to the rest). Combined, **immutable + right-sized + edge-cached** is why a feed of images loads instantly worldwide. The trade-off is **cache invalidation** — but immutability sidesteps it: since a URL's content never changes, you never invalidate, you just publish a **new URL** for new content (a deleted photo is handled by removing access, not by mutating a cached object). The principle: serve images from a **CDN** that caches immutable per-size URLs at the edge (absorbing ~98% of reads), and use **responsive delivery** to send the smallest derivative and best format for each device — turning read-dominated global image serving into cheap, fast edge delivery with no cache-invalidation problem.
+
+<KnowledgeCheck
+  question="Why is a CDN so effective for photo serving, and what does immutability have to do with it?"
+  options={[
+    "The CDN compresses images on the fly, and immutability means images can't be cached",
+    "Photo serving is read-dominated and images are immutable (a derivative URL never changes), so they cache perfectly at edge locations near users — a ~98% hit rate offloads ~50× of reads from the origin, making global serving fast and affordable. Immutability also eliminates cache invalidation: you never mutate a cached object, you publish a new URL for new content. Responsive delivery adds to this by sending the smallest derivative and best format per device",
+    "The CDN stores the only copy of each image, so the object store isn't needed",
+    "It helps only for uploads, not reads",
+  ]}
+  answer={1}
+  explanation="Because reads vastly outnumber writes and each image URL is immutable, CDNs can cache renditions at the edge and serve the vast majority of requests locally — the capacity model's ~98% hit rate is a ~50× origin offload, the key to cheap, low-latency global delivery. Immutability is what makes this clean: content at a URL never changes, so there's no invalidation — new content simply gets a new URL. Responsive delivery further cuts bytes by sending the right size/format. The object store remains the durable origin behind the edge; the CDN doesn't replace it."
+/>
 
 <h2 id="feed-generation">Feed Generation</h2>
 
-Placeholder.
+The timeline — the scroll of photos from people you follow — is a **feed fan-out** problem, and it's exactly the [News Feed](/learn/news-feed) tutorial, so the right move in an interview is to **name it and reuse it** rather than re-derive it. The short version: you choose between **fan-out on write** (push each new photo's ID into every follower's precomputed feed, so reads are cheap O(1) lookups at the cost of write amplification), **fan-out on read** (assemble the feed at read time by pulling from followed users, cheap writes but expensive reads), and a **hybrid** that pushes for normal users but **pulls for celebrities** with millions of followers (whose push would be catastrophic) — all covered in depth there.
+
+<FeedLoadSequence />
+
+The **photo-specific** point worth making here is what the feed stores and returns: **post IDs, not image bytes**. A feed entry is a lightweight reference — a `photo_id` plus a bit of metadata — that is **hydrated** at read time into the metadata (caption, owner, counts) and, crucially, **CDN image URLs**. The feed service therefore serves only small JSON; the actual image pixels load **separately, directly from the CDN**. This separation is what keeps feeds fast and the feed service cheap: it never touches an image byte, and the heavy media delivery is handled by the edge exactly as in the serving section. The principle: **feed generation is the fan-out problem from the News Feed design** (push/pull/hybrid), and here the feed stores **post IDs hydrated with CDN image URLs** — so the feed service moves lightweight references while the images themselves are served from the edge.
 
 <h2 id="metadata-social">Metadata, Albums & Social Interactions</h2>
 
-Placeholder.
+Around the images sits a conventional but high-scale metadata and social layer. The **metadata DB** holds the small photo records (ownership, caption, derivative keys, status), **albums** (collections referencing `photo_id`s), and the social graph (follows) — all small rows, but *many* of them, so this is a **sharded** datastore in its own right (by user or photo id), which is the [Distributed Key-Value Store](/learn/object-storage) scaling shape. It's on the read path (a feed hydrates from it), so it's cached and read-optimized.
+
+The interesting scaling wrinkle is **social interactions** — likes, comments, views. A viral photo can get **millions of likes**, and computing "how many likes does this photo have?" with a live `COUNT(*)` over a likes table on every feed render would be ruinous. So counts are **denormalized into per-photo counters** and updated as interactions arrive (incrementing a counter, the [Leaderboard](/learn/leaderboard)'s sorted-set/counter pattern), and at extreme scale they're **approximate** — displaying "2.4M likes" doesn't require exactness, so counters can be aggregated, sampled, or eventually consistent. Comments are stored and paginated like any high-write append log. The write volume of interactions often **dwarfs** the photo uploads themselves (far more likes than posts), making this its own firehose. The principle: the **metadata and social layer is a sharded, read-optimized datastore** of many small records, with **social interaction counts denormalized into (often approximate) per-photo counters** rather than computed live — because at viral scale, exact real-time counts are neither affordable nor necessary.
+
+<KnowledgeCheck
+  question="How are like/view counts handled at photo-sharing scale, and why?"
+  options={[
+    "With a live COUNT(*) over the likes table on every feed render, for exactness",
+    "They're denormalized into per-photo counters incremented as interactions arrive, and at extreme scale kept approximate (aggregated/eventually consistent), because a viral photo can have millions of likes and running a live COUNT on every feed render would be ruinously expensive. Displaying '2.4M likes' doesn't need exactness, so approximate counters are both affordable and sufficient — the same counter/approximation pattern used in leaderboards and news feeds",
+    "Counts are computed on the client from the full likes list downloaded each time",
+    "Likes are stored in the CDN alongside the images",
+  ]}
+  answer={1}
+  explanation="At scale, interaction volume dwarfs uploads and popular photos accumulate millions of likes, so recomputing counts live per render is infeasible. The standard approach denormalizes counts into per-photo counters updated on each interaction, and relaxes them to approximate/eventually-consistent values because human-facing counts ('2.4M') don't require exactness. That mirrors the counter and approximation techniques from the Leaderboard and News Feed designs. Live COUNT queries, client-side counting, or storing counts in the CDN would all be impractical."
+/>
 
 <h2 id="storage-tiering">Storage, Tiering & Cost</h2>
 
-Placeholder.
+At ~600 TB of new data every day that lives essentially forever, **storage cost becomes the dominant operational expense**, and the design has to actively manage it. The key observation is that photo access is **extremely skewed by age**: a photo is viewed heavily in the days after it's posted (feeds, notifications) and then almost never — last year's vacation photos sit untouched for years but must still be retained. That skew is a gift, because it means most of your stored bytes are **cold** and don't need to sit on fast, expensive storage.
+
+Three levers manage the cost. First, **tiering**: move objects from **hot** storage (fast, expensive) to progressively **colder** tiers (cheaper, higher-latency — the object store's storage classes, "standard → infrequent-access → archive") based on age or access, via **lifecycle policies** — a rarely-touched photo costs a fraction to keep in cold storage, and the slightly higher retrieval latency is fine for an old photo. Second, **regenerate rather than store rarely-used derivatives**: since derivatives are reproducible from the original, you can keep only the common sizes hot and **recreate uncommon ones on demand** (lazy generation), trading a little compute for a lot of storage — you don't need to store a "large" rendition of a five-year-old photo nobody views. Third, **deduplication**: identical uploads (the same meme re-shared thousands of times) can be detected by **content hash** and stored **once**, with many photo records pointing at the same blob. The **originals**, though, are always kept **durably** (erasure-coded in the object store) — they're the source of truth from which everything else regenerates. The trade-off is **cost vs retrieval latency/compute**: cold tiers and on-demand regeneration are cheaper but slower on the rare access, which is exactly the right bargain for cold data. The principle: exploit the **age-skewed access pattern** to bound cost — **tier** hot→cold with lifecycle policies, **regenerate** rarely-used derivatives instead of storing them, and **deduplicate** identical content — while always keeping **originals durably** as the regenerable source of truth.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Placeholder.
+Don't build the globally-distributed, tiered, multi-format pipeline on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["App server + local disk", "A few users, small volume", "Simple, but no durability, no scale, and it proxies every byte — a toy"],
+    ["Object store + CDN, synchronous resize", "Real traffic; global reads", "Durable storage and edge delivery, but resizing on the upload path makes uploads slow"],
+    ["Async image pipeline + sharded metadata", "High upload volume; instant-upload UX", "A queue + worker fleet; metadata sharding; eventual derivative readiness"],
+    ["Global multi-region + storage tiering", "Worldwide audience; cost pressure", "Regional storage + CDN; hot/cold lifecycle tiering; dedup; on-demand regeneration"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the wall you're hitting. An **app server with local disk** is a toy — no durability, and it proxies every byte. Putting an **object store behind a CDN** is the first real step (durable bytes, edge delivery), but resizing **synchronously on upload** makes uploads slow and couples the app tier to heavy CPU work. The center of gravity is an **async image pipeline with sharded metadata** — direct-to-storage uploads, background derivative generation, and a metadata store that scales — which is where instant uploads and read-scale serving come from and where most of this design sits. Only a worldwide product at cost pressure needs **multi-region storage and tiering** — regional object stores and CDNs for locality, and hot/cold lifecycle policies plus dedup and on-demand regeneration to bound the ever-growing storage bill. Most photo platforms are well-served by "object store + CDN + async pipeline + sharded metadata," adding regions and tiers as reach and cost demand.
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-Placeholder.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. The photo platform's guiding rule: **never lose an original (everything else is regenerable), and degrade the experience rather than break it** — a missing derivative or a processing delay should show the original or a placeholder, not an error.
+
+<FailureMatrix
+  rows={[
+    { failure: "Pipeline worker crash mid-job", impact: "A photo's derivatives delayed", detection: "Job visibility timeout / queue redelivery", mitigation: "At-least-once queue redelivers; jobs are idempotent", recovery: "Another worker re-runs the job; derivatives appear" },
+    { failure: "Processing backlog / spike", impact: "Derivatives lag behind uploads", detection: "Queue depth / age metrics", mitigation: "Autoscale workers; show original/placeholder meanwhile", recovery: "Backlog drains; readiness catches up" },
+    { failure: "Object store unavailable", impact: "Uploads / origin fetches fail", detection: "Error rate / health", mitigation: "It's the durable substrate (erasure-coded); CDN serves cached reads through it", recovery: "Object store recovers; retries succeed" },
+    { failure: "CDN edge / region outage", impact: "Slower or failed image loads there", detection: "Edge health / origin QPS spike", mitigation: "Multi-CDN / failover; origin absorbs (rate-limited)", recovery: "Edge restored; cache refills" },
+    { failure: "Missing / not-yet-ready derivative", impact: "Requested size unavailable", detection: "404 on rendition", mitigation: "Fall back to original or another size; lazily generate on demand", recovery: "Pipeline (re)generates the derivative" },
+    { failure: "Metadata shard loss", impact: "Some photos' metadata unreadable", detection: "Replica health", mitigation: "Metadata replicated; fail over to a replica", recovery: "Restore/rebuild shard from replicas" },
+    { failure: "Hot / viral photo", impact: "Read storm on one object", detection: "Per-object QPS", mitigation: "CDN absorbs it (immutable, cache-friendly); replicate widely", recovery: "Cache serves; interaction counters approximate" },
+  ]}
+/>
+
+The theme: **originals are sacred and regenerable-everything, reads degrade gracefully, processing is retryable.** A crashed worker is harmless because the queue is **at-least-once** and jobs are **idempotent** — another worker re-runs it. A processing backlog degrades gently: show the **original or a placeholder** while derivatives catch up, since readiness is eventual by design. Object-store trouble is bounded because it's the **durable, erasure-coded substrate** ([Object Storage](/learn/object-storage)) and the CDN keeps serving cached reads; a CDN outage is met with **multi-CDN failover** and a rate-limited origin. A missing derivative isn't an error — you **fall back** to the original or another size and **lazily regenerate** the requested one (regenerability pays off again). Metadata loss is handled like any replicated store. And a viral photo is *easy* here precisely because images are immutable and **CDN-cacheable**, so a read storm is absorbed at the edge. Because originals are durable and everything else is reproducible, recovery is almost always "retry the job, fail over, or regenerate" — and the one line never crossed is losing an original.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-Placeholder.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Upload originals directly to an object store via presigned URLs (never proxying bytes through the app), record small metadata rows pointing at object-store keys, and generate derivative sizes/formats with an asynchronous, idempotent worker pipeline so uploads feel instant and derivatives are regenerable from the immutable original; serve images from a CDN of immutable, per-size URLs (absorbing ~98% of reads) with responsive delivery of the smallest fitting rendition; build the timeline as a fan-out feed (per the News Feed design) that stores post IDs hydrated with CDN image URLs; keep social counts as denormalized, approximate per-photo counters; and bound storage cost with hot→cold tiering, dedup by content hash, and on-demand regeneration of rarely-used derivatives — always keeping originals durably in the object store."
+  rationale="The system is write-amplified in storage and read-amplified in serving, so the design offloads byte movement to the object store (write) and the CDN (read) and keeps the app tier light. Async, idempotent processing decouples slow derivative generation from the upload and makes derivatives regenerable, so formats/sizes can evolve and cost can be managed by tiering and regeneration. Immutability makes images perfectly cacheable (no invalidation) and gives cheap, fast global delivery. Reusing object storage and fan-out feeds avoids rebuilding solved problems, focusing effort on the media pipeline and delivery that are distinctive."
+  alternatives="Proxy uploads through the app tier — simple but burns app CPU/network on byte-pushing and scales poorly. Resize synchronously on upload — no pipeline, but slow uploads and coupled heavy CPU. Store every derivative forever — every read is a hit but storage cost balloons; regeneration/tiering is cheaper. No CDN — impossible at read scale; the origin can't serve global image traffic affordably. Rebuild fan-out or object storage here — wasteful; reuse the News Feed and Object Storage designs. Exact live like counts — ruinous at viral scale; approximate counters suffice. Mutable image URLs — reintroduce cache invalidation that immutability avoids."
+  revisitWhen="Video is added (a distinct transcoding pipeline and player). ML features arrive (auto-tagging, ranking, dedup by perceptual hash). The audience goes global (multi-region storage + CDN, regional compliance). Storage cost outpaces revenue (more aggressive tiering, drop-and-regenerate more derivatives, better dedup). Or upload patterns shift to huge originals (lean harder on multipart and lazy derivative generation)."
+/>
+
+Four axes capture the real tension:
+
+- **Eager vs lazy derivative generation.** Eager (all sizes on upload) makes every read a hit but stores renditions that may never be viewed; lazy (on first request) saves storage but adds first-view latency. Often eager for common sizes, lazy for rare ones.
+- **Direct-to-storage vs proxied upload.** Direct (presigned URL) keeps the app tier light and uploads fast; proxied is simpler to reason about but wastes app resources on byte-pushing. Direct wins at scale.
+- **Store all derivatives vs regenerate.** Storing everything is fast to serve but expensive; regenerating rarely-used sizes trades compute for storage. Regenerate the cold tail.
+- **Exact vs approximate social counts.** Exact is truthful but ruinous at viral scale; approximate counters are cheap and indistinguishable to users. Approximate wins for display counts.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-Placeholder.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"A photo-sharing platform looks like upload-and-show, but the real design is a write-amplified async image pipeline feeding a read-dominated CDN delivery path, and it rests on two systems I'd reuse rather than rebuild: an object store for the bytes and a fan-out feed for the timeline. On upload, the client gets a presigned URL and uploads the original directly to the object store, so the app tier never proxies multi-megabyte bodies — it just writes a small metadata record and enqueues a job, and the upload returns instantly. A background worker pipeline then generates the derivatives — several resolutions, modern formats like WebP and AVIF, EXIF stripped — idempotently, and it never modifies the original, so derivatives are regenerable: I can backfill a new format later or drop a rarely-used size and recreate it. Serving is where the read amplification lives: images are immutable, so they cache forever at the edge, and a CDN with a ninety-eight-percent hit rate offloads about fifty times the read traffic, so the origin barely gets touched; responsive delivery sends the smallest derivative that fits the device. The feed is the fan-out problem from the news-feed design — it stores post IDs hydrated with CDN image URLs, so the feed service moves lightweight JSON while images load from the edge. Social counts like likes are denormalized approximate counters because a viral photo has millions. And because each upload amplifies into about six megabytes and lives forever — around six hundred terabytes a day — I bound cost by tiering hot to cold, deduping identical uploads, and regenerating cold derivatives on demand, always keeping the original durable. The one rule: never lose an original, because everything else can be regenerated."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why upload directly to storage? Why is processing async and idempotent, and why keep the original immutable? Why does a CDN work so well here, and what does immutability buy you? How does the feed plug in? How do you handle millions of likes? How do you keep the storage bill from exploding?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="What do the capacity numbers reveal as the two defining forces of a photo-sharing platform?"
+  options={[
+    "High write throughput and low read volume",
+    "Write amplification into storage and read amplification absorbed by a CDN: each upload fans into an original plus ~5 derivatives (~6 MB), so 100M uploads/day is ~600 TB/day of new storage — demanding an object store, an async pipeline, and tiering. Meanwhile ~100 views per upload means ~116k image requests/sec, but a 98%-hit CDN offloads ~50× so the origin sees only ~2.3k/s. The app tier barely touches image bytes; it orchestrates the pipeline and hands out CDN URLs",
+    "Neither storage nor reads matter; CPU for resizing dominates everything",
+    "The upload rate is the bottleneck at ~1,157/sec",
+  ]}
+  answer={1}
+  explanation="The model shows two amplifications. On the write side, each upload multiplies into an original plus several derivatives (~6 MB), producing ~600 TB/day — so durable object storage, an async derivative pipeline, and cost tiering are mandatory. On the read side, views dominate ~100:1 (~116k req/s), but a 98%-hit CDN offloads ~50×, leaving the origin at ~2.3k/s. Consequently the application tier orchestrates and serves URLs rather than moving pixels. The raw upload rate (~1,157/s) is modest and not the challenge."
+/>
+
+<KnowledgeCheck
+  question="Why is keeping the original immutable and treating derivatives as regenerable so central to the design?"
+  options={[
+    "It isn't; derivatives must be stored forever and originals discarded after processing",
+    "Because derivatives are pure functions of the original, keeping the original immutable and durable makes every rendition reproducible: you can add a new size or format later by backfilling from originals, drop rarely-viewed derivatives to save storage and regenerate them on demand, and recover any lost derivative — so derivatives are treated as a cache over the durable source of truth. This underpins cost tiering, format evolution, and graceful degradation (fall back to the original or regenerate on a miss)",
+    "It lets the CDN mutate images in place to save storage",
+    "It allows the app tier to proxy image bytes more efficiently",
+  ]}
+  answer={1}
+  explanation="Derivatives being deterministic functions of the original means the original is the single durable source of truth and everything else is reproducible. That regenerability is what makes cost tiering safe (drop-and-recreate cold derivatives), format/size evolution possible (backfill new renditions), and failure handling graceful (a missing derivative falls back to the original or is regenerated). So you fiercely preserve originals and treat derivatives as a regenerable cache — not the other way around, and it has nothing to do with mutating images or proxying bytes."
+/>
+
+<Faq
+  items={[
+    { question: "What is a photo-sharing platform, as a system?", answer: "It lets users upload images, processes each into multiple sizes and formats, and serves them in feeds and profiles to a global audience. The interesting engineering isn't the upload — it's the write-amplified asynchronous image pipeline (one upload becomes an original plus many derivatives) and the read-dominated CDN delivery path. It's built on an object store for the bytes and a fan-out feed for the timeline, so those are reused rather than rebuilt." },
+    { question: "Why upload directly to the object store instead of through the app servers?", answer: "Streaming multi-megabyte uploads through the app tier wastes its CPU and bandwidth proxying bytes it adds no value to, forcing you to scale it for byte-pushing. Instead the API returns a short-lived presigned URL and the client PUTs the original straight to the object store, so the app only handles small JSON. Combined with asynchronous processing, the upload returns instantly while derivatives are generated in the background." },
+    { question: "What is the image processing pipeline?", answer: "An asynchronous, event-driven fleet of workers that consume a queue of jobs, each reading an uploaded original and generating its derivatives: multiple resolutions (thumbnail to large), modern formats (WebP/AVIF with JPEG fallback), crops, a blurhash placeholder, and EXIF stripped for privacy and size. It's idempotent (safe to retry) and never modifies the original, so derivatives are regenerable — decoupling slow processing from the upload." },
+    { question: "Why generate multiple derivatives instead of serving the original?", answer: "Because you never want to send a 4 MB camera original to a 150-pixel thumbnail grid — it wastes bandwidth, time, and battery across billions of views. Pre-generating a range of sizes and efficient formats (WebP/AVIF are far smaller than JPEG) lets each context load the smallest rendition that fits, which is the single biggest lever on delivery cost and speed. The original is kept durably as the source the derivatives come from." },
+    { question: "Why is a CDN essential here?", answer: "Photo serving is overwhelmingly read-heavy and images are immutable, so they cache perfectly at edge locations near users. A CDN with a ~98% hit rate offloads roughly 50× of read traffic from the origin, so hundreds of thousands of image requests per second are served fast from nearby edges instead of a distant object store. Without a CDN, global read-scale image serving would be neither affordable nor fast." },
+    { question: "How does immutability help with caching and invalidation?", answer: "Since a derivative at a given URL never changes, a CDN can cache it indefinitely with no risk of serving stale content — which eliminates the cache-invalidation problem entirely. New content simply gets a new URL rather than mutating an existing cached object, and a deleted photo is handled by removing access, not by invalidating caches. Immutable, right-sized, edge-cached URLs are why photo feeds load instantly worldwide." },
+    { question: "How does the feed work in a photo platform?", answer: "The timeline is a fan-out problem — the same one the News Feed tutorial solves with fan-out-on-write, fan-out-on-read, or a hybrid that pushes for normal users and pulls for celebrities. The photo-specific point is that the feed stores post IDs, not image bytes: each entry is a lightweight reference hydrated at read time with metadata and CDN image URLs, so the feed service moves small JSON while the images load separately from the CDN." },
+    { question: "How are millions of likes on a viral photo handled?", answer: "Not with a live COUNT(*) per render — that's ruinous at scale. Like/view counts are denormalized into per-photo counters updated as interactions arrive, and at extreme scale they're approximate (aggregated or eventually consistent), because showing '2.4M likes' doesn't need exactness. It's the same counter-and-approximation pattern used in leaderboards and news feeds, and interaction write volume often dwarfs the photo uploads themselves." },
+    { question: "Why is the processing pipeline asynchronous rather than done on upload?", answer: "Generating several resolutions and formats takes real CPU time; doing it synchronously would make users wait seconds for every upload and couple the app tier to heavy work. Instead the upload just stores the original and enqueues a job, returning instantly, while background workers produce derivatives — the photo shows the original or a placeholder until they're ready. This is the same accept-fast, process-behind-a-queue pattern as notification fan-out." },
+    { question: "How do you keep storage costs under control?", answer: "Photo access is heavily skewed by age (viewed a lot for days, then rarely), so most stored bytes are cold. You tier objects from hot to cheaper cold storage via lifecycle policies, regenerate rarely-used derivatives on demand instead of storing them forever (they're reproducible from the original), and deduplicate identical uploads by content hash. Originals are always kept durably as the regenerable source of truth; derivatives are treated as a manageable cache." },
+    { question: "What does this system reuse from other designs?", answer: "The durable blob store — erasure coding, scrubbing, the metadata service — is the Object Storage tutorial. The timeline fan-out (push/pull/hybrid for celebrities) is the News Feed tutorial. The CDN edge-delivery tier mirrors the Video Streaming platform. So a strong answer names these as reused substrates and focuses the design effort on the distinctive parts: the asynchronous image pipeline and the CDN-served, responsive delivery path." },
+    { question: "What's the one thing you must never do, and how is everything else recovered?", answer: "Never lose an original — it's the durable source of truth from which every derivative is regenerated, so it's kept erasure-coded in the object store. Everything else degrades or recovers: a crashed processing job is retried idempotently, a backlog shows the original/placeholder until derivatives catch up, a missing derivative falls back to another size or is regenerated on demand, a CDN outage fails over to another edge/origin, and a viral read storm is absorbed by the immutable-friendly CDN. Recovery is retry, fail over, or regenerate." },
+  ]}
+/>
