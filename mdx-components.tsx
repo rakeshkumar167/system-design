@@ -41,6 +41,7 @@ import { MetricsCapacity } from "@/components/learning/metrics-monitoring-capaci
 import { ObjectStorageCapacity } from "@/components/learning/object-storage-capacity";
 import { PhotoSharingCapacity } from "@/components/learning/photo-sharing-capacity";
 import { RideHailingCapacity } from "@/components/learning/ride-hailing-capacity";
+import { CdnCapacity } from "@/components/learning/content-delivery-network-capacity";
 import { ArchitectureDiagram } from "@/components/diagrams/architecture-diagram";
 import {
   CreateUrlSequence,
@@ -262,6 +263,7 @@ const teachingComponents = {
   ObjectStorageCapacity,
   PhotoSharingCapacity,
   RideHailingCapacity,
+  CdnCapacity,
   ArchitectureDiagram,
   CreateUrlSequence,
   RedirectCacheHitSequence,
