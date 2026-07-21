@@ -673,6 +673,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "content-delivery-network": {
+    slug: "content-delivery-network",
+    title: "Design a Content Delivery Network",
+    description:
+      "An interview-grade walkthrough of a Cloudflare/Akamai-class globally-distributed cache: routing every user to the nearest healthy edge, driving the cache-hit ratio to offload the origin behind an origin shield, and keeping thousands of cached copies correct through invalidation.",
+    difficulty: "Advanced",
+    readingMinutes: 33,
+    concepts: ["Edge caching", "Cache invalidation", "Origin shield", "Geo-routing"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "request-routing", label: "Request Routing to the Edge", depth: "advanced" },
+      { id: "edge-cache", label: "The Edge Cache: Keys, TTLs & Hit Ratio", depth: "advanced" },
+      { id: "origin-offload", label: "Origin Offload: Hierarchy & Shield", depth: "advanced" },
+      { id: "cache-invalidation", label: "Cache Invalidation & Freshness", depth: "advanced" },
+      { id: "dynamic-edge", label: "Beyond Static: Dynamic & Edge Compute", depth: "advanced" },
+      { id: "edge-security", label: "Security at the Edge", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

@@ -332,7 +332,7 @@ export const problems: readonly Problem[] = [
       "Serve static content from the edge with caching, invalidation, and origin offload at global scale.",
     difficulty: "Advanced",
     concepts: ["Edge caching", "Cache invalidation", "Origin shield", "Geo-routing"],
-    status: "coming-soon",
+    status: "available",
     sequence: 33,
   },
 ];

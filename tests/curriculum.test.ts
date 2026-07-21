@@ -10,7 +10,7 @@ describe("curriculum", () => {
   it("exposes URL Shortener, Rate Limiter, Pastebin, Notification Service, Distributed Cache, API Gateway, Web Crawler, Search Autocomplete, News Feed, Chat System, Video Streaming, Ticket Booking, Payment System, Distributed Logging, Collaborative Doc Editor, Cloud Drive, Maps and Navigation, and Distributed Job Scheduler as available", () => {
     expect(
       problems.filter((p) => p.status === "available").map((p) => p.slug),
-    ).toEqual(["url-shortener", "rate-limiter", "pastebin", "notification-service", "distributed-cache", "api-gateway", "web-crawler", "search-autocomplete", "news-feed", "chat-system", "video-streaming", "object-storage", "photo-sharing", "ride-hailing", "ticket-booking", "payment-system", "metrics-monitoring", "distributed-logging", "collaborative-doc-editor", "cloud-drive", "maps-navigation", "distributed-job-scheduler", "leaderboard"]);
+    ).toEqual(["url-shortener", "rate-limiter", "pastebin", "notification-service", "distributed-cache", "api-gateway", "web-crawler", "search-autocomplete", "news-feed", "chat-system", "video-streaming", "object-storage", "photo-sharing", "ride-hailing", "ticket-booking", "payment-system", "metrics-monitoring", "distributed-logging", "collaborative-doc-editor", "cloud-drive", "maps-navigation", "distributed-job-scheduler", "leaderboard", "content-delivery-network"]);
     expect(getProblem("rate-limiter")?.title).toBe("Rate Limiter");
     expect(getProblem("pastebin")?.title).toBe("Pastebin");
     expect(getProblem("notification-service")?.title).toBe("Notification Service");
