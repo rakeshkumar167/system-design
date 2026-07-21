@@ -213,6 +213,13 @@ import {
   TripStateSequence,
   LiveTrackingSequence,
 } from "@/components/diagrams/ride-hailing-flows";
+import { CdnArchitecture } from "@/components/diagrams/content-delivery-network-architecture";
+import {
+  EdgeRequestRoutingSequence,
+  EdgeCacheLookupSequence,
+  OriginShieldSequence,
+  CacheInvalidationSequence,
+} from "@/components/diagrams/content-delivery-network-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -398,6 +405,11 @@ const teachingComponents = {
   MatchRideSequence,
   TripStateSequence,
   LiveTrackingSequence,
+  CdnArchitecture,
+  EdgeRequestRoutingSequence,
+  EdgeCacheLookupSequence,
+  OriginShieldSequence,
+  CacheInvalidationSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

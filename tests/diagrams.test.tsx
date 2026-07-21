@@ -633,6 +633,13 @@ import {
   TripStateSequence,
   LiveTrackingSequence,
 } from "@/components/diagrams/ride-hailing-flows";
+import { CdnArchitecture } from "@/components/diagrams/content-delivery-network-architecture";
+import {
+  EdgeRequestRoutingSequence,
+  EdgeCacheLookupSequence,
+  OriginShieldSequence,
+  CacheInvalidationSequence,
+} from "@/components/diagrams/content-delivery-network-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -985,5 +992,47 @@ describe("Ride-hailing diagrams", () => {
       screen.getByRole("img", { name: /track the driver in real time/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/the rider subscribes to the assigned driver's live location stream/i)).toBeInTheDocument();
+  });
+});
+
+describe("Content delivery network diagrams", () => {
+  it("exposes the CDN architecture to non-visual readers", () => {
+    render(<CdnArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /content delivery network architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/the cache-hit ratio is what determines how thin that sliver is/i)).toBeInTheDocument();
+  });
+
+  it("exposes the edge request-routing flow to non-visual readers", () => {
+    render(<EdgeRequestRoutingSequence />);
+    expect(
+      screen.getByRole("img", { name: /route a request to the nearest edge/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/routing around a failed PoP without the user ever noticing/i)).toBeInTheDocument();
+  });
+
+  it("exposes the edge cache-lookup flow to non-visual readers", () => {
+    render(<EdgeCacheLookupSequence />);
+    expect(
+      screen.getByRole("img", { name: /look up an object at the edge cache/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/the hit ratio, not raw capacity, is what actually offloads the origin/i)).toBeInTheDocument();
+  });
+
+  it("exposes the origin-shield flow to non-visual readers", () => {
+    render(<OriginShieldSequence />);
+    expect(
+      screen.getByRole("img", { name: /an origin shield absorbs concurrent edge misses/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/collapses a thundering herd of concurrent misses into one origin fetch/i)).toBeInTheDocument();
+  });
+
+  it("exposes the cache-invalidation flow to non-visual readers", () => {
+    render(<CacheInvalidationSequence />);
+    expect(
+      screen.getByRole("img", { name: /invalidate stale content across the edge/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/versioned, immutable URLs avoid invalidation entirely/i)).toBeInTheDocument();
   });
 });
