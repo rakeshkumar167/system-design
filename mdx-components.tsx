@@ -221,6 +221,13 @@ import {
   OriginShieldSequence,
   CacheInvalidationSequence,
 } from "@/components/diagrams/content-delivery-network-flows";
+import { SnowflakeArchitecture } from "@/components/diagrams/unique-id-generator-architecture";
+import {
+  GenerateIdSequence,
+  WorkerIdAssignmentSequence,
+  ClockSkewSequence,
+  SequenceOverflowSequence,
+} from "@/components/diagrams/unique-id-generator-flows";
 
 /**
  * Global MDX component map. Custom teaching components and diagrams are
@@ -412,6 +419,11 @@ const teachingComponents = {
   EdgeCacheLookupSequence,
   OriginShieldSequence,
   CacheInvalidationSequence,
+  SnowflakeArchitecture,
+  GenerateIdSequence,
+  WorkerIdAssignmentSequence,
+  ClockSkewSequence,
+  SequenceOverflowSequence,
 };
 
 export function useMDXComponents(components: MDXComponents): MDXComponents {

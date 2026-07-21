@@ -640,6 +640,13 @@ import {
   OriginShieldSequence,
   CacheInvalidationSequence,
 } from "@/components/diagrams/content-delivery-network-flows";
+import { SnowflakeArchitecture } from "@/components/diagrams/unique-id-generator-architecture";
+import {
+  GenerateIdSequence,
+  WorkerIdAssignmentSequence,
+  ClockSkewSequence,
+  SequenceOverflowSequence,
+} from "@/components/diagrams/unique-id-generator-flows";
 
 describe("TLS flow diagrams", () => {
   it("exposes the TLS handshake to non-visual readers", () => {
@@ -1034,5 +1041,47 @@ describe("Content delivery network diagrams", () => {
       screen.getByRole("img", { name: /invalidate stale content across the edge/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/versioned, immutable URLs avoid invalidation entirely/i)).toBeInTheDocument();
+  });
+});
+
+describe("Unique ID generator diagrams", () => {
+  it("exposes the Snowflake architecture to non-visual readers", () => {
+    render(<SnowflakeArchitecture />);
+    expect(
+      screen.getByRole("img", { name: /unique id generator architecture/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/zero shared state between nodes/i)).toBeInTheDocument();
+  });
+
+  it("exposes the generate-id flow to non-visual readers", () => {
+    render(<GenerateIdSequence />);
+    expect(
+      screen.getByRole("img", { name: /generate an id/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/no coordination with any other node is needed on this path/i)).toBeInTheDocument();
+  });
+
+  it("exposes the worker-id assignment flow to non-visual readers", () => {
+    render(<WorkerIdAssignmentSequence />);
+    expect(
+      screen.getByRole("img", { name: /assign a worker\/machine id at startup/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/no two nodes ever share the machine-id bits/i)).toBeInTheDocument();
+  });
+
+  it("exposes the clock-skew flow to non-visual readers", () => {
+    render(<ClockSkewSequence />);
+    expect(
+      screen.getByRole("img", { name: /handle clock skew during id generation/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/an NTP correction pushes the wall clock backwards/i)).toBeInTheDocument();
+  });
+
+  it("exposes the sequence-overflow flow to non-visual readers", () => {
+    render(<SequenceOverflowSequence />);
+    expect(
+      screen.getByRole("img", { name: /handle per-millisecond sequence overflow/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/caps per-node throughput but keeps every id it produces unique/i)).toBeInTheDocument();
   });
 });
