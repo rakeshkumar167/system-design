@@ -702,6 +702,35 @@ export const tutorials: Record<string, TutorialMeta> = {
       { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
     ],
   },
+  "unique-id-generator": {
+    slug: "unique-id-generator",
+    title: "Design a Unique ID Generator",
+    description:
+      "An interview-grade walkthrough of a Twitter-Snowflake-class ID service: minting globally unique, roughly time-sortable 64-bit IDs at massive scale with no coordination on the hot path — bit layout, machine-id assignment, clock skew, monotonicity, and partitioning.",
+    difficulty: "Intermediate",
+    readingMinutes: 30,
+    concepts: ["Snowflake IDs", "Clock skew", "Monotonicity", "Partitioning"],
+    sections: [
+      { id: "interview-framing", label: "Interview Framing", depth: "fundamentals" },
+      { id: "requirements", label: "Requirements", depth: "interview-ready" },
+      { id: "capacity-estimates", label: "Capacity Estimates", depth: "interview-ready" },
+      { id: "entity-model", label: "Entity Model", depth: "interview-ready" },
+      { id: "api-design", label: "API Design", depth: "interview-ready" },
+      { id: "high-level-architecture", label: "High-Level Architecture", depth: "interview-ready" },
+      { id: "detailed-flows", label: "Detailed Flows", depth: "interview-ready" },
+      { id: "id-approaches", label: "The Design Space", depth: "advanced" },
+      { id: "snowflake-anatomy", label: "Anatomy of a 64-bit ID", depth: "advanced" },
+      { id: "worker-id-assignment", label: "Assigning Machine IDs", depth: "advanced" },
+      { id: "clock-skew", label: "Clock Skew & Going Backwards", depth: "advanced" },
+      { id: "monotonicity-ordering", label: "Monotonicity & Ordering", depth: "advanced" },
+      { id: "throughput-scaling", label: "Throughput, Overflow & Partitioning", depth: "advanced" },
+      { id: "scalability-evolution", label: "Scalability & Evolution", depth: "advanced" },
+      { id: "resiliency-failure-modes", label: "Resiliency & Failure Modes", depth: "advanced" },
+      { id: "tradeoffs-alternatives", label: "Trade-offs & Alternatives", depth: "advanced" },
+      { id: "interview-summary", label: "Interview Summary", depth: "interview-ready" },
+      { id: "knowledge-checks-faq", label: "Knowledge Checks & FAQ", depth: "fundamentals" },
+    ],
+  },
 };
 
 export function getTutorial(slug: string): TutorialMeta | undefined {

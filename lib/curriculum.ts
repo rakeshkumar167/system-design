@@ -272,7 +272,7 @@ export const problems: readonly Problem[] = [
       "Generate globally unique, roughly time-ordered IDs at massive scale without coordination.",
     difficulty: "Intermediate",
     concepts: ["Snowflake IDs", "Clock skew", "Monotonicity", "Partitioning"],
-    status: "coming-soon",
+    status: "available",
     sequence: 27,
   },
   {

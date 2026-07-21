@@ -27,6 +27,7 @@ import ObjectStorageContent from "@/content/tutorials/object-storage.mdx";
 import PhotoSharingContent from "@/content/tutorials/photo-sharing.mdx";
 import RideHailingContent from "@/content/tutorials/ride-hailing.mdx";
 import ContentDeliveryNetworkContent from "@/content/tutorials/content-delivery-network.mdx";
+import UniqueIdGeneratorContent from "@/content/tutorials/unique-id-generator.mdx";
 
 /** Maps each registered slug to its compiled MDX content component. */
 const content: Record<string, ComponentType> = {
@@ -54,6 +55,7 @@ const content: Record<string, ComponentType> = {
   "photo-sharing": PhotoSharingContent,
   "ride-hailing": RideHailingContent,
   "content-delivery-network": ContentDeliveryNetworkContent,
+  "unique-id-generator": UniqueIdGeneratorContent,
 };
 
 export function generateStaticParams() {
