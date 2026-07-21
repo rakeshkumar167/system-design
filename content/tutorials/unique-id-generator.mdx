@@ -1,71 +1,368 @@
 <h2 id="interview-framing">Interview Framing</h2>
 
-Placeholder.
+A unique ID generator hands out identifiers — for rows, messages, orders, uploads — that are **globally unique** across a distributed system. It sounds like a solved problem: databases have `AUTO_INCREMENT`, languages have `UUID`, why is this an interview question at all? Because the moment you have more than one machine minting IDs, the easy answers each break on a different axis, and the job is to satisfy **three requirements at once**: every ID is **unique** (never a collision, ever), IDs are **roughly time-sortable** (so they cluster in an index and support "most recent" queries), and generation is **fast and coordination-free** (no central bottleneck, no network round-trip on the hot path). Optimize for any one and you can lose the others.
+
+Walk the naive options and watch them fail. A **database auto-increment** is unique and perfectly sortable, but it forces every insert through **one sequence** — a coordination bottleneck and a single point of failure — and it falls apart the moment you shard. A **UUIDv4** is unique and needs no coordination, but it's **128 bits of randomness**: not sortable at all (random IDs scatter across a B-tree index, destroying write locality) and twice as wide as an integer in every index and foreign key. A central **"ticket server"** that hands out numbers is sortable but still a SPOF and a bottleneck. The design that threads the needle is **Snowflake** (Twitter's, and its many descendants): pack a **timestamp**, a **machine id**, and a **per-machine sequence counter** into a single **64-bit integer**, so each node generates IDs entirely **locally** — no coordination, no network — while the embedded timestamp makes them globally unique and roughly time-ordered. The reframe to lead with: *minting an integer is trivial; the real problem is unique, time-sortable IDs at scale with no coordination — and Snowflake solves it by bit-packing time, machine, and a counter into 64 bits so every node mints locally, which pushes the difficulty onto machine-id assignment, clock skew, and how much ordering you can actually promise.*
+
+Spend the opening minutes scoping. Good questions to ask:
+
+- What are the **hard requirements** — must IDs be strictly monotonic, or just roughly time-ordered? (Almost always roughly is enough, and it's what makes coordination-free generation possible.)
+- What **width** — do IDs need to fit a 64-bit integer (cheap indexes, `BIGINT`), or is a 128-bit UUID acceptable?
+- What's the **throughput** — IDs per second, and across how many nodes? (This usually reveals that throughput is trivially met.)
+- How important is **sortability** — for index locality, time-range queries, or cursor pagination?
+- Can we depend on a **coordination service** (ZooKeeper/etcd) at startup, and can we trust the **clock**?
+
+<Callout variant="interview" title="Suggested 45-minute allocation">
+**5 min** framing and the "unique, sortable, coordination-free — pick all three" reframe · **5 min** requirements (uniqueness, rough sortability, no SPOF, 64-bit width) · **5 min** capacity (throughput is a non-problem; the budget is bits) · **5 min** entity model (the ID *is* the entity) and the API (mint / batch / decode) · **8 min** the design space (UUID vs auto-increment vs ticket server vs Snowflake) and the 64-bit anatomy · **8 min** machine-id assignment and clock skew (the two things that actually go wrong) · **5 min** monotonicity/ordering, throughput/overflow, failure modes, wrap-up. Say your invariants out loud — the interviewer wants a 64-bit time+machine+sequence layout, unique machine ids, a plan for the clock going backwards, and honesty about k-sorted (not strictly global) ordering.
+</Callout>
+
+This tutorial commits to concrete assumptions so the design stays consistent end to end. **In scope:** the design space of ID schemes, the Snowflake 64-bit layout and generation algorithm, machine-id assignment, clock-skew handling, the ordering guarantees you can actually make, and per-node throughput and partitioning — plus scaling, failure modes, and trade-offs. **Out of scope (reuse, don't rebuild):** the **coordination service** used for machine-id assignment is ZooKeeper/etcd, the same primitive the [Distributed Job Scheduler](/learn/distributed-job-scheduler) uses for leader election; the systems that *consume* these IDs (the [URL Shortener](/learn/url-shortener)'s short keys, shard keys, [Payment System](/learn/payment-system) idempotency keys) are their own tutorials. Also out of scope: cryptographically unguessable IDs (Snowflake IDs are *not* secret — the timestamp and machine id are readable), and human-friendly encodings. This tutorial builds a small, fast, correct integer factory and spends its effort on the two things that make it hard: clocks and machine-id uniqueness.
 
 <h2 id="requirements">Requirements</h2>
 
-Placeholder.
+Separate what the system must *do* from how *well* it must do it. The functional list is tiny; the entire design lives in the non-functionals.
+
+<RequirementsTable
+  functional={[
+    "Generate a globally unique ID on demand",
+    "IDs are roughly ordered by creation time",
+    "Each ID fits in a 64-bit integer",
+    "Support batch allocation (many IDs at once)",
+    "Decode an ID back into its timestamp / machine / sequence",
+  ]}
+  nonFunctional={[
+    { goal: "Uniqueness", target: "never collide, across all nodes, ever" },
+    { goal: "Throughput", target: "millions of IDs/sec, scaling with nodes" },
+    { goal: "Latency", target: "local generation — no network round-trip" },
+    { goal: "Sortability", target: "k-sorted: roughly time-ordered globally" },
+    { goal: "Availability", target: "no SPOF, no coordination on the hot path" },
+    { goal: "Compactness", target: "64-bit — cheap indexes and foreign keys" },
+  ]}
+/>
+
+Three targets shape every later decision. First, **uniqueness is absolute and non-negotiable**: a single duplicate ID can corrupt data (two rows with the same primary key, two payments sharing an idempotency key), so every mechanism — machine-id assignment, clock handling, sequence overflow — exists to guarantee no two IDs ever coincide. Second, **coordination-free generation is the point**: the design deliberately avoids any per-ID network call or shared counter, because that's what would make it slow and a single point of failure; each node must be able to mint IDs from purely local state. Third, **sortability is "roughly," not "strictly"**: IDs must cluster by time so indexes stay dense and "recent items" queries work, but strict global monotonicity (every ID larger than every previously issued one, everywhere) is **impossible without coordination** — so the honest requirement is **k-sorted** (ordered to the millisecond, with same-millisecond IDs from different nodes allowed to interleave). Note what's **relaxed**: IDs are **not secret** (they leak creation time and origin node — fine for a primary key, not for a password-reset token), and ordering within a single millisecond across nodes is unspecified. The system trades strict global order and unguessability for uniqueness, compactness, and coordination-free speed — exactly the trade that lets every node run independently.
 
 <h2 id="capacity-estimates">Capacity Estimates</h2>
 
-Placeholder.
+Estimates here deliver an unusual verdict: the thing that normally drives a design — throughput — is a **non-issue**, and the real capacity question is how you spend a fixed budget of **bits**.
+
+<SnowflakeCapacity
+  assumptions={{
+    timeBits: 41,
+    machineBits: 10,
+    sequenceBits: 12,
+    peakIdsPerSec: 1000000,
+  }}
+/>
+
+The takeaways. First — the surprise — **throughput is trivially met.** A single node with **12 sequence bits** can mint **4,096 IDs per millisecond**, which is **4,096,000 IDs per second**, entirely from local state with **no network call and no coordination**. So even a demanding **1,000,000 IDs/sec** workload fits on **one machine** (`nodesForPeakDemand = 1`); you never add nodes for throughput. Second — the actual design problem — **the budget is 64 bits, and how you split them is the whole trade-off.** One sign bit (kept zero so IDs stay positive) plus **41 timestamp bits** (milliseconds from a custom epoch) gives a **≈69.7-year** lifespan; **10 machine bits** allow **1,024** independent nodes; **12 sequence bits** allow **4,096** IDs/ms per node. Shift the boundaries and you trade lifespan for nodes, or nodes for per-node throughput — a fixed pie you allocate. Third — the scale ceiling is absurd — **fill all 1,024 nodes and you get ~4.19 billion IDs/sec**, orders of magnitude beyond any real system's need. The capacity story reframes the whole exercise: you are not engineering for capacity, you are **budgeting bits** for lifespan, node count, and per-node rate — and then spending your real effort on the two things that can actually break uniqueness: **clock behavior** and **machine-id assignment**.
 
 <h2 id="entity-model">Entity Model</h2>
 
-Placeholder.
+This system is unusual: there's almost no persistent data. The **ID itself is the entity** — a 64-bit integer that is *self-describing*, decomposing into the three fields packed into it — and the only mutable state is the small amount each generator node holds in memory.
+
+<EntityModel
+  name="SnowflakeId"
+  description="A single 64-bit integer that encodes its own creation time, origin node, and a per-millisecond sequence number. It is self-describing: given the id and the custom epoch, you can recover exactly when and where it was minted. It is not stored anywhere central — it is computed locally and handed out."
+  fields={[
+    { name: "value", type: "int64", notes: "the whole ID — one signed 64-bit integer (return as a string in JSON)" },
+    { name: "timestamp", type: "41 bits", notes: "milliseconds since a custom epoch — the high bits, so IDs sort by time" },
+    { name: "machine_id", type: "10 bits", notes: "which node minted it — makes concurrent IDs unique" },
+    { name: "sequence", type: "12 bits", notes: "0–4095, distinguishes IDs minted in the same millisecond on one node" },
+  ]}
+  keys="A SnowflakeId is a value, not a stored record — it is composed by bit-shifting: (timestamp << 22) | (machine_id << 12) | sequence. The timestamp occupies the high bits, which is precisely why sorting the integers sorts them (roughly) by time. Uniqueness is guaranteed by construction: two IDs differ if they were minted in different milliseconds (different timestamp bits), on different nodes (different machine bits), or at different points within one millisecond on one node (different sequence bits) — the three fields together cover every case. The only durable/mutable state is per generator NODE: its assigned machine_id (fixed for the node's life, obtained at startup), the last timestamp it issued (to detect a backwards clock and to know when to reset the sequence), and the current sequence counter (incremented within a millisecond, reset to 0 on a new millisecond). There is no shared database on the hot path. The invariant: machine_id is unique per live node, and a node never issues the same (timestamp, sequence) pair twice — enforced by never letting the clock go backwards and by waiting for the next millisecond when the sequence overflows."
+/>
+
+Two ideas complete the picture. The ID being **self-describing** is a real feature: you can extract an item's creation time straight from its primary key with no extra column, and route or shard on the machine bits. And the **node's mutable state is tiny and local** — a machine id, a last-timestamp, and a counter — which is what makes generation a few CPU instructions with no I/O. The discipline: **the ID is a bit-packed value whose three fields guarantee uniqueness by construction**, and the only state that matters is each node's **unique machine id** plus the **last-timestamp/sequence** it uses to stay monotonic.
 
 <h2 id="api-design">API Design</h2>
 
-Placeholder.
+The surface is tiny — mint, batch, decode — but two details carry real weight: the hot path must be dirt-cheap, and the 64-bit value must survive JSON.
+
+<ApiContract
+  method="GET"
+  path="/id"
+  summary="Mint a single new ID (the hot path)."
+  request={`GET /id`}
+  response={`HTTP/1.1 200 OK
+{ "id": "1834092847361048576" }`}
+  statusCodes={[
+    { code: "200", meaning: "A fresh, unique, roughly time-ordered ID" },
+    { code: "503", meaning: "Clock moved backwards — briefly refusing rather than risk a duplicate" },
+  ]}
+  notes="Generated entirely from local node state — no database, no network. Note the id is returned as a STRING: JSON numbers are IEEE-754 doubles with only 53 bits of integer precision, so a 64-bit id sent as a number would be silently truncated. Twitter's API famously added id_str for exactly this reason."
+/>
+
+<ApiContract
+  method="GET"
+  path="/ids?count=1000"
+  summary="Allocate a batch of IDs in one call."
+  request={`GET /ids?count=1000`}
+  response={`HTTP/1.1 200 OK
+{ "ids": ["1834092847361048576", "…"], "count": 1000 }`}
+  statusCodes={[
+    { code: "200", meaning: "A block of unique IDs (contiguous within a node/millisecond)" },
+    { code: "400", meaning: "count exceeds the per-request limit" },
+  ]}
+  notes="Amortizes call overhead for clients that need many IDs (bulk inserts, pre-allocation). Still purely local — a node can hand out up to 4,096 IDs per millisecond, blocking for the next millisecond tick if a large batch exhausts the current one."
+/>
+
+<ApiContract
+  method="GET"
+  path="/id/{value}"
+  summary="Decode an ID into its parts (IDs are self-describing)."
+  request={`GET /id/1834092847361048576`}
+  response={`HTTP/1.1 200 OK
+{ "timestamp_ms": 1721480000000, "created_at": "2026-07-20T12:53:20Z",
+  "machine_id": 7, "sequence": 0 }`}
+  statusCodes={[
+    { code: "200", meaning: "The timestamp, machine id, and sequence packed in the ID" },
+    { code: "400", meaning: "Not a valid ID for this epoch/layout" },
+  ]}
+  notes="Pure bit-arithmetic against the known epoch and layout — no lookup. Handy for debugging and analytics (when/where was this minted?), and a reminder that Snowflake IDs are not secret: anyone can read the creation time and node."
+/>
+
+The whole surface is: **mint** one (the hot path, local and cheap), **batch** many (amortized), and **decode** (free, because the ID carries its own metadata). The two things not to miss are returning the id **as a string** so JSON doesn't truncate it, and that even the "generate" call touches **no shared state** — which is the entire reason this design scales and stays available.
 
 <h2 id="high-level-architecture">High-Level Architecture</h2>
 
-Placeholder.
+The architecture barely looks distributed, and that's the point: there is **no shared component on the hot path**. A fleet of independent generator nodes each mint IDs from local state; a coordination service is touched **only once, at startup**, to hand each node a distinct machine id.
+
+<SnowflakeArchitecture />
+
+- **Client.** Asks any generator node for an ID (often the generator is a library linked directly into the app, making it a function call).
+- **ID Node.** An independent generator with its own machine id. It mints IDs locally from its machine id, the wall clock, and an in-memory counter — no network, no shared state.
+- **Coordinator (ZooKeeper / etcd).** Consulted **once at startup** to assign the node a unique machine id, then out of the loop. Not on the hot path.
+- **Clock / NTP.** The wall-clock source feeding the timestamp bits — the one external dependency the correctness rests on, and the one that can misbehave.
+
+The decisive property is that **the hot path is purely local**: generating an ID reads the node's machine id, the current millisecond, and a counter, then bit-packs them — no coordination, no I/O, a few instructions. The coordination service exists only to solve one startup problem (distinct machine ids) and never participates in generation, so it can be briefly unavailable without stopping any running node. Every section that follows drills into one piece: the design space that justifies this shape, the 64-bit anatomy, machine-id assignment, clock skew, ordering, and throughput.
 
 <h2 id="detailed-flows">Detailed Flows</h2>
 
-Placeholder.
+Four flows cover the system: minting an ID (the hot path), a node claiming its machine id at startup, handling a clock that runs backwards, and handling per-millisecond sequence overflow. The first two are the everyday path; the last two are the correctness safeguards.
+
+**Minting an ID.** A node reads the current millisecond; if it's the same millisecond as the last ID, it increments the sequence, otherwise it resets the sequence to zero; then it bit-packs timestamp, machine id, and sequence into a 64-bit integer and returns it.
+
+<GenerateIdSequence />
+
+**Claiming a machine id at startup.** When a node boots, it registers with the coordination service, which assigns it a distinct machine id (held for the node's lifetime); only then does it start minting.
+
+<WorkerIdAssignmentSequence />
+
+The remaining two flows — **clock skew** (the clock moving backwards) and **sequence overflow** (exhausting a millisecond's 4,096 slots) — appear in their deep dives below, where their details belong.
 
 <h2 id="id-approaches">The Design Space</h2>
 
-Placeholder.
+Before committing to Snowflake, it's worth seeing why the obvious alternatives fall short — each fails one of the three requirements (unique, sortable, coordination-free), and the failures are instructive.
+
+**Database auto-increment.** Let the database own a sequence: unique, perfectly ordered, dead simple. But every insert must go through the **one node that owns the counter**, making it a throughput bottleneck and a single point of failure, and it doesn't survive **sharding** — two shards with independent counters collide. You can offset shards (shard A: 1, 3, 5…; shard B: 2, 4, 6…) but that's brittle and caps your shard count. **UUIDv4 (random).** 122 bits of randomness: unique with astronomically low collision odds and needs **zero coordination** — great. But it is **not sortable at all**, so inserting UUIDv4 primary keys scatters writes randomly across a B-tree index, wrecking write locality and cache behavior; and at **128 bits** it doubles the size of every index, primary key, and foreign key. **Ticket / segment server.** A single service (Flickr's classic design) hands out numbers, or hands out *ranges* ("you get 1–1000") that clients then use locally to amortize the round-trip. Ranges cut the coordination a thousandfold, but the server is still a **SPOF** and IDs are only loosely time-ordered. **UUIDv7 / ULID.** Modern time-ordered 128-bit IDs — a timestamp prefix plus randomness — which fix UUIDv4's sortability and are a genuinely good choice when 128 bits is acceptable; they just cost twice the width of an integer. **Snowflake.** Time + machine + sequence in **64 bits**: unique (by construction), roughly sortable (timestamp in the high bits), coordination-free (local generation), and compact. It wins by being decent on **all** axes rather than perfect on one. The principle: each simple scheme sacrifices uniqueness-at-scale, sortability, coordination-freedom, or compactness; Snowflake's bit-packed 64-bit ID is the design that satisfies all four well enough, which is why it's the standard answer.
+
+<KnowledgeCheck
+  question="Why not just use a database auto-increment or a UUIDv4 for distributed IDs?"
+  options={[
+    "Because both are impossible to generate on modern hardware",
+    "Because each fails a key requirement. A database auto-increment is unique and sortable but funnels every insert through one counter — a bottleneck and single point of failure — and collides across shards. A UUIDv4 is unique and coordination-free but 128 bits wide (doubling every index) and completely unsortable, so random keys scatter writes across the B-tree and destroy locality. Snowflake packs time + machine + sequence into 64 bits so it's unique, roughly time-sortable, coordination-free, and compact all at once",
+    "Because UUIDs are not actually unique",
+    "Because auto-increment produces IDs that are too small",
+  ]}
+  answer={1}
+  explanation="The three requirements — unique, roughly sortable, coordination-free (and ideally compact) — are what the naive options miss. Auto-increment centralizes on one sequence (bottleneck/SPOF, breaks under sharding); UUIDv4 is coordination-free but unsortable (random ⇒ terrible index locality) and 128 bits wide. Snowflake's 64-bit time+machine+sequence layout satisfies all of them: local generation (coordination-free), timestamp in the high bits (sortable), the three fields guaranteeing uniqueness, and a single integer's width (compact). It's chosen for being good on every axis, not perfect on one."
+/>
 
 <h2 id="snowflake-anatomy">Anatomy of a 64-bit ID</h2>
 
-Placeholder.
+Snowflake's design is a specific way to spend 64 bits. From the most significant bit down: **1 sign bit**, left as zero so the integer is always **positive** (many languages only have signed 64-bit integers, and a negative ID sorts and displays badly); **41 timestamp bits** holding **milliseconds since a custom epoch** (not the Unix epoch — you pick a recent epoch, e.g. the day you launched, to maximize the usable range); **10 machine-id bits** identifying the node (1,024 possible nodes, sometimes split into datacenter + worker); and **12 sequence bits**, a per-millisecond counter from 0 to 4,095. The timestamp sits in the **high bits on purpose**: comparing two IDs as integers compares their timestamps first, which is what makes the IDs sort by time.
+
+Generation is a handful of operations. Read the current time in milliseconds. If it's the **same millisecond** as the last ID this node issued, **increment the sequence**; if it's a **new millisecond**, **reset the sequence to 0**. Then compose the ID by shifting each field into place: `id = (timestamp << 22) | (machine_id << 12) | sequence` (22 = machine + sequence bits below the timestamp). That's it — no locks beyond a tiny critical section per node, no I/O.
+
+<GenerateIdSequence />
+
+The **bit budget is a design knob**, not a law. The 41/10/12 split is Twitter's; you can rebalance for your needs. More sequence bits raise per-node throughput but leave fewer machine bits (fewer nodes); more machine bits allow more nodes but fewer IDs per millisecond each; more timestamp bits extend the lifespan at the cost of the others. The custom epoch matters too: 41 bits of milliseconds is ~69.7 years *from your epoch*, so choosing a recent epoch (rather than 1970) buys you the full lifespan going forward. The principle: a Snowflake ID is a **deliberate 64-bit allocation** — sign, time (high bits, for sortability), machine, sequence — generated by reading the clock, incrementing-or-resetting the sequence, and bit-shifting the fields together; and the split is a tunable trade among lifespan, node count, and per-node throughput.
+
+<KnowledgeCheck
+  question="Why is the timestamp placed in the high bits of a Snowflake ID, and what does the bit split trade off?"
+  options={[
+    "The position is arbitrary; the bit split has no consequences",
+    "The timestamp occupies the high (most significant) bits so that comparing IDs as integers compares their creation times first — which is exactly what makes the IDs sort roughly by time and gives good index locality. The 64-bit split (1 sign + 41 time + 10 machine + 12 sequence) is a fixed budget you allocate: more sequence bits = higher per-node throughput but fewer machine bits (fewer nodes); more time bits = longer lifespan; it's a trade among lifespan, node count, and per-node rate",
+    "The timestamp is in the high bits to keep IDs secret",
+    "The high bits hold the machine id so IDs sort by node, not time",
+  ]}
+  answer={1}
+  explanation="Sorting 64-bit integers compares their most significant bits first, so putting the timestamp in the high bits makes integer order track time order — the source of Snowflake's sortability and index locality. The remaining bits are a fixed budget: 41 time bits set the lifespan (~69.7 years from a custom epoch), 10 machine bits cap the fleet at 1,024 nodes, and 12 sequence bits cap a node at 4,096 IDs/ms. Rebalancing shifts throughput, node count, and lifespan against each other. The sign bit is kept zero so IDs stay positive; the layout is deliberate, not arbitrary, and IDs are explicitly not secret."
+/>
 
 <h2 id="worker-id-assignment">Assigning Machine IDs</h2>
 
-Placeholder.
+The uniqueness guarantee has a load-bearing assumption: **every live node has a different machine id**. If two nodes ever share the same 10-bit machine id, they can mint the *same* ID in the same millisecond with the same sequence — a **duplicate**, the one thing the system must never produce. So assigning machine ids correctly is as important as the generation algorithm itself, and there are a few ways to do it.
+
+**Static configuration** — bake the machine id into each node's config or deployment. Simple and dependency-free, but error-prone at scale: a copy-paste, a cloned VM, or an autoscaler can silently duplicate an id, and reclaiming ids from decommissioned nodes is manual. **A coordination service (ZooKeeper / etcd)** — the robust answer. On startup a node creates an **ephemeral sequential** znode and is handed the next free machine id; because the node is **ephemeral**, if the node dies its session ends and the id is **released** back to the pool for reuse. This is the same coordination primitive the [Distributed Job Scheduler](/learn/distributed-job-scheduler) uses for leader election, and it makes machine-id assignment automatic, collision-free, and self-reclaiming. **Deriving from the host** — hashing the IP or hostname into 10 bits — needs no coordination but risks **collisions** (two hosts hashing to the same value) and doesn't fit 1,024 slots cleanly, so it's a fallback at best.
+
+<WorkerIdAssignmentSequence />
+
+A subtlety: there are only **1,024** machine ids (10 bits), so in a large or rapidly-scaling fleet you must **reclaim** ids from dead nodes, which is exactly why ephemeral coordination-service nodes are attractive — release is automatic. If you truly need more than 1,024 concurrent nodes, you rebalance the bit budget (more machine bits, fewer sequence or time bits). The principle: **machine ids must be unique per live node or the system mints duplicates**, so assign them from a **coordination service using ephemeral sequential nodes** (automatic, collision-free, self-reclaiming) rather than static config, and remember the id space is only 1,024 — reclaiming ids from dead nodes is part of the design.
+
+<KnowledgeCheck
+  question="Why is machine-id assignment critical, and how is it done robustly?"
+  options={[
+    "It doesn't matter; nodes can share machine ids safely",
+    "Because uniqueness depends on it: if two live nodes share the same machine-id bits, they can mint the same ID in the same millisecond with the same sequence — a duplicate. The robust approach is a coordination service (ZooKeeper/etcd) where a booting node claims a unique id via an ephemeral sequential node; because it's ephemeral, a dead node's id is automatically released back to the pool. Static config works but risks silent duplicates (cloned VMs, copy-paste), and only 1,024 ids exist, so reclaiming them from dead nodes matters",
+    "Because the machine id sets the ID's timestamp",
+    "Because machine ids must be globally sequential across restarts",
+  ]}
+  answer={1}
+  explanation="The machine-id bits are what keep IDs minted concurrently on different nodes distinct, so duplicate machine ids break the core uniqueness guarantee. A coordination service assigns ids via ephemeral sequential nodes — a booting node gets the next free id, and its id is auto-released when its session ends, which also solves reclamation within the small 1,024-id space (10 machine bits). Static configuration is simple but prone to accidental duplication and manual reclamation, and host-derived ids risk hash collisions. Assignment robustness is as important as the generation algorithm itself."
+/>
 
 <h2 id="clock-skew">Clock Skew & Going Backwards</h2>
 
-Placeholder.
+Snowflake's correctness rests on the **wall clock**, and wall clocks are not as trustworthy as they look. NTP corrections, leap-second handling, virtual-machine pauses and migrations, and manual adjustments can all make a machine's clock **jump — including backwards**. A backwards jump is the dangerous one: if the node's clock rewinds to a millisecond it has **already issued IDs for**, and it naively keeps generating, it will re-mint timestamps it used before and can produce **duplicate or out-of-order IDs** — a violation of the one invariant that must hold.
+
+The defense is to **track the last timestamp issued** and compare it to the clock on every generation. Three cases. If the clock has **advanced** (current ms > last ms) — the normal case — reset the sequence and proceed; a forward *jump* just skips some timestamps, leaving harmless gaps. If the clock is on the **same millisecond**, increment the sequence as usual. If the clock has moved **backwards** (current ms < last ms), you must **not** issue an ID that could duplicate a past one; the standard responses are to **wait** until the clock catches back up to the last issued timestamp (Twitter's choice — briefly refuse to generate rather than risk a duplicate), or, for small rewinds, keep issuing against the last timestamp until real time passes it. A more robust variant uses a **monotonic clock** as the source — an OS clock guaranteed never to go backwards — sidestepping NTP rewinds entirely for the ordering logic while still using wall-clock time for the timestamp value.
+
+<ClockSkewSequence />
+
+The trade-off is **availability vs. correctness**: waiting on a backwards clock means the node briefly stops issuing IDs (a small availability hit) in exchange for never producing a duplicate — and uniqueness always wins, so the node refuses rather than risks a collision. Large backward jumps are treated as a fault (alert, and the node may take itself out of rotation) rather than something to wait out. The principle: because time-based IDs trust the clock, a node must **track its last-issued timestamp and never mint against a timestamp it already used** — on a backwards clock it **waits (or refuses)** rather than risk a duplicate, optionally driving the ordering logic from a **monotonic clock** — trading a sliver of availability for absolute uniqueness.
+
+<KnowledgeCheck
+  question="What goes wrong when a node's clock moves backwards, and how is it handled?"
+  options={[
+    "Nothing — clocks never move backwards in practice",
+    "If the clock rewinds to a millisecond the node already issued IDs for and it keeps generating naively, it can re-mint used timestamps and produce duplicate or out-of-order IDs. The node prevents this by tracking its last-issued timestamp: on a backwards clock it waits (or refuses to generate) until real time catches back up rather than risk a duplicate, and can drive its ordering logic from a monotonic clock that never goes backwards. It trades a brief availability hit for the absolute uniqueness guarantee",
+    "The IDs simply become larger; no correctness issue arises",
+    "The machine id changes to compensate for the clock",
+  ]}
+  answer={1}
+  explanation="Wall clocks jump backwards (NTP corrections, leap seconds, VM pauses), and Snowflake's timestamp bits come from the clock, so a naive node could reissue a timestamp it already used and mint duplicates. The fix is to remember the last timestamp issued and never generate against an earlier one: on a rewind, wait until the clock catches up (or refuse), accepting a small availability hit because uniqueness must never be violated. Using a monotonic clock source avoids the rewind for ordering purposes. Forward jumps are harmless (they just leave gaps); large backward jumps are treated as a fault."
+/>
 
 <h2 id="monotonicity-ordering">Monotonicity & Ordering</h2>
 
-Placeholder.
+It's important to be precise about what ordering Snowflake actually guarantees, because interviewers probe exactly here. **Within a single node**, IDs are **strictly increasing**: the timestamp never goes backwards (the clock-skew logic ensures it) and the sequence increments within a millisecond, so each ID from one node is larger than the last. **Across nodes**, IDs are **k-sorted** — also called *roughly time-ordered*: any two IDs are ordered by their millisecond timestamps, but two IDs minted in the **same millisecond on different nodes** can appear in either order (their machine bits break the tie arbitrarily, not by "who was first"). So if node A and node B both mint at millisecond *T*, you cannot say which "came first" from the IDs alone — but an ID from millisecond *T+5* is always greater than one from *T*.
+
+Why not strict global monotonicity — every ID larger than every previously issued one, everywhere? Because that would require the nodes to **coordinate** on a shared counter for every ID, which is precisely the bottleneck-and-SPOF the whole design exists to avoid. Global monotonicity and coordination-free generation are **mutually exclusive**; you pick one, and for IDs you almost always want coordination-free. Happily, **k-sorted is enough** for what IDs are used for: primary keys stay dense and clustered in time (good B-tree write locality, unlike random UUIDs), "most recent N" and time-range queries work off the ID, and cursor pagination is stable — none of which need the strict global order. The rare cases that truly need a single total order (e.g. a strict global sequence number) use a different, coordinated mechanism and pay for it. The principle: Snowflake gives **strict monotonicity within a node** and **k-sorted (roughly time-ordered) IDs across nodes**, deliberately **trading strict global monotonicity** — which is impossible without coordination — for local, coordination-free generation, because roughly-sorted is what index locality and time-range queries actually require.
+
+<KnowledgeCheck
+  question="What ordering guarantee does Snowflake provide, and why not strict global monotonicity?"
+  options={[
+    "Strict global monotonicity: every ID is larger than every ID ever issued anywhere",
+    "Strictly increasing within a single node, and k-sorted (roughly time-ordered) across nodes: IDs are ordered by their millisecond timestamps, but two minted in the same millisecond on different nodes may appear in either order. Strict global monotonicity is deliberately given up because it would require nodes to coordinate on a shared counter for every ID — the exact bottleneck/SPOF the design avoids. K-sorted is enough for index locality, time-range queries, and cursor pagination, which is what IDs are actually used for",
+    "No ordering at all; IDs are fully random like UUIDv4",
+    "Ordering by machine id, so all of one node's IDs sort before another's",
+  ]}
+  answer={1}
+  explanation="Within a node the timestamp never rewinds and the sequence increments, so IDs strictly increase; across nodes they're k-sorted — ordered to the millisecond, with same-millisecond IDs from different nodes interleaving arbitrarily. Strict global monotonicity would demand per-ID coordination on one counter, reintroducing the bottleneck and single point of failure Snowflake exists to avoid, so it's traded away. Roughly-sorted IDs still give dense, time-clustered index writes and support recency/range queries and stable cursors — which is all these IDs need. The honest answer names k-sorted, not strict global order."
+/>
 
 <h2 id="throughput-scaling">Throughput, Overflow & Partitioning</h2>
 
-Placeholder.
+Per-node throughput has a hard ceiling set by the sequence bits: **12 bits → 4,096 IDs per millisecond**. What happens when a node is asked for a 4,097th ID within the same millisecond? It has run out of sequence values for that millisecond, and issuing one would force a duplicate — so it **waits for the next millisecond tick**, then resets the sequence to 0 and continues. This is a natural, correct backpressure: the node briefly (sub-millisecond) blocks rather than ever violating uniqueness, capping it at 4,096,000 IDs/sec.
+
+<SequenceOverflowSequence />
+
+Crucially, that ceiling is **per node**, and scaling past it is **embarrassingly parallel**. The **machine-id bits partition the ID space**: each machine id is effectively an independent shard of the 64-bit space, and a node minting within its own machine-id partition can never collide with another node's, because their machine bits differ. So to add throughput you simply **add nodes** — each brings another 4.096M IDs/sec with **zero coordination** and zero collision risk, up to the 1,024-node ceiling (~4.19 billion IDs/sec total). This is the deep reason Snowflake scales so gracefully: it isn't one system handling load, it's up to 1,024 independent generators, each owning a partition of the ID space, running in parallel. And because throughput per node already dwarfs most workloads, the overflow-wait is rarely hit in practice; it exists as a correctness guarantee, not a routine path. The principle: per-node throughput is **capped at 4,096 IDs/ms** and a node **waits for the next millisecond on overflow** (correct backpressure, never a duplicate), while total scale comes from **partitioning the ID space by machine id** so nodes generate independently and in parallel — you add throughput by adding coordination-free nodes, not by scaling a shared component.
 
 <h2 id="scalability-evolution">Scalability & Evolution</h2>
 
-Placeholder.
+Don't reach for a 1,024-node Snowflake fleet on day one. Each stage answers a specific pressure and adds a specific cost — name the trigger before taking on the complexity.
+
+<TradeoffTable
+  columns={["Stage", "Trigger", "Cost"]}
+  rows={[
+    ["Database auto-increment", "One database, modest scale", "Simple and sortable, but a central counter — bottleneck/SPOF, and it breaks under sharding"],
+    ["Ticket / segment server", "Need IDs across services without a shared DB", "One service hands out ranges clients use locally; amortizes coordination but is still a SPOF"],
+    ["Snowflake (decentralized nodes)", "High throughput + no coordination on the hot path", "Local 64-bit generation; needs machine-id assignment and clock-skew handling"],
+    ["Tuned bit-budget / multi-datacenter", "Very large fleet or many datacenters", "Rebalance bits (e.g. datacenter + worker id); manage epoch and lifespan explicitly"],
+  ]}
+  recommendedRow={2}
+/>
+
+The progression tracks the wall you're hitting. A **database auto-increment** is the right first step for a single database — unique, sortable, trivial — until the central counter becomes a bottleneck or you shard and the counters collide. A **ticket/segment server** decouples ID generation from any one database and, by handing out **ranges** clients consume locally, cuts coordination dramatically — but it's still a single service to keep alive. The pivotal move is **Snowflake**: fully decentralized, coordination-free local generation, which is where high-scale ID generation lives and where the recommended stage sits; the price is the machine-id assignment and clock-skew machinery this tutorial is about. At the largest scale — many datacenters, huge fleets — you **rebalance the bit budget** (e.g. split the machine bits into datacenter + worker, as Twitter did) and manage the epoch and 41-bit lifespan deliberately. Most systems are well served by "Snowflake nodes with coordinated machine ids," and never need more.
 
 <h2 id="resiliency-failure-modes">Resiliency & Failure Modes</h2>
 
-Placeholder.
+Reason about every dependency in the same matrix — blast radius, detection, mitigation, recovery. The guiding rule for an ID generator is stark: **a duplicate ID is catastrophic, so every failure mode resolves in favor of never issuing one, even at the cost of briefly not issuing any.**
+
+<FailureMatrix
+  rows={[
+    { failure: "Clock moves backwards", impact: "Risk of duplicate/out-of-order IDs", detection: "current ms < last issued ms", mitigation: "Wait until the clock catches up (or refuse); use a monotonic clock", recovery: "Resume when real time passes the last timestamp; alert on large jumps" },
+    { failure: "Machine-id collision", impact: "Two nodes mint identical IDs", detection: "Coordination-service conflict / duplicate alarms", mitigation: "Assign ids via ephemeral coordination nodes; refuse to start without a unique id", recovery: "Kill/repair the duplicate node; id auto-released and reassigned" },
+    { failure: "Coordination service down at startup", impact: "A booting node can't get a machine id", detection: "ZK/etcd unreachable", mitigation: "Node refuses to start (fails safe) rather than guess an id; running nodes are unaffected", recovery: "Service returns; node acquires an id and starts" },
+    { failure: "Sequence overflow in a millisecond", impact: "No more IDs this ms", detection: "sequence == 4095 and same ms", mitigation: "Wait for the next millisecond tick, reset sequence to 0", recovery: "Automatic within <1 ms" },
+    { failure: "Time-bit / epoch exhaustion", impact: "Timestamp overflows after ~69.7 years", detection: "Capacity planning / timestamp nearing max", mitigation: "Choose a recent custom epoch; plan a re-epoch or wider layout well ahead", recovery: "Migrate layout before exhaustion (decades of lead time)" },
+    { failure: "Node clock drift (NTP lag)", impact: "IDs slightly mis-timed vs real time", detection: "NTP offset monitoring", mitigation: "Keep NTP healthy; tolerate small drift (IDs still unique and ~ordered)", recovery: "NTP re-syncs; drift corrected (forward, leaving harmless gaps)" },
+    { failure: "64-bit truncated in JSON/JS", impact: "Client corrupts the ID (53-bit float)", detection: "Round-trip mismatch", mitigation: "Serialize the id as a STRING, never a JSON number", recovery: "Fix serialization; reissue affected responses" },
+  ]}
+/>
+
+The theme: **uniqueness is sacred; when in doubt, stop issuing rather than issue a duplicate.** A backwards clock and a machine-id collision are the two true correctness threats, and both are handled by **failing safe** — wait on the clock, and refuse to start without a unique machine id — so a node never trades a duplicate for availability. The **coordination service** matters only at startup, so its outage blocks new nodes but leaves running ones minting happily (the hot path has no dependency on it). **Sequence overflow** self-heals in under a millisecond. **Epoch exhaustion** is real but decades away and handled by choosing a recent epoch and planning ahead. Softer issues — NTP drift, JSON truncation — are operational: keep the clock synced, and always serialize the id as a **string**. Because the only unrecoverable outcome is a duplicate ID, the entire failure strategy is to make duplicates impossible even when that means a node briefly generates nothing.
 
 <h2 id="tradeoffs-alternatives">Trade-offs & Alternatives</h2>
 
-Placeholder.
+Every recommendation here bought something and gave up something. Stating both is the difference between an answer and a strong answer.
+
+<DecisionRecord
+  title="The one-sentence design"
+  choice="Generate IDs with a Snowflake scheme: a 64-bit integer of 1 sign bit + 41 timestamp bits (ms from a custom epoch, in the high bits for sortability) + 10 machine-id bits + 12 per-millisecond sequence bits, minted entirely locally on each node with no coordination on the hot path; assign each node a unique machine id at startup from a coordination service (ZooKeeper/etcd) using ephemeral sequential nodes so ids are collision-free and auto-reclaimed; guard the clock by tracking the last-issued timestamp and waiting (never re-minting) if it moves backwards; cap each node at 4,096 IDs/ms and wait for the next millisecond on overflow; accept k-sorted (roughly time-ordered) IDs across nodes rather than strict global monotonicity; and return the value as a string to survive JSON."
+  rationale="The three requirements — unique, roughly sortable, coordination-free — are jointly satisfiable only by decentralizing generation, and bit-packing time+machine+sequence into 64 bits does exactly that: uniqueness by construction, sortability from the high timestamp bits, coordination-free local minting, and a compact integer for cheap indexes. Machine-id assignment and clock skew are the two things that can break uniqueness, so both fail safe (refuse to start without a unique id; wait rather than mint on a backwards clock). Throughput is a non-problem (millions/sec per node), and scale comes from partitioning by machine id, so you add nodes without coordination. Strict global order is sacrificed because it requires per-ID coordination — the very bottleneck the design avoids — and k-sorted is what index locality and range queries actually need."
+  alternatives="Database auto-increment — simple and sortable but a central bottleneck/SPOF that breaks under sharding. UUIDv4 — coordination-free but 128-bit and unsortable (random ⇒ poor index locality). Ticket/segment server — cuts coordination via ranges but remains a SPOF. UUIDv7/ULID — time-ordered and a genuinely good choice when 128 bits is acceptable; Snowflake is preferred when you want a 64-bit integer. Strict global monotonic counter — gives total order but needs per-ID coordination (bottleneck/SPOF); use only when total order is truly required. Host-derived machine ids — no coordinator but risk hash collisions; prefer a coordination service."
+  revisitWhen="You need more than 1,024 concurrent nodes or higher per-node throughput (rebalance the bit budget). You outgrow 41 time bits or your epoch nears exhaustion (re-epoch or widen the layout). 128-bit IDs become acceptable and you'd rather use UUIDv7/ULID for standardization. You genuinely need a single strict global order (adopt a coordinated sequencer for that path). Or you require unguessable IDs (Snowflake IDs leak time and node — add a separate opaque/secret token)."
+/>
+
+Four axes capture the real tension:
+
+- **64-bit Snowflake vs. 128-bit UUIDv7/ULID.** Snowflake is compact (cheap indexes, `BIGINT`) but needs machine-id coordination; UUIDv7 is coordination-free and standardized but twice as wide. Choose Snowflake when the integer width matters.
+- **Decentralized vs. centralized (ticket server).** Decentralized removes the SPOF and network hop at the cost of machine-id and clock machinery; centralized is simpler but a bottleneck. Decentralized wins at scale.
+- **Strict global vs. k-sorted ordering.** Strict global order needs per-ID coordination (bottleneck); k-sorted is coordination-free and sufficient for index locality and range queries. K-sorted wins.
+- **Coordination-service vs. static machine ids.** A coordinator gives automatic, collision-free, self-reclaiming ids; static config is dependency-free but risks silent duplicates. Use a coordinator at any real scale.
 
 <h2 id="interview-summary">Interview Summary</h2>
 
-Placeholder.
+<Callout variant="interview" title="A 60-second end-to-end answer">
+"Generating an integer is trivial; the real problem is unique, roughly time-sortable IDs at scale with no coordination — and the naive answers each fail one axis: a database auto-increment is a central bottleneck and SPOF that breaks under sharding, and a UUIDv4 is unsortable and 128 bits wide. So I'd use Snowflake: a 64-bit integer with one sign bit, 41 timestamp bits in the high position so IDs sort by time, 10 machine-id bits, and a 12-bit per-millisecond sequence. Each node mints IDs entirely locally — read the clock, increment the sequence within a millisecond or reset it on a new one, bit-pack the three fields — so there's no coordination and no network on the hot path, which is why it's both fast and always available. The two things that can actually break uniqueness are machine-id assignment and the clock. I assign machine ids at startup from ZooKeeper or etcd using ephemeral sequential nodes, so ids are unique and auto-reclaimed when a node dies, and a node refuses to start without one. For the clock, I track the last timestamp issued and, if the clock ever moves backwards, wait rather than re-mint a used timestamp — trading a sliver of availability for absolute uniqueness. On throughput: one node does about four million IDs a second, so even huge workloads fit on a single machine; you scale by adding nodes, because the machine-id bits partition the ID space so nodes never collide. I'm honest that the ordering is k-sorted — strictly increasing per node, roughly time-ordered globally — because strict global order would require per-ID coordination, the exact bottleneck we're avoiding, and roughly-sorted is all index locality and range queries need. One gotcha: return the ID as a string, since JSON numbers are 53-bit floats and would truncate it."
+</Callout>
+
+Common follow-ups an interviewer will use to go deeper: *Why not UUID or auto-increment? How is the 64-bit ID laid out? How do you assign machine ids without collisions? What happens when the clock goes backwards? Is the ordering strict or approximate, and why? How does it scale past one node?* Each maps directly to a section above.
 
 <h2 id="knowledge-checks-faq">Knowledge Checks & FAQ</h2>
 
-Placeholder.
+<KnowledgeCheck
+  question="What does the capacity model reveal as the defining characteristic of a unique ID generator?"
+  options={[
+    "That it's throughput-bound and needs many machines to keep up",
+    "That throughput is a non-problem and the real budget is bits. A single node mints ~4,096,000 IDs/sec locally (12 sequence bits × 1000 ms) with no network or coordination, so even 1,000,000 IDs/sec fits on one machine. The design constraint is spending the fixed 64 bits — 41 time (~69.7-year lifespan), 10 machine (1,024 nodes), 12 sequence (4,096/ms/node) — and filling all nodes would give ~4.19 billion/sec, far beyond need. You budget bits and spend engineering on clock and machine-id correctness, not on capacity",
+    "That storing issued IDs dominates and needs a huge database",
+    "That it's read-heavy and needs aggressive caching",
+  ]}
+  answer={1}
+  explanation="The model shows a single node already generates millions of IDs per second from purely local state, so no realistic workload is throughput-limited (1M/sec needs one node). The genuine design question is how to allocate the 64-bit budget across lifespan (time bits), node count (machine bits), and per-node rate (sequence bits), with a full fleet reaching ~4.19 billion/sec. Nothing is stored centrally and there's no read amplification. The engineering effort goes to the two things that threaten uniqueness — clock skew and machine-id assignment — not to scaling capacity."
+/>
+
+<KnowledgeCheck
+  question="How does Snowflake guarantee uniqueness while generating IDs with no coordination on the hot path?"
+  options={[
+    "By checking a central database for collisions on every ID",
+    "By construction, from three bit-fields that together cover every case: the timestamp differs across milliseconds, the machine-id bits differ across nodes (each node has a unique id assigned at startup), and the sequence differs within a millisecond on one node. So two IDs can never coincide without sharing all three, which the design prevents — a node never reuses a (timestamp, sequence) pair (waiting on a backwards clock and on sequence overflow), and no two live nodes share a machine id. No per-ID coordination is needed; the machine-id assignment at startup is the only coordination",
+    "By making the ID long enough that collisions are statistically unlikely, like UUIDv4",
+    "By routing every request through a single leader node",
+  ]}
+  answer={1}
+  explanation="Uniqueness is structural, not probabilistic or centrally checked. Any two IDs differ in at least one field: different millisecond (timestamp), different node (machine id), or different position within a millisecond on one node (sequence). The generation logic upholds this without runtime coordination by ensuring a node never re-issues a timestamp (wait on a backwards clock) or a sequence value (wait for the next millisecond on overflow), while unique machine ids — the one thing assigned via coordination, at startup only — keep concurrent nodes disjoint. That's why the hot path is purely local yet collision-free."
+/>
+
+<Faq
+  items={[
+    { question: "What is a unique ID generator, as a system?", answer: "It's a service (often a library linked into each app) that hands out identifiers guaranteed unique across a distributed system, ideally roughly time-sortable and generated without coordination. The hard part isn't producing a number — it's satisfying uniqueness, sortability, and coordination-free scale at once. Snowflake does it by packing a timestamp, a machine id, and a per-millisecond counter into a 64-bit integer that each node mints locally." },
+    { question: "Why not just use UUIDs?", answer: "UUIDv4 is unique and coordination-free but has two problems: it's 128 bits (twice an integer's width, bloating every index and foreign key) and it's random, so it's not sortable — inserting UUIDv4 primary keys scatters writes across a B-tree index and destroys locality. UUIDv7/ULID fix the sortability with a time prefix and are a good choice when 128 bits is fine, but Snowflake gives you a compact 64-bit integer, which is why it's preferred when width matters." },
+    { question: "Why not a database auto-increment?", answer: "It's unique and perfectly sortable, but every insert must go through the single node that owns the sequence, making it a throughput bottleneck and a single point of failure. It also breaks under sharding: independent counters on different shards collide unless you carefully offset them, which caps and complicates your sharding. Snowflake decentralizes generation so there's no shared counter and no coordination on the hot path." },
+    { question: "How is a Snowflake ID laid out?", answer: "As a 64-bit integer: 1 sign bit (kept zero so IDs stay positive), 41 timestamp bits (milliseconds since a custom epoch, ~69.7 years, placed in the high bits so IDs sort by time), 10 machine-id bits (1,024 possible nodes), and 12 sequence bits (0–4,095, a per-millisecond counter). An ID is composed by shifting each field into place: (timestamp << 22) | (machine_id << 12) | sequence. The split is Twitter's default and can be rebalanced for your needs." },
+    { question: "How are machine IDs assigned without collisions?", answer: "The robust way is a coordination service (ZooKeeper or etcd): a booting node creates an ephemeral sequential node and is handed the next free machine id, which is automatically released when the node dies (its session ends). Static configuration works but risks silent duplicates from cloned VMs or copy-paste errors, and only 1,024 ids exist, so reclaiming them from dead nodes matters — which ephemeral coordination nodes handle automatically. A node should refuse to start without a unique id." },
+    { question: "What happens when the clock moves backwards?", answer: "That's the main correctness hazard, since the timestamp comes from the wall clock and NTP corrections, leap seconds, or VM pauses can rewind it. The node tracks its last-issued timestamp and, if the clock is now earlier, waits until real time catches back up rather than re-minting a timestamp it already used (which would risk a duplicate). Some implementations use a monotonic clock for the ordering logic. Forward jumps are harmless — they just leave gaps in the ID space." },
+    { question: "Are Snowflake IDs strictly ordered?", answer: "Within a single node, yes — strictly increasing. Across nodes, they're k-sorted (roughly time-ordered): ordered by their millisecond timestamps, but two IDs minted in the same millisecond on different nodes can appear in either order. Strict global monotonicity is deliberately not provided because it would require nodes to coordinate on a shared counter for every ID — the bottleneck the design avoids — and roughly-sorted is enough for index locality, recency queries, and cursor pagination." },
+    { question: "How many IDs can it generate, and how does it scale?", answer: "A single node with 12 sequence bits mints 4,096 IDs per millisecond, or ~4,096,000 per second, entirely locally. If it needs more within a millisecond it waits for the next millisecond tick. You scale by adding nodes: the machine-id bits partition the ID space so different nodes can never collide, and each node adds another ~4.096M/sec with no coordination — up to 1,024 nodes, about 4.19 billion IDs/sec, which no real system needs." },
+    { question: "Why return the ID as a string?", answer: "Because JSON numbers are IEEE-754 double-precision floats with only 53 bits of integer precision, but a Snowflake ID uses up to 63 bits — so sending it as a JSON number would silently truncate it, corrupting the ID in JavaScript and many parsers. Serializing it as a string preserves all 64 bits. Twitter hit this exact issue and added an id_str field alongside the numeric id in its API for this reason." },
+    { question: "Are Snowflake IDs secret or unguessable?", answer: "No — and you shouldn't treat them as secrets. An ID openly encodes its creation timestamp and the machine id that minted it, both readable by anyone who decodes it, and consecutive IDs are roughly predictable. That's fine for a primary key or an internal identifier, but for anything security-sensitive (password-reset tokens, session ids, capability URLs) you need a separate cryptographically-random, opaque token instead." },
+    { question: "How is this related to the coordination service in other tutorials?", answer: "The machine-id assignment uses ZooKeeper or etcd with ephemeral sequential nodes — the same coordination primitive the Distributed Job Scheduler uses for leader election. In both cases a coordination service provides a small amount of strong consistency (unique assignment, leader election) at the edges of a system whose hot path stays coordination-free. It's a good example of using coordination sparingly: only at startup here, never on the per-ID path." },
+    { question: "What happens after ~69.7 years?", answer: "The 41 timestamp bits count milliseconds from a custom epoch, which covers about 69.7 years; after that the timestamp overflows. This is handled by choosing a recent epoch (so the clock starts near zero and you get the full range going forward) and by planning a migration — a wider layout or a new epoch — well before exhaustion, which is decades away. It's a real constraint to acknowledge, but with enormous lead time, unlike the immediate hazards of clock skew and machine-id collisions." },
+    { question: "Should the generator be a service or a library?", answer: "Both are common. As a library linked directly into each application instance, generation is a local function call with zero network latency — the fastest option — but every instance needs a machine id, so you may have many. As a standalone service (a small fleet of ID nodes behind an endpoint), fewer nodes need machine ids and clients call over the network, trading a tiny latency cost for simpler machine-id management. Either way the core algorithm and its guarantees are identical." },
+  ]}
+/>
